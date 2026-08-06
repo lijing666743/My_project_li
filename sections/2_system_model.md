@@ -32,7 +32,7 @@
 | UAV 平台 | $P_i^{\max}$ | UAV $i$ 最大通信发射功率 | W |
 | UAV 平台 | $E_i^0$ | episode 初始主动能量预算 | J |
 | UAV 平台 | $E_i^{\mathrm{res}}(t)$ | 剩余主动能量 | J |
-| UAV 平台 | $\kappa_i$ | CPU 动态能耗系数 | 由 $E=\kappa\Delta t f^3$ 定义 |
+| UAV 平台 | $\kappa_i$ | CPU 动态能耗系数 | 由 $E=\kappa f^3\tau$ 定义 |
 | 任务与队列 | $\tau_n$ | 任务 $n$ 的完整记录 | 记录元组 |
 | 任务与队列 | $D_n,C_n$ | 任务输入数据量和计算量 | bit，cycle |
 | 任务与队列 | $D_n^{\mathrm{rem}},C_n^{\mathrm{rem}}$ | 剩余待传输 bit 和待执行 cycle | bit，cycle |
@@ -61,10 +61,17 @@
 | 资源与能量 | $G$ | 固定资源组数 | $G=5$ |
 | 资源与能量 | $\mathcal G_g$ | 第 $g$ 个固定资源组 | 等效资源单元集合 |
 | 资源与能量 | $x_{ij,r}(t)$ | 链路对等效 RB 的占用指示 | $\{0,1\}$ |
+| 资源与能量 | $p_i(t)$ | UAV $i$ 在已分配资源上的总发射功率 | W |
 | 资源与能量 | $p_{ij,r}(t)$ | 链路在资源单元上的功率 | W |
+| 资源与能量 | $\tau_{ij}^{\mathrm{tx}}(t)$ | 链路 $i\rightarrow j$ 的通信实际活跃时间 | s |
+| 资源与能量 | $\tau_i^{\mathrm{cpu}}(t)$ | UAV $i$ 的 CPU 实际活跃时间 | s |
+| 资源与能量 | $\overline\tau_i^{\mathrm{cpu}}(t)$ | CPU 预留实际活跃时间上界 | s |
 | 资源与能量 | $E_i^{\mathrm{tx}}(t)$ | 主动通信能耗 | J |
 | 资源与能量 | $E_i^{\mathrm{cpu}}(t)$ | CPU 动态能耗 | J |
 | 资源与能量 | $E_i^{\mathrm{act}}(t)$ | 主动通信与计算总能耗 | J |
+| 资源与能量 | $\overline E_i^{\mathrm{tx}}(t)$ | 通信预留能量上界 | J |
+| 资源与能量 | $\overline E_i^{\mathrm{cpu}}(t)$ | CPU 预留能量上界 | J |
+| 资源与能量 | $\overline E_i^{\mathrm{act}}(t)$ | 联合主动能量预留上界 | J |
 | 动作接口 | $a_i(t)$ | UAV $i$ 的联合动作 | 七元组 |
 | 动作接口 | $a_i^{\mathrm{route}}(t)$ | 新任务路由分支 | 离散候选集合 |
 | 动作接口 | $a_i^{\mathrm{tx}}(t)$ | 已有传输队列选择分支 | 离散候选集合 |
@@ -868,6 +875,34 @@ R_{ij}^{\mathrm{eff}}(t)\Delta t
 \right\}.
 $$
 
+对联合执行器接受的链路，通信实际活跃时间定义为：
+
+$$
+\tau_{ij}^{\mathrm{tx}}(t)
+=
+\begin{cases}
+\min\left\{
+\Delta t,
+\dfrac{Q_{ij}^{\mathrm{bit}}(t)}
+{R_{ij}^{\mathrm{eff}}(t)}
+\right\},
+&
+y_{ij}(t)=1,\ |\mathcal S_i(t)|>0,\ p_i(t)>0,\
+R_{ij}^{\mathrm{eff}}(t)>0,
+\\[8pt]
+\Delta t,
+&
+y_{ij}(t)=1,\ |\mathcal S_i(t)|>0,\ p_i(t)>0,\
+R_{ij}^{\mathrm{eff}}(t)=0,
+\\[4pt]
+0,
+&
+\text{其他情况}.
+\end{cases}
+$$
+
+其中 $y_{ij}(t)=1$ 表示链路经联合执行器接受。有效速率大于零且整个传输队列在槽内提前清空时，发送端立即停止主动发射，因而实际活跃时间小于 $\Delta t$；有效速率为零但已以非零功率占用资源尝试发射时，视为整槽发射尝试。未被接受、通信 idle、功率为零或没有实际资源占用的链路均不产生通信活跃时间。本定义不改变 outage 的统计条件和 NA 口径。
+
 服务预算沿 $Q_{i\rightarrow j}^{\mathrm{tx}}(t)$ 的 EDF 顺序逐任务扣除：先服务队首任务，扣除其剩余 bit 与当前预算的较小值；预算仍有剩余时继续处理下一任务；直到预算耗尽或队列为空。对任务 $n$，令 $b_n^{\mathrm{tx}}(t)$ 为本槽实际扣除的 bit，则更新关系为：
 
 $$
@@ -903,48 +938,128 @@ f_j(t)
 \{0,0.25,0.5,1.0\}f_j^{\max}.
 $$
 
-设被选 CPU 队列的 EDF 队首任务为 $n^\star$，其本槽服务量为：
+设被选 CPU 队列的 EDF 队首任务为 $n^\star$，其本槽实际执行 cycle 为：
 
 $$
-S_j^{\mathrm{cpu}}(t)
+c_j^{\mathrm{cpu}}(t)
 =
-\min
-\left\{
+\begin{cases}
+\min\left\{
 C_{n^\star}^{\mathrm{rem}}(t),
 f_j(t)\Delta t
-\right\}.
+\right\},
+&
+f_j(t)>0\text{ 且选择了有效非空 CPU 队列},
+\\[8pt]
+0,
+&
+\text{其他情况}.
+\end{cases}
 $$
 
-第一版主模型每个 UAV 每槽只服务一个 CPU 队首任务，不把剩余 CPU 服务预算继续分配给第二个 CPU 队列。若服务量为 $c_j^{\mathrm{cpu}}(t)$，则队首剩余 cycle 更新为：
+第一版主模型每个 UAV 每槽只服务一个 CPU 队首任务，不把剩余 CPU 服务预算继续分配给第二个 CPU 队列。队首剩余 cycle 更新为：
 
 $$
 C_{n^\star}^{\mathrm{rem}}(t+1)
 =
 C_{n^\star}^{\mathrm{rem}}(t)-c_j^{\mathrm{cpu}}(t),
 \qquad
-0\le c_j^{\mathrm{cpu}}(t)\le S_j^{\mathrm{cpu}}(t).
+0\le c_j^{\mathrm{cpu}}(t)\le C_{n^\star}^{\mathrm{rem}}(t).
 $$
 
-主动通信能耗由实际接受的传输边、其资源占用和每资源单元功率决定：
+CPU 实际活跃时间定义为：
+
+$$
+\tau_j^{\mathrm{cpu}}(t)
+=
+\begin{cases}
+\dfrac{c_j^{\mathrm{cpu}}(t)}{f_j(t)},
+&
+f_j(t)>0\text{ 且选择了有效非空 CPU 队列},
+\\[8pt]
+0,
+&
+\text{其他情况}.
+\end{cases}
+$$
+
+因此 $0\le\tau_j^{\mathrm{cpu}}(t)\le\Delta t$。任务在槽内提前完成时，CPU 随即停止本任务的动态计算活动；剩余槽时间不转而服务第二个任务，也不产生 CPU 动态能耗。
+
+实际通信能耗由接受的传输边、其总发射功率和实际活跃时间决定：
 
 $$
 E_i^{\mathrm{tx}}(t)
 =
-\Delta t
 \sum_{j\in\mathcal U}
-\sum_{r=1}^{R}
-x_{ij,r}(t)p_{ij,r}(t).
+y_{ij}(t)\,p_i(t)\,\tau_{ij}^{\mathrm{tx}}(t).
 $$
 
-CPU 动态能耗按实际使用频率计算：
+其中 $p_i(t)$ 是链路在全部已分配资源上的总发射功率；由于每个发送 UAV 每槽至多有一条接受链路，上式不会重复累计多条发送活跃时间。虽然仍有 $\sum_r p_{ij,r}(t)=p_i(t)$，实际通信能耗不再无条件乘以完整 $\Delta t$。
+
+CPU 动态能耗按实际活跃时间计算：
 
 $$
-E_i^{\mathrm{cpu}}(t)
+E_j^{\mathrm{cpu}}(t)
 =
-\kappa_i\Delta t\,f_i^3(t).
+\kappa_j f_j^3(t)\tau_j^{\mathrm{cpu}}(t)
+=
+\kappa_j f_j^2(t)c_j^{\mathrm{cpu}}(t).
 $$
 
-当 $f_i(t)=0$ 时，CPU 动态能耗为零。UAV 的主动能耗和剩余能量更新为：
+当 $f_j(t)=0$ 或 CPU queue 为 idle 时，$c_j^{\mathrm{cpu}}(t)=0$、$\tau_j^{\mathrm{cpu}}(t)=0$ 且 $E_j^{\mathrm{cpu}}(t)=0$。在真实有效速率确定前，联合执行器不能知道通信实际活跃时间，因此使用保守的能量预留上界：
+
+$$
+\overline E_i^{\mathrm{tx}}(t)
+=
+\begin{cases}
+p_i(t)\Delta t,
+&
+\exists j:\ y_{ij}(t)=1,\ |\mathcal S_i(t)|>0,\ p_i(t)>0,
+\\[4pt]
+0,
+&
+\text{其他情况}.
+\end{cases}
+$$
+
+CPU 预留可以根据槽初已知的队首任务和频率确定：
+
+$$
+\overline\tau_j^{\mathrm{cpu}}(t)
+=
+\begin{cases}
+\min\left\{
+\Delta t,
+\dfrac{C_{n^\star}^{\mathrm{rem}}(t)}{f_j(t)}
+\right\},
+&
+f_j(t)>0\text{ 且 CPU 队列有效},
+\\[8pt]
+0,
+&
+\text{其他情况},
+\end{cases}
+$$
+
+$$
+\overline E_j^{\mathrm{cpu}}(t)
+=
+\kappa_j f_j^3(t)\overline\tau_j^{\mathrm{cpu}}(t).
+$$
+
+联合主动能量预留为：
+
+$$
+\overline E_i^{\mathrm{act}}(t)
+=
+\overline E_i^{\mathrm{tx}}(t)+\overline E_i^{\mathrm{cpu}}(t),
+\qquad
+\overline E_i^{\mathrm{act}}(t)
+\le
+E_i^{\mathrm{res}}(t).
+$$
+
+联合执行器在动作接受或离散降档时使用上述预留上界检查硬可行性。真实服务完成后，实际主动能耗和剩余能量更新为：
 
 $$
 E_i^{\mathrm{act}}(t)
@@ -952,6 +1067,8 @@ E_i^{\mathrm{act}}(t)
 E_i^{\mathrm{tx}}(t)+E_i^{\mathrm{cpu}}(t),
 \qquad
 E_i^{\mathrm{act}}(t)
+\le
+\overline E_i^{\mathrm{act}}(t)
 \le
 E_i^{\mathrm{res}}(t),
 $$
@@ -962,15 +1079,15 @@ E_i^{\mathrm{res}}(t+1)
 E_i^{\mathrm{res}}(t)-E_i^{\mathrm{act}}(t).
 $$
 
-上述约束只保证主动通信与计算的能量守恒，不包含推进、悬停、姿态或机载传感器能耗。初始能量、参考 CPU 和参考速率必须在 Gate P pilot 后校准，不能把未校准数值直接解释为实际硬件功耗。
+预留但未实际消耗的能量在时隙结束时释放，不从剩余能量中扣除。上述约束只保证主动通信与计算的能量守恒，不包含推进、悬停、姿态或机载传感器能耗。初始能量、参考 CPU 和参考速率必须在 Gate P pilot 后校准，不能把未校准数值直接解释为实际硬件功耗。
 
-若联合动作的能量不可行，执行器只在预定义离散档位中降级，降档序列为：
+若联合动作的预留能量不可行，执行器只在预定义离散档位中降级，降档序列为：
 
 $$
 1.0\rightarrow0.5\rightarrow0.25\rightarrow0.
 $$
 
-执行顺序是先屏蔽明显超过剩余能量的单分支档位，再对联合通信—CPU 组合重新计算能耗；若仍不可行，按固定优先规则降低通信功率或 CPU 频率；若所有非零组合均不可行，则相应分支执行 idle，并记录降档原因、次数以及执行前后的动作。该规则不把动作映射到离散档位集合之外的连续值。
+执行顺序是先按预留能量上界屏蔽明显不可行的单分支档位，再对联合通信—CPU 组合重新计算预留能量；若仍不可行，按固定优先规则降低通信功率或 CPU 频率；若所有非零组合均不可行，则相应分支执行 idle，并记录降档原因、次数以及执行前后的动作。该规则不把动作映射到离散档位集合之外的连续值。
 
 ## 2.12 七分支离散动作与硬约束
 
@@ -1000,7 +1117,7 @@ $$
 - 没有传输队列时，tx、resource group、width 和 power 均固定为 idle；
 - 第五组不能与宽度 2 组合；
 - 没有本地或远程 CPU 队列时，CPU queue 和 CPU frequency 固定为 idle；
-- 明显超过剩余能量的离散档位提前 mask；
+- 按预留能量上界明显超过剩余能量的离散档位提前 mask；
 - 联合半双工冲突不由单个 actor 的本地 mask 假定解决，而由联合执行器解析。
 
 为明确联合解析的硬约束，令 $y_{ij}(t)\in\{0,1\}$ 表示传输边 $i\rightarrow j$ 是否被接受，令 $u_{jk}(t)\in\{0,1\}$ 表示 UAV $j$ 是否选择来源为 $k$ 的 CPU 队列，其中 $k=j$ 表示本地队列。则每个发送 UAV 和每个计算 UAV 分别满足：
@@ -1034,10 +1151,10 @@ CPU 与无线通信模块被视为并行资源，因此半双工约束不限制 
 4. 从槽初已有的非空传输队列中执行 tx_select；
 5. 选择固定资源组、资源宽度和功率档位；
 6. 选择一个槽初 CPU 队列和 CPU 频率档位；
-7. 将所有候选动作送入联合 hard-feasible 执行器；
-8. 根据真实槽级信道计算 SINR、有效速率和通信服务；
-9. 执行本地或远程 CPU 服务；
-10. 更新任务剩余 bit、剩余 cycle 和主动能量；
+7. 将所有候选动作送入联合 hard-feasible 执行器，并先依据预留能量上界检查动作可行性；
+8. 根据真实槽级信道计算 SINR、有效速率、通信服务量和通信实际活跃时间；
+9. 执行本地或远程 CPU 服务并计算 CPU 实际活跃时间；
+10. 更新任务剩余 bit、剩余 cycle，并按实际主动能耗更新能量；
 11. 在本槽服务量和剩余工作量更新完成后，结算按时完成任务和过期任务；
 12. 将本槽 route 任务、本槽传输完成任务和新到达任务在槽末入队；新到达任务记录 $t_n^{\mathrm{arr}}=t$ 并在下一时隙首次可 route，本槽 route 决策在此时生效并锁定目的地，绑定为 local 的 route 任务同步设置 $d_n^{\mathrm{dst}}\leftarrow i_n$ 和 $D_n^{\mathrm{rem}}\leftarrow0$，绑定为远程 UAV $j$ 的 route 任务同步设置 $d_n^{\mathrm{dst}}\leftarrow j$（$j\ne i_n$），本槽传输完成任务在下一时隙首次可计算；
 13. 更新外生移动、真实信道、CSI AoI 和消息 AoI，并进入下一槽。
@@ -1197,7 +1314,7 @@ $$
 \begin{array}{l}
 \text{队列和候选邻居存在性约束成立},\\
 \text{固定资源组与相邻宽度约束成立},\\
-E_i^{\mathrm{act}}(t)\le E_i^{\mathrm{res}}(t),\ \forall i,\\
+\overline E_i^{\mathrm{act}}(t)\le E_i^{\mathrm{res}}(t),\ \forall i,\\
 \text{每个发送端至多一条服务边},\\
 \text{半双工约束成立},\\
 \text{每个 CPU 至多一个队列}
@@ -1206,6 +1323,8 @@ E_i^{\mathrm{act}}(t)\le E_i^{\mathrm{res}}(t),\ \forall i,\\
 $$
 
 动作 mask 处理可由局部信息提前识别的非法分支；联合执行器处理必须看到联合候选动作后才能判断的半双工和联合能量冲突。两者共同保证执行结果属于 hard-feasible 集合，但不把非法动作伪装成连续资源值。
+
+能量硬约束在执行前使用预留主动能量上界；服务完成后，实际能耗满足 $E_i^{\mathrm{act}}(t)\le\overline E_i^{\mathrm{act}}(t)$，未使用的预留能量释放。奖励中的能耗项仍使用实际主动能耗 $E^{\mathrm{act}}(t)$，不使用预留能量。
 
 ## 2.15 假设、局限性与实现映射
 
@@ -1219,7 +1338,7 @@ $$
 6. 建筑物以三维柱体表示，遮挡通过线段与建筑物的几何相交判定。
 7. 轻量信道模型仅服务于趋势评价；真实信道用于环境转移，actor 使用估计信道、AoI 和历史统计。
 8. 初始能量、参考速率、deadline 和路径损耗参数在 Gate P pilot 后校准。
-9. 主动能耗只包含无线发射和 CPU 动态能耗，不包含推进和其他飞行器功耗。
+9. 主动能耗只包含按实际传输活跃时间和 CPU 动态活跃时间统计的无线发射与 CPU 动态能耗，不包含推进和其他飞行器功耗；预留能量只用于执行前的硬可行性检查，不作为实际能耗指标。
 10. 结果回传暂不建模，远程 CPU 完成即视为任务计算完成。
 
 ### 2.15.2 局限性和声明边界
@@ -1246,7 +1365,8 @@ $$
 | 固定资源组 | $\mathcal G_1,\ldots,\mathcal G_5$ 及宽度 mask | src/env/resource_groups.py | 资源组边界测试，Gate 0 |
 | SINR 与有效速率 | $\mathrm{SINR}_{ij,r}$、$R_{ij}^{\mathrm{eff}}$ | src/env/channel.py | 干扰和速率单元测试，Gate 1 |
 | outage 统计 | 未调度链路记为 NA，仅统计实际调度链路 | src/env/channel.py，src/evaluation/ | outage 口径测试，Gate 1 |
-| 能量守恒 | $E_i^{\mathrm{res}}(t+1)=E_i^{\mathrm{res}}(t)-E_i^{\mathrm{act}}(t)$ | src/env/energy.py | energy 守恒与非负测试，Gate 0 |
+| 能量守恒 | $\overline E_i^{\mathrm{act}}(t)\le E_i^{\mathrm{res}}(t)$；$E_i^{\mathrm{res}}(t+1)=E_i^{\mathrm{res}}(t)-E_i^{\mathrm{act}}(t)$ | src/env/energy.py | 预留硬约束、实际能耗守恒与非负测试，Gate 0 |
+| 实际服务与能耗 | $\tau_{ij}^{\mathrm{tx}}$、$\tau_i^{\mathrm{cpu}}$；提前完成后按实际活跃时间扣除，outage 非零功率尝试按整槽计 | src/env/energy.py，src/env/queues.py | 提前完成能耗、outage 整槽发射尝试、实际能耗不超过预留、剩余能量按实际能耗更新，均为计划测试，Gate 0 |
 | 离散能量降档 | $1.0\rightarrow0.5\rightarrow0.25\rightarrow0$ | src/env/energy.py，src/agents/action_mask.py | 档位闭集测试，Gate 0 |
 | 联合半双工 | 同一 UAV 不得同时发送和接收 | src/env/half_duplex_resolver.py | 冲突解析测试，Gate 0 |
 | 信息权限 | actor 只使用 $o_i(t)$，禁止读取真实遮挡、信道、未来位置、真实 $\lambda_i$ 和完整私有队列 | src/agents/observation.py | 信息泄漏测试，Gate 0 |
