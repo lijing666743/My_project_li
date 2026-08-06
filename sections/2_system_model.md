@@ -91,6 +91,8 @@ $$
 
 因此，$\varnothing$ 仅表示任务尚未绑定目的地；local 任务和 remote 任务的目的 UAV 分别为源 UAV $i_n$ 和远程 UAV $j\ne i_n$，字段定义域仍为 $\mathcal U\cup\{\varnothing\}$。
 
+route 决策在槽末生效并使任务进入 local 或 tx 队列时，任务才完成目的地绑定；绑定后目的地字段保持不变。
+
 ​      默认参数用于编码初始接口和 Gate P 校准前的可复现实验起点。它们不等同于已完成的物理层标定结果。
 
 | 参数 | 编码初始值 | 单位 | 状态 |
@@ -359,7 +361,7 @@ $$
 
 done 和 expired 均为终止状态，该集合不包含由二者出发的转移，尤其不包含 $\mathrm{expired}\rightarrow\mathrm{done}$。
 
-对于 $\mathrm{unbound}\rightarrow\mathrm{local}$ 转移，槽末绑定操作必须同时执行：
+当 route 决策在槽末生效并触发 $\mathrm{unbound}\rightarrow\mathrm{local}$ 转移时，绑定操作必须同时执行：
 
 $$
 d_n^{\mathrm{dst}}\leftarrow i_n,
@@ -367,9 +369,17 @@ d_n^{\mathrm{dst}}\leftarrow i_n,
 D_n^{\mathrm{rem}}\leftarrow 0.
 $$
 
+当 route 决策在槽末生效并触发 $\mathrm{unbound}\rightarrow\mathrm{tx}$ 转移时，绑定操作必须同时执行：
+
+$$
+d_n^{\mathrm{dst}}\leftarrow j,
+\qquad
+j\ne i_n.
+$$
+
 本地任务不需要 U2U 输入传输，因此进入本地 CPU 队列后必须始终满足 $D_n^{\mathrm{rem}}=0$；其 $C_n^{\mathrm{rem}}=C_n$，直到实际 CPU 服务使其递减。远程任务绑定到 $j\ne i_n$ 后，$D_n^{\mathrm{rem}}$ 继续表示尚未完成的 U2U 输入传输量，并只按实际传输服务量递减。
 
-该集合不包含已发送任务重新绑定到其他目的 UAV 的转移，也不包含多跳转发。任务在首 bit 发送前仍可由 route 重新决策；一旦进入传输服务并发送首 bit，目的地锁定。新生成任务、本槽路由任务和本槽传输完成任务均在槽末进入相应队列，因此不可能在一个时隙内完成路由、传输和计算。
+该集合不包含已绑定任务改变目的 UAV 的转移，也不包含多跳转发。route 决策在槽末生效时，unbound 任务转入 local 或 tx 队列并立即锁定目的地；此后处于 local、tx 或 cpu 状态的任务不得再次执行 route，也不得改变 $d_n^{\mathrm{dst}}$。新生成任务、本槽路由任务和本槽传输完成任务均在槽末进入相应队列，因此不可能在一个时隙内完成路由、传输和计算。
 
 对于处于 done 状态的任务，若其在时隙 $t_n^{\mathrm{cmp}}$ 完成，其端到端时延定义为：
 
@@ -448,7 +458,7 @@ $$
 
 余量越小表示任务越紧迫。相同 slack 时采用固定任务标识作为可复现的 tie-break，不把随机打散引入队列语义。
 
-route 只处理槽初 $Q_i^{\mathrm{unb}}(t)$ 中的最高优先级任务，并在 local、defer 或当前候选远程 UAV 中选择；它负责绑定目的地，不直接产生本槽传输服务。tx_select 只从槽初已有的 $Q_{i\rightarrow j}^{\mathrm{tx}}(t)$ 中选择一个非空传输队列，并负责本槽服务预算分配。两者即使在同一槽分别输出，也不能使新路由任务获得本槽传输服务。
+route 只处理槽初 $Q_i^{\mathrm{unb}}(t)$ 中的最高优先级任务，并在 local、defer 或当前候选远程 UAV 中选择；选择 local 或远程目的地时，route 决策在槽末生效并一次性绑定目的地，不直接产生本槽传输服务。tx_select 只从槽初已有的 $Q_{i\rightarrow j}^{\mathrm{tx}}(t)$ 中选择一个非空传输队列，并负责本槽服务预算分配；该动作只服务已绑定的传输队列，不参与目的地选择或改变 $d_n^{\mathrm{dst}}$。两者即使在同一槽分别输出，也不能使新路由任务获得本槽传输服务。
 
 ## 2.7 外生移动与动态U2U图模型
 
@@ -507,7 +517,7 @@ $$
 
 其中 $R_{\mathrm{cand}}$ 是候选通信半径，初始值为 500 m，正式实验前结合链路预算校准。可选的距离滞回只用于减少边界抖动，不改变单跳语义。
 
-新任务边只用于决定未绑定任务当前可选的目的 UAV。服务边则保存已经锁定的 $i\rightarrow j$ 关系；即使锁定任务因移动暂时超出新任务候选范围，仍保留其传输队列和剩余 bit，等待链路恢复或按过期规则结算。outage 不删除已绑定服务边。所有邻居、建筑物路径和信道计算均以 $\mathbf q_i(t)$ 的三维位置为输入。
+新任务边只用于决定未绑定任务当前可选的目的 UAV。服务边则保存已经锁定的 $i\rightarrow j$ 关系；即使锁定任务因移动暂时超出新任务候选范围，仍保留其传输队列和剩余 bit，等待链路恢复或按过期规则结算，链路 outage、移动或超出候选范围均不触发目的地变更。outage 不删除已绑定服务边。所有邻居、建筑物路径和信道计算均以 $\mathbf q_i(t)$ 的三维位置为输入。
 
 ## 2.8 建模的U2U物理层评价
 
@@ -972,7 +982,7 @@ $$
 
 - 没有未绑定任务时，route 固定为 idle；
 - 不在 $\mathcal N_i(t)$ 中的远程目的地不可选；
-- 已发送首 bit 的任务不得重新路由；
+- 已绑定到 local 或 remote 的任务不得再次进入 route 候选；route 候选始终只来自 $Q_i^{\mathrm{unb}}(t)$；
 - 没有传输队列时，tx、resource group、width 和 power 均固定为 idle；
 - 第五组不能与宽度 2 组合；
 - 没有本地或远程 CPU 队列时，CPU queue 和 CPU frequency 固定为 idle；
@@ -1015,7 +1025,7 @@ CPU 与无线通信模块被视为并行资源，因此半双工约束不限制 
 9. 执行本地或远程 CPU 服务；
 10. 更新任务剩余 bit、剩余 cycle 和主动能量；
 11. 在本槽服务量和剩余工作量更新完成后，结算按时完成任务和过期任务；
-12. 将本槽 route 任务、本槽传输完成任务和新到达任务在槽末入队；其中绑定为 local 的 route 任务在入队时同步设置 $d_n^{\mathrm{dst}}\leftarrow i_n$ 和 $D_n^{\mathrm{rem}}\leftarrow0$；
+12. 将本槽 route 任务、本槽传输完成任务和新到达任务在槽末入队；route 决策在此时生效并锁定目的地：绑定为 local 的 route 任务同步设置 $d_n^{\mathrm{dst}}\leftarrow i_n$ 和 $D_n^{\mathrm{rem}}\leftarrow0$，绑定为远程 UAV $j$ 的 route 任务同步设置 $d_n^{\mathrm{dst}}\leftarrow j$（$j\ne i_n$）；
 13. 更新外生移动、真实信道、CSI AoI 和消息 AoI，并进入下一槽。
 
 该顺序带来三条不可绕过的可用性规则：新 route 任务不能在本槽由 tx_select 服务；本槽传输完成任务不能在本槽计算；槽末生成的新任务不能在本槽再次参与 route。因而任何算法都共享相同的服务边界，不能通过改变网络输出顺序获得额外的槽内服务。
@@ -1186,7 +1196,7 @@ $$
 ### 2.15.1 主要建模假设
 
 1. UAV 高度固定，水平移动由外生 Gauss-Markov 过程产生，所有算法使用相同移动轨迹。
-2. 任务输入不可拆分到多个目的 UAV，不允许多跳转发；目的地在首 bit 发送后锁定。
+2. 任务输入不可拆分到多个目的 UAV，不允许多跳转发；目的地在 route 决策生效并进入 local 或 tx 队列时锁定。
 3. 传输和 CPU 服务跨时隙持续，槽末入队的任务下一时隙才可服务。
 4. 计算模块与无线模块可以并行，但无线模块满足联合半双工。
 5. 主通信资源由五个固定资源组组成，资源组宽度只取一个或两个相邻组，功率和 CPU 频率只取离散档位。
@@ -1208,11 +1218,11 @@ $$
 
 | 系统规则 | 形式化对象或不变量 | 计划实现位置 | 计划测试或 Gate |
 |---|---|---|---|
-| 任务记录与生命周期 | $\tau_n$、$\mathcal S_{\mathrm{task}}$、$\mathcal T_{\mathrm{task}}$；local 与 unbound 的目的地标记可区分 | src/env/tasks.py | 目的地标记与任务生命周期测试，Gate 0 |
+| 任务记录与生命周期 | $\tau_n$、$\mathcal S_{\mathrm{task}}$、$\mathcal T_{\mathrm{task}}$；unbound→local/tx 时一次性绑定目的地，且 local、tx、cpu 状态下目的地不可变 | src/env/tasks.py | 目的地标记与任务生命周期测试，Gate 0 |
 | bit 守恒 | local 绑定后 $D_n^{\mathrm{rem}}=0$；远程任务按实际传输服务递减且不为负 | src/env/queues.py | local 绑定清零与远程 bit 守恒测试，Gate 0 |
 | cycle 守恒 | $C_n^{\mathrm{rem}}$ 按实际 CPU 服务递减且不为负 | src/env/queues.py | cycle 守恒测试，Gate 0 |
 | 状态机合法性 | 只允许 $\mathcal T_{\mathrm{task}}$ 中的转移 | src/env/tasks.py | 零非法状态转移测试，Gate 0 |
-| route/tx 分离 | route 仅操作 $Q_i^{\mathrm{unb}}$；tx_select 仅操作 $Q_{i\rightarrow j}^{\mathrm{tx}}$ | src/env/action_space.py，src/env/queues.py | 同槽因果测试，Gate 0 |
+| route/tx 分离 | route 仅操作 $Q_i^{\mathrm{unb}}$ 并一次性绑定；tx_select 仅操作 $Q_{i\rightarrow j}^{\mathrm{tx}}$ 且不改变目的地 | src/env/action_space.py，src/env/queues.py | 同槽因果测试，Gate 0 |
 | 槽边界 | 新路由、新到达和传输完成任务下一槽才可服务 | src/env/u2u_mec_env.py | 槽序列测试，Gate 0 |
 | 固定高度 | $\mathbf q_i(t)=[x_i(t),y_i(t),H]^{\mathrm T}$ | src/env/mobility.py | 高度不变测试，Gate 0 |
 | 动态候选邻居 | $\mathcal N_i(t)$ 与三维距离阈值 | src/env/topology.py | 邻居边界测试，Gate 1 |
