@@ -1,10 +1,23 @@
+# Local backup artifacts
+*.bak
+*.bak-*
+*.bak.*
+
+# Python caches
 __pycache__/
 *.pyc
+*.py[cod]
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .venv/
 venv/
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
 
 # 运行日志、自动生成图片和 Dashboard CSV；保留各目录中的 .gitkeep。
 logs/*

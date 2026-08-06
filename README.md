@@ -65,6 +65,10 @@ knowledge/project_plan/方案2.md
 
 ## 当前进度
 
+- Git 基线已经建立；
+- 本地备份与缓存文件已通过 `.gitignore` 排除；
+- 系统模型语义修订尚未开始；
+- 当前仍处于初始化和规格修订阶段；
 - 最终项目方案已经冻结；
 - 项目状态文档正在与冻结方案同步；
 - `sections/2_system_model.md`、`sections/3_methods.md` 和 `sections/4_experimental_protocol.md` 尚待正式整理；
