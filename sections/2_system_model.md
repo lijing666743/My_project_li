@@ -37,7 +37,7 @@
 | 任务与队列 | $D_n,C_n$ | 任务输入数据量和计算量 | bit，cycle |
 | 任务与队列 | $D_n^{\mathrm{rem}},C_n^{\mathrm{rem}}$ | 剩余待传输 bit 和待执行 cycle | bit，cycle |
 | 任务与队列 | $t_n^{\mathrm{arr}},t_n^{\mathrm{ddl}}$ | 到达时隙和截止时隙 | slot |
-| 任务与队列 | $d_n^{\mathrm{dst}}$ | 已锁定目的 UAV | $\mathcal U\cup\{\varnothing\}$ |
+| 任务与队列 | $d_n^{\mathrm{dst}}$ | 任务当前绑定的执行目的 UAV | $\mathcal U\cup\{\varnothing\}$ |
 | 任务与队列 | $s_n(t)$ | 任务生命周期状态 | 见 2.5 |
 | 任务与队列 | $Q_i^{\mathrm{unb}}$ | UAV $i$ 的未绑定任务队列 | 任务列表 |
 | 任务与队列 | $Q_i^{\mathrm{loc}}$ | UAV $i$ 的本地待计算任务队列 | 任务列表 |
@@ -76,6 +76,20 @@
 | Dec-POMDP | $P$ | 状态转移核 | $\mathcal S\times\mathcal A\rightarrow\mathcal P(\mathcal S)$ |
 | Dec-POMDP | $r_t$ | 团队即时奖励 | 实数 |
 | Dec-POMDP | $\gamma$ | 折扣因子 | $(0,1)$ |
+
+任务目的地字段统一定义为：
+
+$$
+d_n^{\mathrm{dst}}(t)
+=
+\begin{cases}
+\varnothing, & \text{任务尚未绑定，即处于 unbound 状态},\\
+i_n, & \text{任务已绑定在源 UAV 本地执行},\\
+j,\ j\ne i_n, & \text{任务已绑定到远程 UAV }j\text{ 执行}.
+\end{cases}
+$$
+
+因此，$\varnothing$ 仅表示任务尚未绑定目的地；local 任务和 remote 任务的目的 UAV 分别为源 UAV $i_n$ 和远程 UAV $j\ne i_n$，字段定义域仍为 $\mathcal U\cup\{\varnothing\}$。
 
 ​      默认参数用于编码初始接口和 Gate P 校准前的可复现实验起点。它们不等同于已完成的物理层标定结果。
 
@@ -272,7 +286,7 @@ s_n
 \right).
 $$
 
-其中 $D_n$ 的单位为 bit，$C_n$ 的单位为 cycle，$D_n^{\mathrm{rem}}$ 和 $C_n^{\mathrm{rem}}$ 分别表示未完成的传输和计算工作量；$d_n^{\mathrm{dst}}=\varnothing$ 表示尚未锁定目的 UAV。任务生成时令 $D_n^{\mathrm{rem}}=D_n$、$C_n^{\mathrm{rem}}=C_n$，随后仅通过实际服务量递减。
+其中 $D_n$ 的单位为 bit，$C_n$ 的单位为 cycle，$D_n^{\mathrm{rem}}$ 表示剩余待传输输入 bit，$C_n^{\mathrm{rem}}$ 表示剩余待执行 cycle；$d_n^{\mathrm{dst}}=\varnothing$ 表示任务尚未绑定目的 UAV。任务生成时处于 unbound 状态，并初始化为 $D_n^{\mathrm{rem}}=D_n$、$C_n^{\mathrm{rem}}=C_n$ 和 $d_n^{\mathrm{dst}}=\varnothing$。远程任务的 $D_n^{\mathrm{rem}}$ 只按实际 U2U 传输服务量递减；任务绑定为 local 时则必须按下述生命周期规则立即清零该字段。$C_n^{\mathrm{rem}}$ 保持为 $C_n$，直到实际 CPU 服务使其递减。
 
 输入数据量和单位 bit 计算量使用方案 2 的初始化范围：
 
@@ -323,7 +337,7 @@ $$
 \}.
 $$
 
-其中，unbound 表示任务已经到达但尚未绑定本地或远程目的地；local 表示任务已绑定源 UAV 的本地 CPU 队列；tx 表示任务已绑定远程目的 UAV 并处于传输队列；cpu 表示任务正在本地或远程 CPU 队列中接受计算服务；done 表示任务不晚于截止时隙末完成；expired 表示任务在截止时隙服务结束、且本槽服务量和剩余工作量更新后仍未完成。
+其中，unbound 表示任务已经到达但尚未绑定本地或远程目的地，此时 $d_n^{\mathrm{dst}}=\varnothing$；local 表示任务已绑定到源 UAV $i_n$ 的本地 CPU 队列，此时 $d_n^{\mathrm{dst}}=i_n$；tx 表示任务已绑定到远程 UAV $j\ne i_n$ 并处于传输队列，此时 $d_n^{\mathrm{dst}}=j$；cpu 表示任务正在本地或远程 CPU 队列中接受计算服务，其目的地字段必须等于实际执行 UAV，即本地执行时为 $i_n$、远程执行时为 $j\ne i_n$；done 表示任务不晚于截止时隙末完成；expired 表示任务在截止时隙服务结束、且本槽服务量和剩余工作量更新后仍未完成。
 
 合法生命周期转移由以下集合概括：
 
@@ -344,6 +358,16 @@ $$
 $$
 
 done 和 expired 均为终止状态，该集合不包含由二者出发的转移，尤其不包含 $\mathrm{expired}\rightarrow\mathrm{done}$。
+
+对于 $\mathrm{unbound}\rightarrow\mathrm{local}$ 转移，槽末绑定操作必须同时执行：
+
+$$
+d_n^{\mathrm{dst}}\leftarrow i_n,
+\qquad
+D_n^{\mathrm{rem}}\leftarrow 0.
+$$
+
+本地任务不需要 U2U 输入传输，因此进入本地 CPU 队列后必须始终满足 $D_n^{\mathrm{rem}}=0$；其 $C_n^{\mathrm{rem}}=C_n$，直到实际 CPU 服务使其递减。远程任务绑定到 $j\ne i_n$ 后，$D_n^{\mathrm{rem}}$ 继续表示尚未完成的 U2U 输入传输量，并只按实际传输服务量递减。
 
 该集合不包含已发送任务重新绑定到其他目的 UAV 的转移，也不包含多跳转发。任务在首 bit 发送前仍可由 route 重新决策；一旦进入传输服务并发送首 bit，目的地锁定。新生成任务、本槽路由任务和本槽传输完成任务均在槽末进入相应队列，因此不可能在一个时隙内完成路由、传输和计算。
 
@@ -388,11 +412,11 @@ $$
 Q_i^{\mathrm{loc}}(t)
 =
 \left(
-\tau_n:\ i_n=i,\ s_n(t)\in\{\mathrm{local},\mathrm{cpu}\},\ d_n^{\mathrm{dst}}=\varnothing
+\tau_n:\ i_n=i,\ s_n(t)\in\{\mathrm{local},\mathrm{cpu}\},\ d_n^{\mathrm{dst}}=i
 \right).
 $$
 
-从源 UAV $i$ 到目的 UAV $j$ 的传输队列为：
+这里的 $i$ 同时是任务源 UAV 和本地执行 UAV；队列内任务均满足 $D_n^{\mathrm{rem}}=0$。对 $j\in\mathcal U\setminus\{i\}$，从源 UAV $i$ 到远程目的 UAV $j$ 的传输队列为：
 
 $$
 Q_{i\rightarrow j}^{\mathrm{tx}}(t)
@@ -402,7 +426,7 @@ Q_{i\rightarrow j}^{\mathrm{tx}}(t)
 \right).
 $$
 
-来源为 $i$、在目的 UAV $j$ 上执行的远程 CPU 队列为：
+对 $j\in\mathcal U\setminus\{i\}$，来源为 $i$、在远程目的 UAV $j$ 上执行的 CPU 队列为：
 
 $$
 Q_{i\rightarrow j}^{\mathrm{cpu}}(t)
@@ -411,6 +435,8 @@ Q_{i\rightarrow j}^{\mathrm{cpu}}(t)
 \tau_n:\ i_n=i,\ d_n^{\mathrm{dst}}=j,\ s_n(t)=\mathrm{cpu}
 \right).
 $$
+
+因此，两类远程队列均要求 $j\ne i$；目的地为源 UAV 的本地任务不会被收入远程 CPU 队列。
 
 每类队列均按队首 deadline 优先的 EDF 顺序排列。任务 $n$ 在槽初的 deadline 余量定义为：
 
@@ -989,7 +1015,7 @@ CPU 与无线通信模块被视为并行资源，因此半双工约束不限制 
 9. 执行本地或远程 CPU 服务；
 10. 更新任务剩余 bit、剩余 cycle 和主动能量；
 11. 在本槽服务量和剩余工作量更新完成后，结算按时完成任务和过期任务；
-12. 将本槽 route 任务、本槽传输完成任务和新到达任务在槽末入队；
+12. 将本槽 route 任务、本槽传输完成任务和新到达任务在槽末入队；其中绑定为 local 的 route 任务在入队时同步设置 $d_n^{\mathrm{dst}}\leftarrow i_n$ 和 $D_n^{\mathrm{rem}}\leftarrow0$；
 13. 更新外生移动、真实信道、CSI AoI 和消息 AoI，并进入下一槽。
 
 该顺序带来三条不可绕过的可用性规则：新 route 任务不能在本槽由 tx_select 服务；本槽传输完成任务不能在本槽计算；槽末生成的新任务不能在本槽再次参与 route。因而任何算法都共享相同的服务边界，不能通过改变网络输出顺序获得额外的槽内服务。
@@ -1086,7 +1112,7 @@ C_n^{\mathrm{rem}}(t)/f_{\mathrm{ref}}
 }.
 $$
 
-其中 $\mathcal T_t^{\mathrm{active}}$ 是尚未处于 done 或 expired 的任务集合。设 $N_{\mathrm{on}}(t)$ 为本槽按 deadline 完成的任务数，$N_{\mathrm{exp}}(t)$ 为本槽结算的过期任务数，$E^{\mathrm{act}}(t)$ 为全体 UAV 主动能耗，则团队即时奖励定义为：
+其中 $\mathcal T_t^{\mathrm{active}}$ 是尚未处于 done 或 expired 的任务集合。本地绑定任务因满足 $D_n^{\mathrm{rem}}=0$，不计入通信剩余工作量。设 $N_{\mathrm{on}}(t)$ 为本槽按 deadline 完成的任务数，$N_{\mathrm{exp}}(t)$ 为本槽结算的过期任务数，$E^{\mathrm{act}}(t)$ 为全体 UAV 主动能耗，则团队即时奖励定义为：
 
 $$
 r_t
@@ -1182,8 +1208,8 @@ $$
 
 | 系统规则 | 形式化对象或不变量 | 计划实现位置 | 计划测试或 Gate |
 |---|---|---|---|
-| 任务记录与生命周期 | $\tau_n$、$\mathcal S_{\mathrm{task}}$、$\mathcal T_{\mathrm{task}}$ | src/env/tasks.py | tests/test_task_lifecycle.py，Gate 0 |
-| bit 守恒 | $D_n^{\mathrm{rem}}$ 按实际传输服务递减且不为负 | src/env/queues.py | bit 守恒测试，Gate 0 |
+| 任务记录与生命周期 | $\tau_n$、$\mathcal S_{\mathrm{task}}$、$\mathcal T_{\mathrm{task}}$；local 与 unbound 的目的地标记可区分 | src/env/tasks.py | 目的地标记与任务生命周期测试，Gate 0 |
+| bit 守恒 | local 绑定后 $D_n^{\mathrm{rem}}=0$；远程任务按实际传输服务递减且不为负 | src/env/queues.py | local 绑定清零与远程 bit 守恒测试，Gate 0 |
 | cycle 守恒 | $C_n^{\mathrm{rem}}$ 按实际 CPU 服务递减且不为负 | src/env/queues.py | cycle 守恒测试，Gate 0 |
 | 状态机合法性 | 只允许 $\mathcal T_{\mathrm{task}}$ 中的转移 | src/env/tasks.py | 零非法状态转移测试，Gate 0 |
 | route/tx 分离 | route 仅操作 $Q_i^{\mathrm{unb}}$；tx_select 仅操作 $Q_{i\rightarrow j}^{\mathrm{tx}}$ | src/env/action_space.py，src/env/queues.py | 同槽因果测试，Gate 0 |
