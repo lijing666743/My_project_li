@@ -66,10 +66,19 @@
 | 无线信道 | $m_{j,r}^{I}(t)$ | 历史干扰摘要可用性 mask | $\{0,1\}$ |
 | 无线信道 | $\mathrm{SINR}_{ij,r}(t)$ | 资源单元级信干噪比 | 线性值 |
 | 无线信道 | $R_{ij}^{\mathrm{eff}}(t)$ | 链路有效速率 | bit/s |
+| outage 统计 | $\chi_{ij}^{\mathrm{att}}(t)$ | 实际传输尝试指示量 | $\{0,1\}$ |
+| outage 统计 | $o_{ij}(t)$ | 单次实际传输尝试的 outage 样本 | $\{0,1,\mathrm{NA}\}$ |
+| outage 统计 | $\mathcal A^{\mathrm{att}}$ | 实际传输尝试样本集合 | 时隙、发送端和接收端三元组集合 |
+| outage 统计 | $\widehat q_{ij}^{\mathrm{out}}(t)$ | 仅由历史实际传输尝试计算的 outage 特征 | $[0,1]$ 或缺省值 |
+| outage 统计 | $m_{ij}^{\mathrm{out}}(t)$ | 历史 outage 特征可用性 mask | $\{0,1\}$ |
+| outage 统计 | $\mathrm{NA}$ | 没有实际传输尝试时的不可用标记，不参与数值统计 | 非数值标记 |
 | 资源与能量 | $R$ | 等效资源单元总数 | 正整数 |
 | 资源与能量 | $G$ | 固定资源组数 | $G=5$ |
 | 资源与能量 | $\mathcal G_g$ | 第 $g$ 个固定资源组 | 等效资源单元集合 |
-| 资源与能量 | $x_{ij,r}(t)$ | 链路对等效 RB 的占用指示 | $\{0,1\}$ |
+| 资源与能量 | $\mathcal R$ | 等效资源单元索引集合 | $\{1,\ldots,R\}$ |
+| 资源与能量 | $\mathcal S_i^{\mathrm{prop}}(t)$ | actor 动作提案为发送 UAV $i$ 申请的资源单元集合 | 资源单元集合 |
+| 资源与能量 | $\mathcal S_i^{\mathrm{exec}}(t)$ | 联合执行器仲裁后发送 UAV $i$ 实际占用的资源单元集合 | 资源单元集合 |
+| 资源与能量 | $x_{ij,r}(t)$ | 链路 $i\rightarrow j$ 对资源单元 $r$ 的最终实际占用指示 | $\{0,1\}$ |
 | 资源与能量 | $p_i(t)$ | UAV $i$ 在已分配资源上的总发射功率 | W |
 | 资源与能量 | $p_{ij,r}(t)$ | 链路在资源单元上的功率 | W |
 | 资源与能量 | $\tau_{ij}^{\mathrm{tx}}(t)$ | 链路 $i\rightarrow j$ 的通信实际活跃时间 | s |
@@ -736,7 +745,7 @@ p_r^{\mathrm{ref}}
 \frac{P_{\mathrm{ref}}}{R}.
 $$
 
-其中 $p_r^{\mathrm{ref}}$ 只用于构造跨时隙、跨动作可比较的观测特征，不是 actor 在当前时隙最终选择的实际功率；$\widehat\Gamma_{ij,r}^{\mathrm{hist}}(t)$ 也不使用当前其他 UAV 的动作，因而不等于当前真实 $\mathrm{SINR}_{ij,r}(t)$。actor 可使用该代理量或其固定资源组聚合值、上一槽已实现的有效速率、仅基于过去实际调度记录的 outage 率、CSI AoI、消息 AoI 和可用性 mask；$\mathrm{SINR}_{ij,r}(t)$ 仍只由环境在联合动作确定后计算。CSI AoI 和历史摘要/消息 AoI 的更新是环境事件，不是 actor 可直接控制的动作。
+其中 $p_r^{\mathrm{ref}}$ 只用于构造跨时隙、跨动作可比较的观测特征，不是 actor 在当前时隙最终选择的实际功率；$\widehat\Gamma_{ij,r}^{\mathrm{hist}}(t)$ 也不使用当前其他 UAV 的动作，因而不等于当前真实 $\mathrm{SINR}_{ij,r}(t)$。actor 可使用该代理量或其固定资源组聚合值、上一槽已实现的有效速率、仅基于过去实际传输尝试的 outage 率、CSI AoI、消息 AoI 和可用性 mask；$\mathrm{SINR}_{ij,r}(t)$ 仍只由环境在联合动作确定后计算。CSI AoI 和历史摘要/消息 AoI 的更新是环境事件，不是 actor 可直接控制的动作。
 
 ### 2.8.6 模型边界和第三UAV软遮挡扩展
 
@@ -760,19 +769,21 @@ $$
 
 主场景 $R=20$ 时每组含 4 个等效资源单元；$R=10$ 和 $R=40$ 时分别为 2 个和 8 个。资源选择以固定组为粒度，不暴露单个等效资源单元的自由索引，也不使用连续带宽份额。
 
-若动作选择组索引 $g_i(t)$ 和宽度 $w_i(t)\in\{1,2\}$，则所用组集合为：
+若 actor 动作选择组索引 $g_i(t)$ 和宽度 $w_i(t)\in\{1,2\}$，则动作提案申请的组集合为：
 
 $$
 \mathcal W_i(t)
 =
 \{g_i(t),g_i(t)+1,\ldots,g_i(t)+w_i(t)-1\},
 \qquad
-\mathcal S_i(t)
+\mathcal S_i^{\mathrm{prop}}(t)
 =
 \bigcup_{g\in\mathcal W_i(t)}\mathcal G_g.
 $$
 
-当 $g_i(t)=5$ 且 $w_i(t)=2$，该组合由动作 mask 禁止；当通信分支为 idle 时令 $\mathcal S_i(t)=\varnothing$。实际发射功率由离散功率分支确定：
+$\mathcal S_i^{\mathrm{prop}}(t)$ 只表示发送 UAV $i$ 在 actor 动作提案中申请的资源单元集合，在联合执行器运行前即可由 $g_i(t),w_i(t)$ 确定，不表示资源已经实际占用。$g_i(t)=5$ 且 $w_i(t)=2$ 时该组合由动作 mask 禁止；当通信分支为 idle 时令 $\mathcal S_i^{\mathrm{prop}}(t)=\varnothing$。即使执行器最终拒绝发送，也允许 $\mathcal S_i^{\mathrm{prop}}(t)\ne\varnothing$。
+
+实际发射功率由离散功率分支确定：
 
 $$
 p_i(t)
@@ -782,15 +793,15 @@ $$
 
 因此资源宽度只表示一个组或两个相邻组，不改变固定资源组边界；功率分支也不会产生离散集合之外的连续值。
 
-若链路 $i\rightarrow j$ 被联合执行器接受，且资源单元 $r$ 属于 $\mathcal S_i(t)$，则占用指示为：
+在当前模型中，联合执行器对已选择的固定资源组内部资源单元不做部分删除、增加或重新分配；对提案链路只决定是否接受。于是链路 $i\rightarrow j$ 的最终实际资源占用指示为：
 
 $$
 x_{ij,r}(t)
 =
-\mathbb 1\{r\in\mathcal S_i(t)\};
+y_{ij}(t)\mathbb 1\left[r\in\mathcal S_i^{\mathrm{prop}}(t)\right].
 $$
 
-否则 $x_{ij,r}(t)=0$。链路在已分配资源上的总功率按资源单元数平均分配：
+其中 $y_{ij}(t)=1$ 表示链路经联合执行器接受；当 $y_{ij}(t)=0$ 时，$x_{ij,r}(t)=0$ 对所有 $r$ 成立，即使提案集合非空。链路在已分配资源上的总功率按实际占用资源单元数平均分配：
 
 $$
 p_{ij,r}(t)
@@ -800,6 +811,36 @@ p_{ij,r}(t)
 \quad
 \text{当 }\sum_{r'=1}^{R}x_{ij,r'}(t)>0.
 $$
+
+联合执行器仲裁后的实际资源集合定义为：
+
+$$
+\mathcal S_i^{\mathrm{exec}}(t)
+=
+\left\{
+ r\in\mathcal R:
+ \sum_{j\in\mathcal U,\ j\ne i}x_{ij,r}(t)>0
+\right\}.
+$$
+
+它表示发送 UAV $i$ 在执行器完成硬约束仲裁后的最终实际占用资源单元集合。由于每个发送 UAV 每槽至多有一条满足 $y_{ij}(t)=1$ 的实际接受发送链路，若该唯一链路为 $i\rightarrow j$，则：
+
+$$
+\mathcal S_i^{\mathrm{exec}}(t)
+=
+\left\{r\in\mathcal R:x_{ij,r}(t)=1\right\}.
+$$
+
+若发送 UAV $i$ 没有任何被接受的发送链路，则 $\mathcal S_i^{\mathrm{exec}}(t)=\varnothing$；此时 $\mathcal S_i^{\mathrm{prop}}(t)$ 仍可能非空。对满足 $y_{ij}(t)=1$ 的唯一实际接受链路，有：
+
+$$
+\left|\mathcal S_i^{\mathrm{exec}}(t)\right|>0
+\Longleftrightarrow
+\sum_{r=1}^{R}x_{ij,r}(t)>0,
+\qquad y_{ij}(t)=1.
+$$
+
+链路未被接受时，实际资源集合为空；后续实际服务、通信能耗和 outage 资格均使用 $\mathcal S_i^{\mathrm{exec}}(t)$ 或等价的 $x_{ij,r}(t)$，不使用 $\mathcal S_i^{\mathrm{prop}}(t)$。
 
 当分母为零时链路未获得资源，约定所有 $p_{ij,r}(t)=0$，且不计算该链路的有效服务。
 
@@ -839,44 +880,110 @@ $$
 
 $\gamma_{\min}$ 的初始值为 $-3$ dB，并可在 $-6$、$0$ 和 $3$ dB 之间做敏感性分析。有效速率是环境真实服务计算的输入，不应与 actor 只能获得的历史干扰链路质量代理量混淆。
 
-outage 仅在实际调度且获得非零资源的链路上统计。其定义为：
+outage 样本只由联合执行器最终接受并实际发起传输的链路产生。$a_i^{\mathrm{tx}}(t)=j$ 仅表示 actor 的传输动作提案，不能直接生成 outage 样本。令槽初已绑定传输队列中的剩余 bit 为：
 
 $$
-O_{ij}(t)
+Q_{ij}^{\mathrm{bit}}(t)
+=
+\sum_{n\in Q_{i\rightarrow j}^{\mathrm{tx}}(t)}D_n^{\mathrm{rem}}(t).
+$$
+
+实际传输尝试指示量定义为：
+
+$$
+\chi_{ij}^{\mathrm{att}}(t)
+=
+\mathbb 1\left[y_{ij}(t)=1\right]
+\mathbb 1\left[p_i(t)>0\right]
+\mathbb 1\left[\left|\mathcal S_i^{\mathrm{exec}}(t)\right|>0\right]
+\mathbb 1\left[Q_{ij}^{\mathrm{bit}}(t)>0\right].
+$$
+
+在 $y_{ij}(t)=1$ 时，$\left|\mathcal S_i^{\mathrm{exec}}(t)\right|>0$ 与 $\sum_{r=1}^{R}x_{ij,r}(t)>0$ 等价，因此也可写为：
+
+$$
+\chi_{ij}^{\mathrm{att}}(t)
+=
+\mathbb 1\left[y_{ij}(t)=1\right]
+\mathbb 1\left[p_i(t)>0\right]
+\mathbb 1\left[\sum_{r=1}^{R}x_{ij,r}(t)>0\right]
+\mathbb 1\left[Q_{ij}^{\mathrm{bit}}(t)>0\right].
+$$
+
+其中 $y_{ij}(t)$、$p_i(t)$ 和 $x_{ij,r}(t)$ 均指联合执行器处理后的实际接受、实际功率和实际资源占用结果。只有 $\chi_{ij}^{\mathrm{att}}(t)=1$ 才生成一个实际传输尝试样本；同一发送 UAV 每槽至多生成一个此类样本。actor 主动选择 idle、执行器拒绝或因半双工冲突退化为 idle、能量降档至零功率、实际资源占用为空或传输队列为空时，$\chi_{ij}^{\mathrm{att}}(t)=0$，这些情况不属于无线 outage。
+
+对单次实际传输尝试，沿用当前真实 SINR、有效速率和既有无线 outage 判定条件：
+
+$$
+o_{ij}(t)
 =
 \begin{cases}
 1,
 &
-a_i^{\mathrm{tx}}(t)=j,\
-|\mathcal S_i(t)|>0,\
+\chi_{ij}^{\mathrm{att}}(t)=1,\
 R_{ij}^{\mathrm{eff}}(t)=0,
 \\
 0,
 &
-a_i^{\mathrm{tx}}(t)=j,\
-|\mathcal S_i(t)|>0,\
+\chi_{ij}^{\mathrm{att}}(t)=1,\
 R_{ij}^{\mathrm{eff}}(t)>0,
 \\
 \mathrm{NA},
 &
-\text{本槽未调度链路 }i\rightarrow j.
+\chi_{ij}^{\mathrm{att}}(t)=0.
 \end{cases}
 $$
 
-主动暂停、没有传输任务或没有分配资源均不计为信道 outage。对历史上实际被调度的时隙集合 $\mathcal H_{ij}(t)$，outage 率估计为：
+因此，实际非零功率和非零资源均已发出数据、但真实有效速率为零时，仍按现有无线 outage 条件记为 $o_{ij}(t)=1$；$o_{ij}(t)=\mathrm{NA}$ 不得在任何统计中转为 0 或 1。对当前时隙 $t$，历史 outage 特征只使用已结束时隙中的实际传输尝试集合：
+
+$$
+\mathcal H_{ij}^{\mathrm{att}}(t)
+=
+\left\{
+\tau:\,0\le\tau\le t-1,\ \chi_{ij}^{\mathrm{att}}(\tau)=1
+\right\}.
+$$
+
+当 $|\mathcal H_{ij}^{\mathrm{att}}(t)|>0$ 时，outage 特征为：
 
 $$
 \hat q_{ij}^{\mathrm{out}}(t)
 =
 \frac{
-\sum_{\tau\in\mathcal H_{ij}(t)}
-\mathbb 1\{O_{ij}(\tau)=1\}
+\sum_{\tau\in\mathcal H_{ij}^{\mathrm{att}}(t)}
+\mathbb 1\{o_{ij}(\tau)=1\}
 }{
-|\mathcal H_{ij}(t)|
+|\mathcal H_{ij}^{\mathrm{att}}(t)|
 }.
 $$
 
-当 $\mathcal H_{ij}(t)$ 为空时，使用缺省值并附带可用性 mask，不把 NA 当作失败事件。等效 RB 级失效率另行记录为：
+当 $|\mathcal H_{ij}^{\mathrm{att}}(t)|=0$ 时，使用固定缺省值并令 $m_{ij}^{\mathrm{out}}(t)=0$；有历史实际传输尝试时令该 mask 为 1。缺省值不表示 outage，NA 也不进入上述分子或分母。累计 outage 指标的实际尝试样本集合定义为：
+
+$$
+\mathcal A^{\mathrm{att}}
+=
+\left\{
+(t,i,j):\chi_{ij}^{\mathrm{att}}(t)=1
+\right\},
+$$
+
+并按实际传输尝试计算：
+
+$$
+P_{\mathrm{out}}
+=
+\begin{cases}
+\displaystyle
+\frac{
+\sum_{(t,i,j)\in\mathcal A^{\mathrm{att}}}o_{ij}(t)
+}{|\mathcal A^{\mathrm{att}}|},
+& |\mathcal A^{\mathrm{att}}|>0,\\[1.2ex]
+\mathrm{NA},
+& |\mathcal A^{\mathrm{att}}|=0.
+\end{cases}
+$$
+
+按链路、episode、场景或滑动窗口分别统计时，分母均只包含对应窗口内的实际传输尝试次数。等效 RB 级失效率另行记录为：
 
 $$
 O_{ij}^{\mathrm{RB}}(t)
@@ -889,7 +996,7 @@ O_{ij}^{\mathrm{RB}}(t)
 },
 $$
 
-且仅当分母大于零时计算。该口径使链路 outage、等效 RB 级失效率和未调度状态保持可区分。
+且仅当 $\chi_{ij}^{\mathrm{att}}(t)=1$ 时计算；否则记为 NA。该口径使链路 outage、等效 RB 级失效率和未实际传输状态保持可区分。
 
 ## 2.10 跨时隙传输服务模型
 
@@ -941,12 +1048,12 @@ $$
 {R_{ij}^{\mathrm{eff}}(t)}
 \right\},
 &
-y_{ij}(t)=1,\ |\mathcal S_i(t)|>0,\ p_i(t)>0,\
+y_{ij}(t)=1,\ |\mathcal S_i^{\mathrm{exec}}(t)|>0,\ p_i(t)>0,\
 R_{ij}^{\mathrm{eff}}(t)>0,
 \\[8pt]
 \Delta t,
 &
-y_{ij}(t)=1,\ |\mathcal S_i(t)|>0,\ p_i(t)>0,\
+y_{ij}(t)=1,\ |\mathcal S_i^{\mathrm{exec}}(t)|>0,\ p_i(t)>0,\
 R_{ij}^{\mathrm{eff}}(t)=0,
 \\[4pt]
 0,
@@ -955,7 +1062,7 @@ R_{ij}^{\mathrm{eff}}(t)=0,
 \end{cases}
 $$
 
-其中 $y_{ij}(t)=1$ 表示链路经联合执行器接受。有效速率大于零且整个传输队列在槽内提前清空时，发送端立即停止主动发射，因而实际活跃时间小于 $\Delta t$；有效速率为零但已以非零功率占用资源尝试发射时，视为整槽发射尝试。未被接受、通信 idle、功率为零或没有实际资源占用的链路均不产生通信活跃时间。本定义不改变 outage 的统计条件和 NA 口径。
+其中 $y_{ij}(t)=1$ 表示链路经联合执行器接受。有效速率大于零且整个传输队列在槽内提前清空时，发送端立即停止主动发射，因而实际活跃时间小于 $\Delta t$；有效速率为零但已以非零功率占用资源尝试发射时，视为整槽发射尝试。未被接受、通信 idle、功率为零或没有实际资源占用的链路均不产生通信活跃时间，也不产生 outage 样本；本定义与 $\chi_{ij}^{\mathrm{att}}(t)$ 的实际执行口径一致。
 
 服务预算沿 $Q_{i\rightarrow j}^{\mathrm{tx}}(t)$ 的 EDF 顺序逐任务扣除：先服务队首任务，扣除其剩余 bit 与当前预算的较小值；预算仍有剩余时继续处理下一任务；直到预算耗尽或队列为空。对任务 $n$，令 $b_n^{\mathrm{tx}}(t)$ 为本槽实际扣除的 bit，则更新关系为：
 
@@ -1060,7 +1167,7 @@ E_j^{\mathrm{cpu}}(t)
 \kappa_j f_j^2(t)c_j^{\mathrm{cpu}}(t).
 $$
 
-当 $f_j(t)=0$ 或 CPU queue 为 idle 时，$c_j^{\mathrm{cpu}}(t)=0$、$\tau_j^{\mathrm{cpu}}(t)=0$ 且 $E_j^{\mathrm{cpu}}(t)=0$。在真实有效速率确定前，联合执行器不能知道通信实际活跃时间，因此使用保守的能量预留上界：
+当 $f_j(t)=0$ 或 CPU queue 为 idle 时，$c_j^{\mathrm{cpu}}(t)=0$、$\tau_j^{\mathrm{cpu}}(t)=0$ 且 $E_j^{\mathrm{cpu}}(t)=0$。在真实有效速率和最终执行结果形成前，联合执行器不能知道通信实际活跃时间，因此对候选动作使用基于提案阶段的保守能量预留上界。此阶段只读取候选传输动作、槽初已绑定队列、$\mathcal S_i^{\mathrm{prop}}(t)$ 和候选功率；$y_{ij}(t)$、$x_{ij,r}(t)$ 与 $\mathcal S_i^{\mathrm{exec}}(t)$ 尚未形成：
 
 $$
 \overline E_i^{\mathrm{tx}}(t)
@@ -1068,13 +1175,18 @@ $$
 \begin{cases}
 p_i(t)\Delta t,
 &
-\exists j:\ y_{ij}(t)=1,\ |\mathcal S_i(t)|>0,\ p_i(t)>0,
+\begin{gathered}
+\exists j:\ a_i^{\mathrm{tx}}(t)=j,\ Q_{i\rightarrow j}^{\mathrm{tx}}(t)\ne\varnothing,\ Q_{ij}^{\mathrm{bit}}(t)>0,\\
+|\mathcal S_i^{\mathrm{prop}}(t)|>0,\ p_i(t)>0
+\end{gathered},
 \\[4pt]
 0,
 &
 \text{其他情况}.
 \end{cases}
 $$
+
+上式中的 $p_i(t)$ 表示执行器当前正在检查的候选功率档位，而不是对最终接受结果的预判；预留条件不以 $y_{ij}(t)=1$、$|\mathcal S_i^{\mathrm{exec}}(t)|>0$ 或 $\sum_r x_{ij,r}(t)>0$ 为前提。若候选发送被拒绝、因半双工冲突被丢弃或最终降档为通信 idle，则不保留通信预留，$\mathcal S_i^{\mathrm{exec}}(t)=\varnothing$ 且 $E_i^{\mathrm{tx}}(t)=0$。若候选被接受，未实际消耗的预留在槽末释放，剩余能量只按实际主动能耗扣除。
 
 CPU 预留可以根据槽初已知的队首任务和频率确定：
 
@@ -1113,7 +1225,7 @@ $$
 E_i^{\mathrm{res}}(t).
 $$
 
-联合执行器在动作接受或离散降档时使用上述预留上界检查硬可行性。真实服务完成后，实际主动能耗和剩余能量更新为：
+在形成最终 $y_{ij}(t)$、$x_{ij,r}(t)$ 和 $\mathcal S_i^{\mathrm{exec}}(t)$ 之前，联合执行器先使用上述候选预留上界检查接受或离散降档组合的硬可行性；真实服务完成后，实际主动能耗和剩余能量更新为：
 
 $$
 E_i^{\mathrm{act}}(t)
@@ -1193,22 +1305,22 @@ $$
 \forall i\in\mathcal U.
 $$
 
-CPU 与无线通信模块被视为并行资源，因此半双工约束不限制 CPU 和无线动作之间的并行性。联合执行器收集所有非 idle 候选传输边，按 EDF slack、估计链路质量和固定 UAV 标识的可复现优先级排序，依次接受不产生半双工冲突的边；冲突边退化为通信 idle，并记录冲突与修正次数。
+CPU 与无线通信模块被视为并行资源，因此半双工约束不限制 CPU 和无线动作之间的并行性。联合执行器收集所有非 idle 候选传输边，按 EDF slack、估计链路质量和固定 UAV 标识的可复现优先级排序，依次接受不产生半双工冲突的边；冲突边退化为通信 idle，并记录冲突与修正次数；退化后的 $y_{ij}(t)=0$，不生成 outage 样本。
 
 ## 2.13 时隙事件顺序
 
 每个时隙严格按以下顺序执行，以保持任务、bit、cycle 和能量的因果一致性。槽初读取已有队列，槽内完成服务，槽末统一处理状态更新和事件入队：
 
 1. 槽初读取已有任务、四类队列、候选邻居、陈旧 CSI、历史干扰摘要和延迟消息；
-2. 根据槽初局部观测生成七分支离散动作；
+2. actor 根据槽初局部观测生成七分支动作提案；
 3. 对一个未绑定 EDF 任务执行 route 决策；
 4. 从槽初已有的非空传输队列中执行 tx_select；
-5. 选择固定资源组、资源宽度和功率档位；
+5. 解析固定资源组、资源宽度和候选功率档位，形成 $\mathcal S_i^{\mathrm{prop}}(t)$ 与候选 $p_i(t)$；此时 $y_{ij}(t)$、$x_{ij,r}(t)$ 和 $\mathcal S_i^{\mathrm{exec}}(t)$ 尚未形成；
 6. 选择一个槽初 CPU 队列和 CPU 频率档位；
-7. 将所有候选动作送入联合 hard-feasible 执行器，并先依据预留能量上界检查动作可行性；
-8. 联合执行器确定实际接受变量、资源占用和功率后，环境结合当前真实槽级信道计算当前真实干扰、SINR、有效速率、通信服务量和通信实际活跃时间；
+7. 联合执行器先依据 $\mathcal S_i^{\mathrm{prop}}(t)$、候选 $p_i(t)$、槽初传输队列数据和 CPU 预留计算通信及联合主动能量预留，并检查硬可行性；该阶段不读取 $y_{ij}(t)$、$x_{ij,r}(t)$ 或 $\mathcal S_i^{\mathrm{exec}}(t)$；
+8. 通过预留检查后，联合执行器完成半双工等硬约束仲裁和既有功率/频率降档，确定最终 $y_{ij}(t)$、$x_{ij,r}(t)$ 和 $p_i(t)$，再构造 $\mathcal S_i^{\mathrm{exec}}(t)$；随后环境结合当前真实槽级信道计算当前真实干扰、SINR、有效速率、通信服务量和通信实际活跃时间；
 9. 执行本地或远程 CPU 服务并计算 CPU 实际活跃时间；
-10. 更新任务剩余 bit、剩余 cycle，并按实际主动能耗更新能量；
+10. 更新任务剩余 bit、剩余 cycle，并计算和扣除实际主动能耗；随后仅按 $\chi_{ij}^{\mathrm{att}}(t)$ 生成单次 outage 样本 $o_{ij}(t)$，并释放未实际消耗的预留；
 11. 在本槽服务量和剩余工作量更新完成后，结算按时完成任务和过期任务；
 12. 将本槽 route 任务、本槽传输完成任务和新到达任务在槽末入队；新到达任务记录 $t_n^{\mathrm{arr}}=t$ 并在下一时隙首次可 route，本槽 route 决策在此时生效并锁定目的地，绑定为 local 的 route 任务同步设置 $d_n^{\mathrm{dst}}\leftarrow i_n$ 和 $D_n^{\mathrm{rem}}\leftarrow0$，绑定为远程 UAV $j$ 的 route 任务同步设置 $d_n^{\mathrm{dst}}\leftarrow j$（$j\ne i_n$），本槽传输完成任务在下一时隙首次可计算；
 13. 时隙结束后，对环境规定可观测的接收端形成 $I_{j,r}^{\mathrm{meas}}(t)$，供未来时隙更新历史干扰摘要；无可用测量时保持上一历史值并增加其 AoI，已有历史值仍保持可用性 mask，只有 episode 尚无任何历史测量时 mask 为 $0$。
@@ -1251,7 +1363,7 @@ m_i(t)
 \right).
 $$
 
-局部观测至少包括自身剩余能量比例、归一化资源能力、历史到达率估计、本地/传输/CPU 队列摘要、候选传输队列的任务数与剩余 bit、CPU 队列的任务数与剩余 cycle、队首 slack、上一槽动作和资源利用率；邻居特征包括相对位置、相对速度、广播剩余能量、广播资源能力、CPU 负载摘要和消息 AoI；边特征包括估计距离、陈旧期望链路增益或其归一化形式、历史干扰链路质量代理量 $\widehat\Gamma_{ij,r}^{\mathrm{hist}}(t)$ 或固定资源组聚合值、上一槽有效速率、仅基于过去实际调度历史的 outage 率、CSI AoI、历史干扰摘要 AoI、相对速度和特征可用性 mask。上一槽有效速率只表示已结束时隙的实际结果；未调度链路没有该观测时使用缺省值加 mask，NA 不视为失败；outage 率也只使用过去实际调度记录。
+局部观测至少包括自身剩余能量比例、归一化资源能力、历史到达率估计、本地/传输/CPU 队列摘要、候选传输队列的任务数与剩余 bit、CPU 队列的任务数与剩余 cycle、队首 slack、上一槽动作和资源利用率；邻居特征包括相对位置、相对速度、广播剩余能量、广播资源能力、CPU 负载摘要和消息 AoI；边特征包括估计距离、陈旧期望链路增益或其归一化形式、历史干扰链路质量代理量 $\widehat\Gamma_{ij,r}^{\mathrm{hist}}(t)$ 或固定资源组聚合值、上一槽有效速率、仅基于过去实际传输尝试的 outage 率、CSI AoI、历史干扰摘要 AoI、相对速度和特征可用性 mask。上一槽有效速率只表示已结束时隙的实际结果；未调度链路没有该观测时使用缺省值加 mask，NA 不视为失败；outage 率只使用 $\tau\le t-1$ 的 $\chi_{ij}^{\mathrm{att}}(\tau)=1$ 样本，不读取当前时隙尚未产生的真实 SINR 或执行结果。
 
 actor 不得读取以下信息：
 
@@ -1410,6 +1522,17 @@ $$
 
 下表只描述后续实现与测试应覆盖的接口，不声称这些模块当前已经实现。由于项目初始化阶段不编写系统实现代码，本表中的文件名是规划映射。本节的时间边界不变量是：槽末到达的任务下一槽可 route，槽末绑定或转队的任务下一槽可服务，deadline 时隙服务结束后再结算。计划测试应覆盖这些 off-by-one 与槽边界用例；以下仅为测试要求，不代表测试已经实现。
 
+outage 口径的计划测试至少包括：
+
+- proposed send 被执行器拒绝时，outage 为 NA；
+- actor 主动选择通信 idle 时，outage 为 NA；
+- 零功率或零实际资源占用时，outage 为 NA；
+- 实际非零功率、非零资源且队列非空，但有效速率为零时，outage 为 1；
+- 成功实际传输时，沿用既有判定得到 outage 为 0；
+- 累计指标的分母只包含实际传输尝试；
+- 没有实际传输尝试时，累计 outage 为 NA；
+- 历史 outage 特征只使用 $t-1$ 或更早的实际传输尝试样本。
+
 | 系统规则 | 形式化对象或不变量 | 计划实现位置 | 计划测试或 Gate |
 |---|---|---|---|
 | 任务记录与生命周期 | $\tau_n$、$\mathcal S_{\mathrm{task}}$、$\mathcal T_{\mathrm{task}}$；unbound→local/tx 时一次性绑定目的地，且 local、tx、cpu 状态下目的地不可变 | src/env/tasks.py | 目的地标记与任务生命周期测试，Gate 0 |
@@ -1423,7 +1546,7 @@ $$
 | 建筑物遮挡 | 存在量词几何相交判定 | src/env/buildings.py | 遮挡几何测试，Gate 1 |
 | 固定资源组 | $\mathcal G_1,\ldots,\mathcal G_5$ 及宽度 mask | src/env/resource_groups.py | 资源组边界测试，Gate 0 |
 | SINR 与有效速率 | $\mathrm{SINR}_{ij,r}$、$R_{ij}^{\mathrm{eff}}$ | src/env/channel.py | 干扰和速率单元测试，Gate 1 |
-| outage 统计 | 未调度链路记为 NA，仅统计实际调度链路 | src/env/channel.py，src/evaluation/ | outage 口径测试，Gate 1 |
+| outage 统计 | 仅对 $y_{ij}=1$、$p_i>0$、实际资源占用非空且队列剩余 bit 大于零的实际传输尝试统计；其余为 NA | src/env/channel.py，src/evaluation/ | outage 口径测试，Gate 1 |
 | 能量守恒 | $\overline E_i^{\mathrm{act}}(t)\le E_i^{\mathrm{res}}(t)$；$E_i^{\mathrm{res}}(t+1)=E_i^{\mathrm{res}}(t)-E_i^{\mathrm{act}}(t)$ | src/env/energy.py | 预留硬约束、实际能耗守恒与非负测试，Gate 0 |
 | 实际服务与能耗 | $\tau_{ij}^{\mathrm{tx}}$、$\tau_i^{\mathrm{cpu}}$；提前完成后按实际活跃时间扣除，outage 非零功率尝试按整槽计 | src/env/energy.py，src/env/queues.py | 提前完成能耗、outage 整槽发射尝试、实际能耗不超过预留、剩余能量按实际能耗更新，均为计划测试，Gate 0 |
 | 离散能量降档 | $1.0\rightarrow0.5\rightarrow0.25\rightarrow0$ | src/env/energy.py，src/agents/action_mask.py | 档位闭集测试，Gate 0 |
