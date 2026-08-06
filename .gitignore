@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# 运行日志、自动生成图片和 Dashboard CSV；保留各目录中的 .gitkeep。
+logs/*
+!logs/.gitkeep
+plots/*
+!plots/.gitkeep
+dashboard_logs/*
+!dashboard_logs/.gitkeep
+
+# 模型 checkpoint
+**/*.ckpt
+**/*.pt
+**/*.pth
+**/*.safetensors
+**/checkpoints/

@@ -1,0 +1,4 @@
+interface:
+  display_name: "SCI Literature Review"
+  short_description: "Evidence-gated literature review support"
+  default_prompt: "Use $sci-literature-review to plan or audit a source-grounded SCI literature review."

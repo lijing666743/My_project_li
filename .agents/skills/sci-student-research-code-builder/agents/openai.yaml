@@ -1,0 +1,4 @@
+interface:
+  display_name: "SCI Student Research Code Builder"
+  short_description: "Build student-friendly research code"
+  default_prompt: "Use $sci-student-research-code-builder to create or refactor a student-friendly research program with main.py, src, interactive parameters, logs, and dashboard output."

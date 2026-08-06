@@ -1,0 +1,109 @@
+# 动态异构多 UAV U2U-MEC 协同卸载与资源编排
+
+## 项目定位
+
+本项目面向外生移动和动态 U2U 邻居环境，研究在 UAV 资源异构、业务负载异构、建筑物遮挡、有限频谱、不完美 CSI、跨时隙传输/计算队列和任务截止期共同存在时的单跳 U2U-MEC 协同卸载与资源调度问题。
+
+项目的唯一实施基线为：
+
+```
+knowledge/project_plan/方案2.md
+```
+
+该方案已冻结为“修订版可实施实验方案（编码冻结版）”。后续 `sections/`、配置文件、代码、测试和实验报告均须与该方案保持一致。
+
+## 研究主线
+
+1. UAV 资源异构与业务负载异构分离；
+2. 外生移动与动态候选邻居；
+3. 建筑物几何遮挡；
+4. 空间相关阴影与 Rician/Rayleigh 衰落；
+5. 不完美 CSI 与 CSI AoI；
+6. 五个固定资源组及同频干扰；
+7. 任务级 EDF 队列；
+8. 跨时隙传输与计算服务；
+9. 能量约束、离散降档与联合半双工解析；
+10. CTDE 图多智能体协同卸载。
+
+## 冻结方法
+
+### 主方法
+
+**CA-GAT-MAPPO**
+
+核心结构为：
+
+```
+局部节点、队列与边特征
+    -> 一层边感知 GATv2
+    -> GRU
+    -> 七个 categorical 动作头
+    -> 动作 mask
+    -> 联合 hard-feasible 执行器
+    -> 集合式集中 critic
+```
+
+### 保底方法
+
+**Factorized-Action GAT-QMIX**
+
+该方法是面向多分支离散动作的 GAT-QMIX 变体，不等同于未经修改的标准 QMIX。它与主方法共享环境转移、观测权限、动作分支、动作 mask、联合半双工解析器、离散降档、奖励和评价指标。
+
+## 主动作空间
+
+主实验使用七分支因子化离散动作：
+
+1. `route`：只处理槽初未绑定任务；
+2. `tx_select`：只选择槽初已有的非空传输队列；
+3. `resource_group`：选择固定资源组；
+4. `resource_width`：选择一个或两个相邻资源组；
+5. `power_level`：选择离散功率档位；
+6. `cpu_queue`：选择本地或远程 CPU 队列；
+7. `cpu_frequency`：选择离散 CPU 频率档位。
+
+主实验不再使用任意 RB 起始位置，也不使用 Beta 或 Dirichlet 连续资源动作。
+
+## 当前进度
+
+- 最终项目方案已经冻结；
+- 项目状态文档正在与冻结方案同步；
+- `sections/2_system_model.md`、`sections/3_methods.md` 和 `sections/4_experimental_protocol.md` 尚待正式整理；
+- 环境、算法和实验脚本尚未实现；
+- 当前没有真实实验结果。
+
+## 下一步
+
+1. 完成 `sections/2_system_model.md`；
+2. 完成 `sections/3_methods.md`；
+3. 完成 `sections/4_experimental_protocol.md`；
+4. 执行系统模型、方法和实验协议的一致性审计；
+5. 修改 `AGENTS.md`，结束初始化阶段；
+6. 开始 Gate P 参数校准和 Gate 0 环境测试；
+7. 依次实现规则基线、Factorized-Action GAT-QMIX 和 CA-GAT-MAPPO。
+
+## 可选扩展
+
+以下内容只有在主实验闸门通过后才考虑：
+
+- 第三 UAV Fresnel 软遮挡；
+- 连续资源动作；
+- Sionna RT 离线回放；
+- UAV 数量 OOD；
+- 离散硬件类型与类型 embedding。
+
+## 明确不做
+
+主论文不实施：
+
+- UAV 轨迹优化；
+- RIS；
+- 多跳路由；
+- DAG 任务；
+- 完整 MIMO；
+- 实时射线追踪；
+- 完整 HARQ 协议栈；
+- ns-3 包级联动。
+
+## 证据边界
+
+结果和讨论章节只能使用真实程序运行产生的数据、日志和图表。不得虚构实验结果、训练曲线、统计显著性或算法优势。

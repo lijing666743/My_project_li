@@ -1,0 +1,39 @@
+% Formal block snippets for SCI manuscripts.
+% Adapt to the target journal template and compile before claiming readiness.
+
+\begin{equation}
+  \min_{\mathbf{x} \in \mathcal{X}} \; f(\mathbf{x})
+  \quad \text{s.t.} \quad
+  g_i(\mathbf{x}) \le 0,\; i=1,\ldots,m .
+\end{equation}
+
+\begin{algorithm}[t]
+\caption{Method Name}
+\label{alg:method-name}
+\begin{algorithmic}[1]
+\Require Input data $\mathcal{D}$, parameters $\theta$
+\Ensure Output decision $\mathbf{x}$
+\State Initialize state variables.
+\For{each iteration $t=1,\ldots,T$}
+  \State Update candidate solution according to the method rule.
+  \State Evaluate stopping or feasibility conditions.
+\EndFor
+\State \Return $\mathbf{x}$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{definition}
+Given a feasible set $\mathcal{X}$ and metric $m(\cdot)$, define the admissible solution set as
+\[
+  \mathcal{A} = \{\mathbf{x} \in \mathcal{X}: m(\mathbf{x}) \le \tau\}.
+\]
+\end{definition}
+
+\begin{proposition}
+Under Assumptions 1--2, the proposed update preserves feasibility with respect to constraint $g_i(\mathbf{x}) \le 0$.
+\end{proposition}
+
+\begin{proof}
+State the invariant, apply the update rule, and show the constraint remains satisfied. Replace this placeholder with a real derivation before use.
+\end{proof}
+

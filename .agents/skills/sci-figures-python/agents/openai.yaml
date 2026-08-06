@@ -1,0 +1,4 @@
+interface:
+  display_name: "SCI Python Figures"
+  short_description: "Publication figure planning and Python templates"
+  default_prompt: "Use $sci-figures-python to create or audit reproducible SCI paper figures."

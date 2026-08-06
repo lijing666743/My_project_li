@@ -1,0 +1,5 @@
+interface:
+  display_name: "SCI Image2 Diagram Drafter"
+  short_description: "Draft logic-coupled, math-light SCI diagrams for Visio"
+  default_prompt: "Generate a logic-coupled, module-interaction dense, program-detail-rich, math-light, icon-minimized SCI diagram draft image; optionally generate a pure-white-background shape/container board when requested or needed for manual Visio redraw."
+

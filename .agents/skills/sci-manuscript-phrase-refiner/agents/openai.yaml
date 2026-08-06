@@ -1,0 +1,6 @@
+interface:
+  display_name: "SCI Manuscript Phrase Refiner"
+  short_description: "Refine manuscript phrases without claim drift"
+  default_prompt: "Use $sci-manuscript-phrase-refiner to clean engineering residue, preserve claims, and rewrite this manuscript text with concise IEEE/top-journal SCI phrasing."
+policy:
+  allow_implicit_invocation: true

@@ -1,0 +1,6 @@
+interface:
+  display_name: "SCI Formalization"
+  short_description: "Maximize valid manuscript formalization"
+  default_prompt: "Use $sci-manuscript-formalization-augmenter to run a maximal valid formalization pass and add every supported equation, algorithm, definition, or theorem-style block for this manuscript section."
+policy:
+  allow_implicit_invocation: true
