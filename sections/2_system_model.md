@@ -65,6 +65,8 @@
 | 无线信道 | $a_j^{\mathrm{msg}}(t)$ | 接收 UAV $j$ 广播摘要的消息 AoI | slot |
 | 无线信道 | $m_{j,r}^{I}(t)$ | 历史干扰摘要可用性 mask | $\{0,1\}$ |
 | 无线信道 | $\mathrm{SINR}_{ij,r}(t)$ | 资源单元级信干噪比 | 线性值 |
+| 无线信道 | $\gamma_{\min}^{\mathrm{dB}}$ | 无线 SINR 门限的 dB 表示 | dB |
+| 无线信道 | $\gamma_{\min}^{\mathrm{lin}}$ | 由 dB 门限转换得到的线性 SINR 门限 | 线性无量纲值 |
 | 无线信道 | $R_{ij}^{\mathrm{eff}}(t)$ | 链路有效速率 | bit/s |
 | outage 统计 | $\chi_{ij}^{\mathrm{att}}(t)$ | 实际传输尝试指示量 | $\{0,1\}$ |
 | outage 统计 | $o_{ij}(t)$ | 单次实际传输尝试的 outage 样本 | $\{0,1,\mathrm{NA}\}$ |
@@ -141,7 +143,8 @@ route 决策在槽末生效并使任务进入 local 或 tx 队列时，任务才
 | $R_{\mathrm{ref}}$ | $20$ | Mbit/s | Gate P 待校准 |
 | 天线增益 | $2$ | dBi | Gate P 待校准 |
 | 噪声系数 | $7$ | dB | Gate P 待校准 |
-| $\gamma_{\min}$ | $-3$ | dB | 敏感性参数 |
+| $\gamma_{\min}^{\mathrm{dB}}$ | $-3$ | dB | 敏感性参数 |
+| $\gamma_{\min}^{\mathrm{lin}}$ | $10^{-3/10}\approx0.5012$ | 线性无量纲值 | 由 dB 门限转换 |
 | $\sigma_s$ | $4$ | dB | 敏感性参数 |
 | $d_{\mathrm{corr}}$ | $50$ | m | 敏感性参数 |
 | $R_{\mathrm{cand}}$ | $500$ | m | Gate P 待校准 |
@@ -859,9 +862,17 @@ x_{kl,r}(t)p_{kl,r}(t)|h_{kj,r}(t)|^2
 }.
 $$
 
-其中 $N_0$ 是噪声谱密度，$B_{\mathrm{RU}}$ 是单个等效资源单元带宽，$F$ 是由噪声系数换算得到的线性因子。分母中的求和仅包含同一资源单元上被联合执行器接受的其他传输边。该真实 SINR 仅用于环境状态转移、有效速率、实际服务量、outage 以及集中训练期允许使用的真实全局状态。
+其中 $N_0$ 是噪声谱密度，$B_{\mathrm{RU}}$ 是单个等效资源单元带宽，$F$ 是由噪声系数换算得到的线性因子。分母中的求和仅包含同一资源单元上被联合执行器接受的其他传输边。该真实 SINR 始终是线性无量纲比值，不是 dB 值；它仅用于环境状态转移、有效速率、实际服务量、outage 以及集中训练期允许使用的真实全局状态。
 
-设 $\gamma_{\min}$ 为最小可用 SINR 阈值，则链路有效速率为：
+设 $\gamma_{\min}^{\mathrm{dB}}$ 为 dB 表示的最小可用 SINR 阈值，并定义对应的线性阈值为：
+
+$$
+\gamma_{\min}^{\mathrm{lin}}
+=
+10^{\gamma_{\min}^{\mathrm{dB}}/10}.
+$$
+
+本模型中 $\gamma_{\min}^{\mathrm{dB}}=-3\ \mathrm{dB}$，因此 $\gamma_{\min}^{\mathrm{lin}}=10^{-3/10}\approx0.5012$。所有与线性真实 SINR 的数值比较均使用 $\gamma_{\min}^{\mathrm{lin}}$；dB 阈值仅用于参数说明、报告和可读性展示。链路有效速率为：
 
 $$
 R_{ij}^{\mathrm{eff}}(t)
@@ -874,11 +885,11 @@ B_{\mathrm{RU}}
 \right)
 \mathbb 1
 \left\{
-\mathrm{SINR}_{ij,r}(t)\ge\gamma_{\min}
+\mathrm{SINR}_{ij,r}(t)\ge\gamma_{\min}^{\mathrm{lin}}
 \right\}.
 $$
 
-$\gamma_{\min}$ 的初始值为 $-3$ dB，并可在 $-6$、$0$ 和 $3$ dB 之间做敏感性分析。有效速率是环境真实服务计算的输入，不应与 actor 只能获得的历史干扰链路质量代理量混淆。
+$\gamma_{\min}^{\mathrm{dB}}$ 可在 $-6$、$0$ 和 $3$ dB 之间做敏感性分析，并按上述转换同步得到对应的 $\gamma_{\min}^{\mathrm{lin}}$。有效速率是环境真实服务计算的输入，不应与 actor 只能获得的历史干扰链路质量代理量混淆。
 
 outage 样本只由联合执行器最终接受并实际发起传输的链路产生。$a_i^{\mathrm{tx}}(t)=j$ 仅表示 actor 的传输动作提案，不能直接生成 outage 样本。令槽初已绑定传输队列中的剩余 bit 为：
 
@@ -990,7 +1001,7 @@ O_{ij}^{\mathrm{RB}}(t)
 =
 \frac{
 \sum_{r:x_{ij,r}(t)=1}
-\mathbb 1\{\mathrm{SINR}_{ij,r}(t)<\gamma_{\min}\}
+\mathbb 1\{\mathrm{SINR}_{ij,r}(t)<\gamma_{\min}^{\mathrm{lin}}\}
 }{
 \sum_{r=1}^{R}x_{ij,r}(t)
 },
@@ -1532,6 +1543,7 @@ outage 口径的计划测试至少包括：
 - 累计指标的分母只包含实际传输尝试；
 - 没有实际传输尝试时，累计 outage 为 NA；
 - 历史 outage 特征只使用 $t-1$ 或更早的实际传输尝试样本。
+- SINR 门限量纲测试：确认 $\gamma_{\min}^{\mathrm{dB}}=-3\ \mathrm{dB}$ 转换为 $\gamma_{\min}^{\mathrm{lin}}\approx0.5012$，并覆盖线性 SINR 等于、略低于和略高于该值时的有效速率门控与 outage 判定边界；
 
 | 系统规则 | 形式化对象或不变量 | 计划实现位置 | 计划测试或 Gate |
 |---|---|---|---|
