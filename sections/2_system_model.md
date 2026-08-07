@@ -47,6 +47,7 @@
 | 任务与队列 | $Q_{i\rightarrow j}^{\mathrm{tx}}$ | 从 $i$ 到 $j$ 的已绑定传输队列 | 任务列表 |
 | 任务与队列 | $Q_{i\rightarrow j}^{\mathrm{cpu}}$ | 来源为 $i$、在 $j$ 上执行的 CPU 队列 | 任务列表 |
 | 任务与队列 | $\operatorname{slack}_n(t)$ | 任务截止期余量 | slot |
+| 仲裁与确定性 | $\Pi_{ij}^{\mathrm{tx}}(t)$ | 候选通信边的固定字典序仲裁键 | $(\text{slack},-\text{quality},i,j)$ |
 | 业务到达 | $A_i(t)$ | UAV $i$ 在时隙 $t$ 槽末生成并到达的任务数 | 任务数；Bernoulli 情况为 $\{0,1\}$ |
 | 业务到达 | $\lambda_i$ | UAV $i$ 的环境任务到达概率或按时隙计的强度 | task/slot；Bernoulli 概率为无量纲 |
 | 业务到达 | $\hat{\lambda}_i(t)$ | 时隙 $t$ 槽初基于已结束时隙到达量形成的历史到达率估计 | task/slot |
@@ -67,6 +68,7 @@
 | 无线信道 | $m_{ij}^{\mathrm{CSI}}(t)$ | 陈旧 CSI 历史索引的可用性 mask | $\{0,1\}$ |
 | 无线信道 | $\widehat Z_{j,r}^{\mathrm{hist}}(t)$ | 历史干扰加噪声摘要 | W |
 | 无线信道 | $I_{j,r}^{\mathrm{meas}}(t)$ | 已结束时隙中的可用干扰测量 | W |
+| 无线信道 | $\widehat\Gamma_{ij}^{\mathrm{hist}}(t)$ | 候选链路使用的既有历史干扰链路质量代理量；若正文已有固定资源组聚合，则沿用该聚合定义 | 线性值 |
 | 无线信道 | $\widehat\Gamma_{ij,r}^{\mathrm{hist}}(t)$ | 历史干扰链路质量代理量 | 线性值 |
 | 无线信道 | $p_r^{\mathrm{ref}}$ | 固定参考每资源单元功率，$P_{\mathrm{ref}}/R$ | W |
 | 无线信道 | $\beta_I$ | 历史干扰指数滑动平均系数 | $[0,1)$ |
@@ -1297,7 +1299,7 @@ E_j^{\mathrm{cpu}}(t)
 \kappa_j f_j^2(t)c_j^{\mathrm{cpu}}(t).
 $$
 
-当 $f_j(t)=0$ 或 CPU queue 为 idle 时，$c_j^{\mathrm{cpu}}(t)=0$、$\tau_j^{\mathrm{cpu}}(t)=0$ 且 $E_j^{\mathrm{cpu}}(t)=0$。在真实有效速率和最终执行结果形成前，联合执行器不能知道通信实际活跃时间，因此对候选动作使用基于 candidate power 的保守能量预留上界。此阶段只读取候选传输动作、槽初已绑定队列、$\mathcal S_i^{\mathrm{prop}}(t)$ 和当前正在检查的 $p_i^{\mathrm{cand}}(t;\ell)$；$y_{ij}(t)$、$x_{ij,r}(t)$ 与 $\mathcal S_i^{\mathrm{exec}}(t)$ 尚未形成：
+当 $f_j(t)=0$ 或 CPU queue 为 idle 时，$c_j^{\mathrm{cpu}}(t)=0$、$\tau_j^{\mathrm{cpu}}(t)=0$ 且 $E_j^{\mathrm{cpu}}(t)=0$。在半双工候选集合确定后、真实有效速率、最终发射功率和实际服务结果形成前，联合执行器仍不能知道通信实际活跃时间，因此对候选动作使用基于 candidate power 的保守能量预留上界。该阶段读取槽初已绑定队列、$\mathcal S_i^{\mathrm{prop}}(t)$ 和当前正在检查的 $p_i^{\mathrm{cand}}(t;\ell)$；不读取当前真实 SINR、有效速率、实际服务或实际活跃时间，预留仍按提案资源集合和候选功率计算：
 
 $$
 \overline E_i^{\mathrm{tx,cand}}(t;\ell)
@@ -1316,7 +1318,7 @@ p_i^{\mathrm{cand}}(t;\ell)\Delta t,
 \end{cases}
 $$
 
-上式中的 $p_i^{\mathrm{cand}}(t;\ell)$ 仅表示 executor 当前正在检查的候选功率档位，而不是对最终接受结果的预判；预留条件不以 $y_{ij}(t)=1$、$|\mathcal S_i^{\mathrm{exec}}(t)|>0$ 或 $\sum_r x_{ij,r}(t)>0$ 为前提。每个候选档位都单独计算该临时预留；候选发送被拒绝、因半双工冲突被丢弃或最终降档为通信 idle 时，候选预留释放且 $E_i^{\mathrm{tx}}(t)=0$。若候选被接受，未实际消耗的预留在槽末释放，剩余能量只按实际主动能耗扣除。
+上式中的 $p_i^{\mathrm{cand}}(t;\ell)$ 仅表示 executor 当前正在检查的候选功率档位，而不是对最终接受结果的预判；预留条件不以 $y_{ij}(t)=1$、$|\mathcal S_i^{\mathrm{exec}}(t)|>0$ 或 $\sum_r x_{ij,r}(t)>0$ 为前提。每个候选档位都单独计算该临时预留；候选发送若在半双工或能量等硬约束阶段被拒绝，或最终降档为通信 idle，则候选预留释放且 $E_i^{\mathrm{tx}}(t)=0$。若候选被接受，未实际消耗的预留在槽末释放，剩余能量只按实际主动能耗扣除。
 
 CPU 预留可以根据槽初已知的队首任务和频率确定：
 
@@ -1356,7 +1358,7 @@ E_i^{\mathrm{res}}(t).
 $$
 
 
-在形成最终 $y_{ij}(t)$、$x_{ij,r}(t)$ 和 $\mathcal S_i^{\mathrm{exec}}(t)$ 之前，联合执行器先使用上述候选预留上界检查接受或离散降档组合的硬可行性；真实服务完成后，实际主动能耗和剩余能量更新为：
+在半双工仲裁形成接受集合后、真实服务开始前，联合执行器使用上述候选预留上界检查离散降档组合的硬可行性；真实服务完成后，实际主动能耗和剩余能量更新为：
 
 $$
 E_i^{\mathrm{act}}(t)
@@ -1384,7 +1386,7 @@ $$
 1.0\rightarrow0.5\rightarrow0.25\rightarrow0.
 $$
 
-执行顺序是先按预留能量上界屏蔽明显不可行的单分支档位，再对联合通信—CPU 组合重新计算预留能量；若仍不可行，按固定优先规则降低通信功率或 CPU 频率；若所有非零组合均不可行，则相应分支执行 idle，并记录降档原因、次数以及执行前后的动作。该规则不把动作映射到离散档位集合之外的连续值。
+执行器降档顺序冻结为：对每个 UAV，先保持其 actor 提议的 CPU 频率不变；再对接受集合中的每个通信候选沿当前已有的绝对 candidate power 档位从高到低（从 $p_i^{\mathrm{prop}}(t)$ 所在档位开始）逐档检查，并为每个候选计算 $\overline E_i^{\mathrm{act,cand}}(t;\ell)$。选择满足 $\overline E_i^{\mathrm{act,cand}}(t;\ell)\le E_i^{\mathrm{res}}(t)$ 的最高可行通信档位并停止；若包括 $0$ 在内的全部通信档位在当前 CPU 频率下均不可行，才按 actor 提议档位向下逐档检查既有 CPU 频率档位，直到找到最高可行 CPU 频率；如通信功率为 $0$ 且 CPU 也降至最低 idle 档位后仍不可行，沿用当前正文已有的最终安全 idle 处理。全流程不新增功率或 CPU 频率档位，不使用随机 tie-break，也不在找到最高可行档位后继续无必要降档。
 
 ## 2.12 七分支离散动作与硬约束
 
@@ -1436,7 +1438,35 @@ $$
 \forall i\in\mathcal U.
 $$
 
-CPU 与无线通信模块被视为并行资源，因此半双工约束不限制 CPU 和无线动作之间的并行性。联合执行器收集所有非 idle 候选传输边，按 EDF slack、估计链路质量和固定 UAV 标识的可复现优先级排序，依次接受不产生半双工冲突的边；冲突边退化为通信 idle，并记录冲突与修正次数；退化后的 $y_{ij}(t)=0$，不生成 outage 样本。
+CPU 与无线通信模块被视为并行资源，因此半双工约束不限制 CPU 和无线动作之间的并行性。联合执行器先收集所有合法且非 idle 的候选通信边。对每条候选边 $i\rightarrow j$，令 $n_{ij}^{\star}$ 为 $Q_{i\rightarrow j}^{\mathrm{tx}}(t)$ 的 EDF 队首任务，并令 $\widehat\Gamma_{ij}^{\mathrm{hist}}(t)$ 表示当前模型已经定义的逐资源单元代理量或固定资源组聚合值；不引入新的链路质量指标。
+
+候选通信边的唯一仲裁键冻结为：
+
+$$
+\Pi_{ij}^{\mathrm{tx}}(t)
+=
+\left(
+\operatorname{slack}_{n_{ij}^{\star}}(t),
+-\widehat\Gamma_{ij}^{\mathrm{hist}}(t),
+i,
+j
+\right).
+$$
+
+所有候选边按上述键作升序字典序排序：slack 越小越优先，历史链路质量代理量越大越优先，随后按发送 UAV ID $i$、接收 UAV ID $j$ 升序 tie-break。排序完成后从空的接受集合开始逐项扫描；若加入当前候选会违反已有发送端至多一条链路约束或既有半双工约束，则拒绝该候选，否则接受该候选。被拒绝链路满足 $y_{ij}(t)=0$、$\mathcal S_i^{\mathrm{exec}}(t)=\varnothing$ 和 $p_i^{\mathrm{exec}}(t)=0$，且不生成 outage 样本。
+
+CPU queue 分支仍由 actor 提出，执行器不新增全局 CPU 调度触发机制；每个 UAV 只执行当前已选的一个有效 CPU 队列及其 EDF 队首任务。若实现内部确需在多个有效 CPU 候选之间比较，则使用 $(\operatorname{slack}_{n^{\star}}(t),n^{\star},j)$ 的升序字典序，其中 $n^{\star}$ 是固定任务 ID、$j$ 是计算 UAV ID；这只是把既有 EDF、固定任务 ID 和 UAV ID tie-break 写明，不改变 CPU 队列语义。
+
+因此，在固定槽初状态、固定联合动作提案和固定环境状态下，联合执行器定义为：
+
+$$
+\mathcal E:
+(\text{槽初状态},\ \text{联合动作提案},\ \text{固定环境状态})
+\mapsto
+(\text{最终执行动作}).
+$$
+
+该映射不得依赖 Python set/dict 的偶然遍历顺序、未声明的列表顺序、随机 tie-break 或实现者自行选择的升降序；完成半双工扫描后才进入上述能量降档顺序。
 
 ## 2.13 时隙事件顺序
 
@@ -1450,8 +1480,8 @@ CPU 与无线通信模块被视为并行资源，因此半双工约束不限制 
 4. 从槽初已有的非空传输队列中执行 tx_select；
 5. 解析固定资源组、资源宽度和功率动作，形成 $\mathcal S_i^{\mathrm{prop}}(t)$ 与 $p_i^{\mathrm{prop}}(t)$；此时 $y_{ij}(t)$、$x_{ij,r}(t)$ 和 $\mathcal S_i^{\mathrm{exec}}(t)$ 尚未形成；
 6. 选择一个槽初 CPU 队列和 CPU 频率档位；
-7. 联合执行器从 $p_i^{\mathrm{prop}}(t)$ 开始生成并检查内部临时 $p_i^{\mathrm{cand}}(t;\ell)$，依据 $\mathcal S_i^{\mathrm{prop}}(t)$、槽初传输队列数据和 CPU 预留计算 candidate 通信及联合主动能量预留；该阶段不读取 $y_{ij}(t)$、$x_{ij,r}(t)$ 或 $\mathcal S_i^{\mathrm{exec}}(t)$；
-8. 通过预留检查后，联合执行器完成半双工等硬约束仲裁和既有功率/频率降档，确定最终 $y_{ij}(t)$、$x_{ij,r}(t)$、$p_i^{\mathrm{exec}}(t)$ 和 $\mathcal S_i^{\mathrm{exec}}(t)$；随后环境结合当前真实槽级信道计算当前真实干扰、SINR、有效速率、通信服务量和通信实际活跃时间。功率阶段顺序统一为 $a_i^{\mathrm{pow}}(t)\rightarrow p_i^{\mathrm{prop}}(t)\rightarrow p_i^{\mathrm{cand}}(t;\ell)\rightarrow p_i^{\mathrm{exec}}(t)\rightarrow p_{ij,r}(t)\rightarrow$ SINR、实际服务、实际能耗和 outage；
+7. 联合执行器收集所有合法且非 idle 的候选传输边，按 2.12 定义的 $\Pi_{ij}^{\mathrm{tx}}(t)$ 升序字典序逐项扫描；违反已有发送端或半双工约束的候选立即拒绝，并设置 $y_{ij}(t)=0$、$\mathcal S_i^{\mathrm{exec}}(t)=\varnothing$ 和 $p_i^{\mathrm{exec}}(t)=0$，其余候选进入接受集合；
+8. 对每个 UAV 先保持 actor 提出的 CPU 频率不变；对接受集合中的通信候选，再按既有 candidate power 从高到低逐档计算联合主动能量预留，并选择满足硬约束的最高可行通信档位；只有通信功率已降至 $0$ 且当前组合仍不可行时，才按 actor 提议的 CPU 频率档位向下逐档检查，选择最高可行 CPU 频率。随后形成最终 $x_{ij,r}(t)$、$p_i^{\mathrm{exec}}(t)$、$\mathcal S_i^{\mathrm{exec}}(t)$ 和 CPU 频率；环境再结合当前真实槽级信道计算当前真实干扰、SINR、有效速率、通信服务量和通信实际活跃时间。功率阶段顺序统一为 $a_i^{\mathrm{pow}}(t)\rightarrow p_i^{\mathrm{prop}}(t)\rightarrow p_i^{\mathrm{cand}}(t;\ell)\rightarrow p_i^{\mathrm{exec}}(t)\rightarrow p_{ij,r}(t)\rightarrow$ SINR、实际服务、实际能耗和 outage；
 9. 执行本地或远程 CPU 服务并计算 CPU 实际活跃时间；
 10. 更新任务剩余 bit、剩余 cycle，并计算和扣除实际主动能耗；随后仅按 $\chi_{ij}^{\mathrm{att}}(t)$ 生成单次 outage 样本 $o_{ij}(t)$，并释放未实际消耗的预留；
 11. 在本槽服务量和剩余工作量更新完成后，结算按时完成任务和过期任务；
@@ -1680,6 +1710,14 @@ outage 口径的计划测试至少包括：
 - 验证通信能量预留使用 $p_i^{\mathrm{cand}}(t;\ell)$，而不是尚未确定的 $p_i^{\mathrm{exec}}(t)$；
 - 验证 $p_{ij,r}(t)$ 是由最终 $p_i^{\mathrm{exec}}(t)$ 和 $\mathcal S_i^{\mathrm{exec}}(t)$ 得到的 executed per-RU power；
 - 验证真实 SINR、实际服务、实际通信能耗和 outage 的非零功率条件均使用 executed power，且不存在未限定的 $p_i(t)$ 跨阶段复用。
+- 固定槽初状态、联合动作提案和环境状态重复执行两次时，最终 $y_{ij}(t)$、$x_{ij,r}(t)$、$p_i^{\mathrm{exec}}(t)$、CPU 频率和拒绝结果必须完全一致；
+- 具有不同 slack 的候选边按较小 slack 优先，slack 相同则按较大历史链路质量代理量优先，再按发送和接收 UAV ID 升序；
+- slack、历史链路质量代理量和发送 UAV ID 均相同的候选比较时，接收 UAV ID 升序必须给出唯一顺序，且不得调用随机 tie-break；
+- 半双工扫描按固定顺序接受不冲突候选；与已接受边违反既有半双工约束的候选必须被拒绝，并验证拒绝边的 $y_{ij}(t)=0$、空执行资源集、零执行功率和 NA outage；
+- 对同一联合动作，候选输入改用 set/dict 或不同未声明列表顺序时，排序后的 executor 输出必须不变；
+- 当前 actor CPU 频率下存在可行 candidate power 时，必须选择最高可行通信档位且 CPU 频率保持不变；
+- 只有通信 candidate power 已降至 $0$ 且联合能量仍不可行时，才允许按既有 CPU 频率档位降档；每次都选择最高可行 CPU 频率；
+- executor 排序和降档不得读取当前真实 SINR、当前 outage 或未来执行结果；上述内容只能在最终执行动作确定后由环境计算。
 
 历史到达率的计划测试至少包括：
 
