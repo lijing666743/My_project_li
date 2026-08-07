@@ -90,6 +90,7 @@ knowledge/project_plan/方案2.md
 - 最终一致性审计发现的 P1-04 已修订：已冻结等宽 RU 的 $B_{\mathrm{RU}}=B^{\mathrm{tot}}/R$、噪声 PSD/噪声系数到线性 RU 噪声功率的单位链、executed-action 干扰测量及历史更新时间；
 - 已补齐 CSI 陈旧偏移量、CSI 误差 dB 域与作用对象、干扰历史 mask、消息 AoI 的 refresh/increment 和当前槽测量不得泄漏给 actor 的可执行语义；测试代码与实验尚未实现。
 - 最终一致性审计发现的 P1-05/P1-06 已完成：reward timing 已冻结为 post-service / post-settlement，normalization scales 已冻结为 episode 开始前固定的 reference constants，episode horizon 与 terminal truncation 已定义；
+- 最终冻结审计发现的 P1-01/P1-07/P1-08 已完成本轮修订：已闭合 deadline slot transition/settlement，补齐 reset 状态，并将 zero-power executed communication 统一为 canonical idle；其他最终冻结 P1 仍待处理，`sections/2_system_model.md` 尚未正式冻结；
 - 审计中原有 P0/P1 修订项至此全部处理完成，但 `sections/2_system_model.md` 尚未正式冻结；下一步是第二次全文一致性审计；
 - 本项目尚未实现代码、测试、方法或实验，不得据此声称其已经完成；
 - 当前真实 SINR 仅在联合执行动作确定后由环境计算；

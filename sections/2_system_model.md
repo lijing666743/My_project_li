@@ -486,6 +486,23 @@ $$
 
 若任务在相同结算点已全部完成，则转为 done，并计为按时完成。系统仅保留按时完成和过期两类结算结果；expired 任务在 $t_n^{\mathrm{ddl}}$ 槽末结算后立即从所有活动队列中移除，因此在 $t_n^{\mathrm{ddl}}+1$ 的槽初不再出现在任何活动队列中，也不再接受传输或计算服务。
 
+
+为闭合槽末因果关系，任务状态转移必须先于 deadline settlement：对每个时隙 $t$，先完成本槽 service 并更新 $D_n^{\mathrm{rem}}$、$C_n^{\mathrm{rem}}$，再应用本槽已经发生但只能在槽末生效的 route、transfer-completion 和 CPU-completion 转移，完成全部队列 bookkeeping，最后在该 post-service/post-transition 状态上执行 done/expired 结算。该顺序冻结为：
+
+$$
+\boxed{
+\text{slot service}
+\rightarrow
+\text{slot-end task transition}
+\rightarrow
+\text{done/expired settlement}
+}
+$$
+
+其中，route 在槽末完成目的地 binding；local route 将 $d_n^{\mathrm{dst}}$ 锁定为源 UAV 并令 $D_n^{\mathrm{rem}}=0$；transmission 在本槽完成全部剩余 bit 时令 $D_n^{\mathrm{rem}}=0$，若 $C_n^{\mathrm{rem}}>0$ 则仅在槽末转入目的 UAV 的 CPU 队列、不得在同一槽再次获得 CPU service；CPU 完成全部 remaining cycles 时先形成 completion candidate。若任务在上述结算状态满足全部 workload 已完成，则转为 $\mathrm{done}$；否则若 $t=t_n^{\mathrm{ddl}}$，立即转为 $\mathrm{expired}$。不得采用 settlement 先于 route/transfer transition 的顺序。若任务转为 expired，则从所有 active service queues 和 waiting queues 中移除，且不进入下一槽的 route、tx 或 CPU service。
+
+三个 deadline-slot 边界例子如下。若 $t=t_n^{\mathrm{ddl}}$ 的槽初任务仍为 unbound 且本槽执行合法 route，binding 可以在槽末生效，但 route 不产生本槽 service；若 workload 仍未完成，则在同一槽的 settlement 中标记为 $\mathrm{expired}$，不进入下一槽。若 deadline slot 内 transmission 恰好使 $D_n^{\mathrm{rem}}\rightarrow0$ 而 $C_n^{\mathrm{rem}}>0$，允许完成 tx $\rightarrow$ CPU 的槽末 bookkeeping，但不提供同槽 CPU service，随后立即标记为 $\mathrm{expired}$。若 deadline slot 内 CPU 恰好使 $C_n^{\mathrm{rem}}\rightarrow0$ 且全部 workload 已完成，则标记为 $\mathrm{done}$ 而不是 $\mathrm{expired}$；completion 判断优先于 expiration 判断。
+
 ## 2.6 任务队列与EDF调度
 
 环境显式保存四类队列。未绑定队列为：
@@ -949,6 +966,15 @@ $$
 
 这里 $\Phi_P(\rho)=\rho P_i^{\max}$ 只是已有功率动作分支到物理量的映射。$p_i^{\mathrm{prop}}(t)$ 是 actor 的动作提案，不是最终实际发射功率；executor 可以拒绝该提案，或沿既有离散降档序列检查更低功率。因而资源宽度仍只表示一个组或两个相邻组，功率分支也不会产生离散集合之外的连续值。
 
+
+若 actor 选择了通信 tx proposal 但 $p_i^{\mathrm{prop}}(t)=0$，则该 proposal 在进入冲突解析和资源执行语义前预先 canonicalize 为 communication idle，并从候选通信边中排除。它不占用 half-duplex、不占用执行资源、不产生能量预留、干扰、实际 transmission attempt 或 outage 样本；power 0 档位本身保留，且不增加新的 idle 类别。形式上，其最终通信结果必须满足：
+
+$$
+p_i^{\mathrm{prop}}(t)=0
+\quad\Longrightarrow\quad
+\text{communication idle before executor}.
+$$
+
 executor 内部允许使用候选功率，但候选功率不属于动作接口、环境持久状态、actor observation 或第八个动作分支。令 $p_i^{\mathrm{cand}}(t;\ell)$ 表示第 $\ell$ 个降档检查阶段的临时值；它从 $p_i^{\mathrm{prop}}(t)$ 开始，只沿当前已有的绝对离散功率等级 $1.0\rightarrow0.5\rightarrow0.25\rightarrow0$ 向下选择：
 
 $$
@@ -963,6 +989,18 @@ p_i^{\mathrm{cand}}(t;1)=p_i^{\mathrm{prop}}(t).
 $$
 
 其中候选序列从 actor 提出的绝对离散等级开始并保持降序；若 proposed 等级为 $0.5$，候选序列为 $0.5,0.25,0$，而不是再次将 $p_i^{\mathrm{prop}}$ 乘以一个比例。这样 candidate 只表示 executor 的临时检查值，不重构既有功率档位。
+
+
+若通信候选已经通过前序 deterministic arbitration，但 energy feasibility search 将其 candidate power 降至 $0$，则最终执行结果同样 canonicalize 为 communication idle。该处理在本槽不触发 backtracking 或 re-arbitration；前序 half-duplex 扫描中已经被拒绝的低优先级 proposal 不因该降档而复活。
+
+$$
+p_i^{\mathrm{cand}}(t;\ell^\star)=0
+\ \text{and final }p_i^{\mathrm{exec}}(t)=0
+\quad\Longrightarrow\quad
+\text{communication idle}.
+$$
+
+半双工扫描得到的接受结果在功率降档完成前只属于 executor 内部的暂定结果；下述 $y_{ij}(t)$、$x_{ij,r}(t)$、$\mathcal S_i^{\mathrm{exec}}(t)$ 和 $p_i^{\mathrm{exec}}(t)$ 均指完成该 canonicalization 后的最终执行结果。
 
 在当前模型中，联合执行器对已选择的固定资源组内部资源单元不做部分删除、增加或重新分配；对提案链路只决定是否接受。于是链路 $i\rightarrow j$ 的最终实际资源占用指示为：
 
@@ -1030,6 +1068,31 @@ p_i^{\mathrm{cand}}(t;\ell^\star),
 $$
 
 其中 $j^\star$ 是发送 UAV $i$ 唯一被接受的目的 UAV，$\ell^\star$ 是 executor 最终接受的候选档位。被拒绝、退化为通信 idle 或没有实际资源占用时，$p_i^{\mathrm{exec}}(t)=0$；接受降档时允许 $p_i^{\mathrm{exec}}(t)\ne p_i^{\mathrm{prop}}(t)$。$p_i^{\mathrm{exec}}(t)$ 与 $y_{ij}(t)$、$x_{ij,r}(t)$ 以及 $\mathcal S_i^{\mathrm{exec}}(t)$ 属于同一最终执行阶段。
+
+
+因此，$p_i^{\mathrm{exec}}(t)=0$ 的最终语义唯一为 physical communication idle：
+
+$$
+\boxed{
+p_i^{\mathrm{exec}}(t)=0
+\Longrightarrow
+\text{no executed communication}
+}
+$$
+
+执行器必须在最终结果形成前同步清除该 UAV 的通信执行变量：
+
+$$
+p_i^{\mathrm{exec}}(t)=0
+\Longrightarrow
+y_{ij}(t)=0\ \forall j,
+\qquad
+x_{ij,r}(t)=0\ \forall j,r,
+\qquad
+\mathcal S_i^{\mathrm{exec}}(t)=\varnothing.
+$$
+
+不得保留 $y_{ij}(t)=1$ 或 $\mathcal S_i^{\mathrm{exec}}(t)\ne\varnothing$ 与 $p_i^{\mathrm{exec}}(t)=0$ 并存的半执行状态；因此后续 SINR、service、energy、interference measurement 和 outage 均不由该 idle 结果产生。
 
 链路未被接受时，实际资源集合为空；后续实际服务、通信能耗和 outage 资格均使用 $\mathcal S_i^{\mathrm{exec}}(t)$ 或等价的 $x_{ij,r}(t)$，不使用 $\mathcal S_i^{\mathrm{prop}}(t)$。
 
@@ -1515,7 +1578,7 @@ $$
 \forall i\in\mathcal U.
 $$
 
-CPU 与无线通信模块被视为并行资源，因此半双工约束不限制 CPU 和无线动作之间的并行性。联合执行器先收集所有合法且非 idle 的候选通信边。对每条候选边 $i\rightarrow j$，令 $n_{ij}^{\star}$ 为 $Q_{i\rightarrow j}^{\mathrm{tx}}(t)$ 的 EDF 队首任务，并令 $\widehat\Gamma_{ij}^{\mathrm{hist}}(t)$ 表示当前模型已经定义的逐资源单元代理量或固定资源组聚合值；不引入新的链路质量指标。
+CPU 与无线通信模块被视为并行资源，因此半双工约束不限制 CPU 和无线动作之间的并行性。联合执行器先收集所有合法、非 idle 且 $p_i^{\mathrm{prop}}(t)>0$ 的候选通信边；raw zero-power proposal 已在此前 canonicalize 为 idle。对每条候选边 $i\rightarrow j$，令 $n_{ij}^{\star}$ 为 $Q_{i\rightarrow j}^{\mathrm{tx}}(t)$ 的 EDF 队首任务，并令 $\widehat\Gamma_{ij}^{\mathrm{hist}}(t)$ 表示当前模型已经定义的逐资源单元代理量或固定资源组聚合值；不引入新的链路质量指标。
 
 候选通信边的唯一仲裁键冻结为：
 
@@ -1543,34 +1606,101 @@ $$
 (\text{最终执行动作}).
 $$
 
-该映射不得依赖 Python set/dict 的偶然遍历顺序、未声明的列表顺序、随机 tie-break 或实现者自行选择的升降序；完成半双工扫描后才进入上述能量降档顺序。
+该映射不得依赖 Python set/dict 的偶然遍历顺序、未声明的列表顺序、随机 tie-break 或实现者自行选择的升降序；完成半双工扫描后才进入上述能量降档顺序。若后续 energy downgrade 使 candidate power 降至 $0$，只执行上述 final canonicalization，不在本槽 backtrack 或 re-arbitrate。
 
 ## 2.13 时隙事件顺序
 
-每个 episode 在时隙 $0$ 开始前先执行 reset：初始化 $\mathbf p_i(0)$、$\mathbf v_i(0)$ 及其他移动状态，设置 $\Delta s_{ij}(0)=0$，直接采样 $X_{ij}(0)$，并依据初始环境状态生成首个真实信道样本 $h_{ij,r}(0)$；随后按 2.8.5 计算 $t=0$ 的 CSI 历史索引、可用性 mask 和陈旧 CSI 特征。reset 不生成 pre-episode 信道历史，也不定义 $\mathbf p_i(-1)$、$X_{ij}(-1)$ 或 $h_{ij,r}(-1)$。
+### 2.13.1 episode reset 与 slot-0 readiness
 
-若 $t=0$ 的 CSI 或历史干扰测量不可用，则分别使用既有缺省 CSI、$I_{j,r}^{\mathrm{def}}$、$m_{ij}^{\mathrm{CSI}}(0)=0$ 或 $m_{j,r}^{I}(0)=0$；历史质量代理按既有 $\widehat\Gamma_{ij,r}^{\mathrm{hist}}(0)$ 公式由缺省 $\widehat h$ 和 $\widehat Z$ 形成，并始终与相应 mask 配对，不把占位值解释为真实信道或零干扰。
+每个 episode 在进入 $\mathrm{actor}(0)$ 之前执行一次完整 reset。reset 后环境 slot index 直接为 $t=0$，不存在需要读取的 $t=-1$ 状态；actor observation 所依赖的每个 state、history 和 mask 必须已经具有合法数值，或具有明确的 $\mathrm{NA}$ 与可用性 mask，不通过 negative index、lazy initialization 或 Python 默认空值补齐。
 
-每个 episode 的决策与服务时隙固定为 $t=0,1,\ldots,T-1$，其中 $T-1$ 是最后一个可执行 service slot；不存在 $t=T$ 的额外 actor decision、通信或 CPU service。每个时隙严格按以下顺序执行，以保持任务、bit、cycle 和能量的因果一致性。槽初读取已有队列，槽内完成服务，槽末统一处理状态更新和事件入队：
+能量初值对每个 UAV 满足：
+$$
+E_i^{\mathrm{res}}(0)=E_i^0,
+\qquad
+E_i^0>0.
+$$
+$E_i^0$ 是 episode 初始主动能量预算，$E_i^{\mathrm{res}}(0)$ 是 reset 后剩余主动能量，二者不与 reservation energy 混用。
 
-1. 槽初读取已有任务、四类队列、候选邻居、陈旧 CSI、历史干扰摘要和延迟消息；历史到达率估计按 2.4 节仅使用 $A_i(0),\ldots,A_i(t-1)$ 及对应的 $m_i^\lambda(t)$，$t=0$ 使用固定缺省值和无效 mask；
-2. actor 根据槽初局部观测生成七分支动作提案；
-3. 对一个未绑定 EDF 任务执行 route 决策；
-4. 从槽初已有的非空传输队列中执行 tx_select；
-5. 解析固定资源组、资源宽度和功率动作，形成 $\mathcal S_i^{\mathrm{prop}}(t)$ 与 $p_i^{\mathrm{prop}}(t)$；此时 $y_{ij}(t)$、$x_{ij,r}(t)$ 和 $\mathcal S_i^{\mathrm{exec}}(t)$ 尚未形成；
-6. 选择一个槽初 CPU 队列和 CPU 频率档位；
-7. 联合执行器收集所有合法且非 idle 的候选传输边，按 2.12 定义的 $\Pi_{ij}^{\mathrm{tx}}(t)$ 升序字典序逐项扫描；违反已有发送端或半双工约束的候选立即拒绝，并设置 $y_{ij}(t)=0$、$\mathcal S_i^{\mathrm{exec}}(t)=\varnothing$ 和 $p_i^{\mathrm{exec}}(t)=0$，其余候选进入接受集合；
-8. 对每个 UAV 先保持 actor 提出的 CPU 频率不变；对接受集合中的通信候选，再按既有 candidate power 从高到低逐档计算联合主动能量预留，并选择满足硬约束的最高可行通信档位；只有通信功率已降至 $0$ 且当前组合仍不可行时，才按 actor 提议的 CPU 频率档位向下逐档检查，选择最高可行 CPU 频率。随后形成最终 $x_{ij,r}(t)$、$p_i^{\mathrm{exec}}(t)$、$\mathcal S_i^{\mathrm{exec}}(t)$ 和 CPU 频率；环境再结合当前真实槽级信道计算当前真实干扰、SINR、有效速率、通信服务量和通信实际活跃时间。功率阶段顺序统一为 $a_i^{\mathrm{pow}}(t)\rightarrow p_i^{\mathrm{prop}}(t)\rightarrow p_i^{\mathrm{cand}}(t;\ell)\rightarrow p_i^{\mathrm{exec}}(t)\rightarrow p_{ij,r}(t)\rightarrow$ SINR、实际服务、实际能耗和 outage；
-9. 执行本地或远程 CPU 服务并计算 CPU 实际活跃时间；
-10. 更新任务剩余 bit、剩余 cycle，并计算和扣除实际主动能耗；随后仅按 $\chi_{ij}^{\mathrm{att}}(t)$ 生成单次 outage 样本 $o_{ij}(t)$，并释放未实际消耗的预留；
-11. 在本槽服务量和剩余工作量更新完成后，结算按时完成任务和过期任务；
-12. 使用步骤 10 已确定的全体 UAV 实际主动能耗、步骤 11 已完成的按时完成/过期结算，以及服务后的任务工作量计算 $r_t$。该 reward 计算发生在槽末到达生成与入队之前，因此不读取刚生成且只能在 $t+1$ 槽初可见的 $A_i(t)$，也不产生额外的 terminal reward；
-13. 将本槽 route 任务、本槽传输完成任务和新到达任务在槽末入队；新到达任务数记为 $A_i(t)$，并记录 $t_n^{\mathrm{arr}}=t$，在下一时隙首次可 route。本槽 route 决策在此时生效并锁定目的地，绑定为 local 的 route 任务同步设置 $d_n^{\mathrm{dst}}\leftarrow i_n$ 和 $D_n^{\mathrm{rem}}\leftarrow0$，绑定为远程 UAV $j$ 的 route 任务同步设置 $d_n^{\mathrm{dst}}\leftarrow j$（$j\ne i_n$），本槽传输完成任务在下一时隙首次可计算；$A_i(t)$ 不影响时隙 $t$ 的 actor 观测，最早在时隙 $t+1$ 槽初进入历史到达率或队列观测；
-14. 在当前真实信道、最终 executed 传输、真实 SINR、服务量和 outage 均已计算后，按 2.9 的干扰求和形成 $I_{ij,r}^{\mathrm{meas}}(t)$，并在接收端历史摘要中记作 $I_{j,r}^{\mathrm{meas}}(t)$；同时生成既有测量可用性 mask。该测量只在槽末形成，缺测不等同于真实零干扰。其 EMA、历史 mask 和消息 AoI 按 2.8.5 更新为下一槽状态，当前测量不返回给当前槽 actor。
-15. 若 $t<T-1$，更新外生移动和下一槽真实信道状态，并进入下一槽；CSI 使用既有固定配置陈旧偏移量计算 $\ell_{ij}^{\mathrm{CSI}}(t)=t-a_{ij}^{\mathrm{CSI}}(t)$，不新增独立的 CSI refresh/increment 过程。若 $t=T-1$，完成上述 reward 与槽末必要更新后执行 terminal bookkeeping，并在边界 $T$ 结束 episode，不构造 $t=T$ 的 actor 或 service。普通槽的事件依赖关系固定为：slot-start history $\rightarrow$ actor $\rightarrow$ executor $\rightarrow$ true channel/SINR/service $\rightarrow$ actual energy $\rightarrow$ completion/deadline settlement $\rightarrow r_t \rightarrow$ slot-end updates/arrivals $\rightarrow t+1$。
-该顺序带来三条不可绕过的可用性规则：新 route 任务不能在本槽由 tx_select 服务；本槽传输完成任务不能在本槽计算；槽末生成的新任务不能在本槽再次参与 route。完成和过期结算均发生在本槽服务量及剩余工作量更新之后，且 deadline 时隙仍允许服务。因而任何算法都共享相同的服务边界，不能通过改变网络输出顺序获得额外的槽内服务。
+在本模型不设置 episode initial backlog 的约定下，slot 0 开始前正文已有的任务与队列结构均为空：
+$$
+\mathcal T_0=\varnothing,
+\qquad
+Q_i^{\mathrm{unb}}(0)=Q_i^{\mathrm{loc}}(0)=\varnothing,
+\qquad
+Q_{i\rightarrow j}^{\mathrm{tx}}(0)
+=
+Q_{i\rightarrow j}^{\mathrm{cpu}}(0)
+=
+\varnothing,
+\quad
+i\ne j.
+$$
+$\mathcal T_0$ 使用 2.14 已定义的 active task collection，不引入第二套任务集合或队列名称。
 
-固定 horizon 的终止规则如下。若任务满足 $t_n^{\mathrm{ddl}}\le T-1$，则它仍在其 deadline slot 接受最后一次合法 service；该槽服务和剩余工作量更新后，完成则记为 $\mathrm{done}$，否则立即记为 $\mathrm{expired}$，episode 在边界 $T$ 到来时不再改写这一结算结果。若任务在边界 $T$ 仍未完成且 $t_n^{\mathrm{ddl}}\ge T$，则只在 episode terminal bookkeeping 中标记为 $\mathrm{truncated}$，不把该标签加入 $\mathcal S_{\mathrm{task}}$，也不将其视为物理任务状态转移。由统一到达过程在最后一个槽末生成的 $A_i(T-1)$ 同样只用于 terminal bookkeeping，直接记为 $\mathrm{truncated}$；它们不进入 $t=T$ 的 route 或 service，也不影响 $r_{T-1}$。
+正文当前只给出任务记录中的 $id_n$ 和固定任务 ID tie-break，未另行冻结起始编号。因此 reset 时 task-ID counter 置为 $0$，新任务按 $n=0,1,2,\ldots$ 获得 deterministic bookkeeping ID。槽末同一时隙的新任务先按 UAV ID 升序处理，同一 UAV 内再沿 arrival generator 的稳定生成顺序单调递增编号；编号顺序不依赖 Python 容器遍历顺序，也不改变任务分布或到达数量。
+
+reset 同时保持已冻结的移动、阴影和真实信道边界：直接提供 $\mathbf p_i(0)$、$\mathbf v_i(0)$，设置 $\Delta s_{ij}(0)=0$，采样 $X_{ij}(0)\sim\mathcal N(0,\sigma_s^2)$，并生成首个合法 true-channel sample $h_{ij,r}(0)$。不定义或访问 $\mathbf p_i(-1)$、$X_{ij}(-1)$ 或 $h_{ij,r}(-1)$。
+
+陈旧 CSI、历史干扰和历史质量特征也必须在 $\mathrm{actor}(0)$ 前合法定义：沿用既有 CSI stale index/availability、$\widehat I_{j,r}^{\mathrm{hist}}(0)=I_{j,r}^{\mathrm{def}}$、$m_{j,r}^{I}(0)=0$、$a_j^{\mathrm{msg}}(0)=\mathrm{NA}$ 以及历史质量的既有缺省值与 mask。CSI error realization 按 CSI error process 的正式采样规则生成；其采样时序留待对应 P1 修订冻结，本轮不规定 $\xi$ 的独立性、重采样频率或 $\sigma_{\mathrm{CSI}}$ 分布，也不新建持久的 $\xi(0)$ state。
+
+episode-level bookkeeping 在 reset 时初始化为物理上合法的空状态：completed、expired 和 truncated counters 为 $0$；实际 transmission-attempt count、outage numerator 和 denominator 为 $0$，无样本的 outage ratio/average 为 $\mathrm{NA}$；energy accumulator 为 $0$；latency accumulator 和 latency sample list 为空。既有 normalization reference constants 不在 reset 中重新估计。
+
+### 2.13.2 时隙事件顺序
+
+每个 episode 的决策与服务时隙固定为 $t=0,1,\ldots,T-1$，其中 $T-1$ 是最后一个可执行 service slot；不存在 $t=T$ 的额外 actor decision、通信或 CPU service。每个时隙严格按以下顺序执行，以保持任务、bit、cycle、energy、settlement、reward 和 arrival 的因果一致性：
+
+1. 读取 slot-start state、已有任务、四类队列、候选邻居、陈旧 CSI、历史干扰摘要、延迟消息、历史到达率和对应 masks；历史到达率按 2.4 节仅使用 $A_i(0),\ldots,A_i(t-1)$，$t=0$ 使用固定缺省值和无效 mask。
+2. actor 根据槽初局部观测生成七分支动作提案。
+3. 对通信 tx proposal 执行 raw zero-power canonicalization：若 $p_i^{\mathrm{prop}}(t)=0$，该 proposal 作为 communication idle 排除，不进入 half-duplex、资源、能量、干扰或实际 attempt 语义。
+4. 对一个未绑定 EDF 任务执行 route 决策；从槽初已有的非空传输队列中执行 tx_select；解析固定资源组、资源宽度和功率动作，形成 $\mathcal S_i^{\mathrm{prop}}(t)$、$p_i^{\mathrm{prop}}(t)$，并选择一个槽初 CPU 队列和 CPU 频率档位。route 只在槽末 binding，不产生本槽下一阶段 service。
+5. 对剩余合法且非 idle 的通信候选按既有 $\Pi_{ij}^{\mathrm{tx}}(t)$ 升序字典序执行 deterministic executor 和 half-duplex 扫描；该步骤形成暂定接受结果，不改变既有仲裁键、字典序或发送/接收约束。
+6. 对暂定接受通信候选沿既有 $1.0\rightarrow0.5\rightarrow0.25\rightarrow0$ candidate power 顺序进行 power-first energy downgrade；只有通信功率降至 $0$ 且联合能量仍不可行时，才按既有顺序执行 CPU frequency downgrade，并选择最高可行档位。
+7. 若 raw proposal 或 candidate downgrade 的最终执行功率为 $0$，执行 final zero-power canonicalization；本槽不进行 backtracking 或 re-arbitration，不复活前序已拒绝的低优先级 proposal。
+8. 形成最终 $y_{ij}(t)$、$x_{ij,r}(t)$、$\mathcal S_i^{\mathrm{exec}}(t)$、$p_i^{\mathrm{exec}}(t)$ 和 $f_i(t)$；其中 $p_i^{\mathrm{exec}}(t)=0$ 时最终通信变量必须全部为 idle/zero。
+9. 在最终执行变量确定后，结合当前真实槽级信道计算真实 interference、SINR、有效速率、通信 service 和通信实际活跃时间；zero-power idle 不进入真实 SINR desired edge。
+10. 更新本槽实际 service 造成的 $D_n^{\mathrm{rem}}$、$C_n^{\mathrm{rem}}$，计算并扣除 actual active energy，释放未实际消耗的 reservation，并按 $\chi_{ij}^{\mathrm{att}}(t)$ 生成 outage 样本；zero-power idle 不产生 interference、$I^{\mathrm{meas}}$、transmission service、tx energy 或 actual attempt。
+11. 应用本槽已经发生但只能在槽末生效的 task transition 并完成 bookkeeping：route binding 在槽末生效；local route 锁定 source UAV 并令 $D_n^{\mathrm{rem}}=0$；tx 完成全部剩余 bits 时转入目的 UAV CPU waiting queue；CPU 完成全部 remaining cycles 时形成 completion candidate；任何新转入 CPU queue 的任务都不得在同一槽再次获得 CPU service。
+12. 在 post-service/post-transition 状态上执行 settlement：先判断全部 workload 是否完成，完成则记为 $\mathrm{done}$；否则若 $t=t_n^{\mathrm{ddl}}$ 则记为 $\mathrm{expired}$，并立即从所有 active service queues/waiting queues 移除，不进入下一槽 service。
+13. 使用 actual energy、post-service/post-settlement task state 和既有 reward 公式计算 $r_t$；reward 仍发生在 slot-end arrival 之前，$A_i(t)$ 不影响同槽 reward。
+14. 在当前真实信道和最终 executed action 已确定后，按既有规则形成当前 measurement/history 更新；该更新只使用最终 executed nonzero communication，zero-power idle 不进入 $I^{\mathrm{meas}}$。
+15. 将本槽 route/transfer-completion 结果和新到达任务在槽末入队；新任务记为 $A_i(t)$、记录 $t_n^{\mathrm{arr}}=t$，下一时隙才可见和 route；新到达不影响时隙 $t$ 的 actor 或 reward。
+16. 若 $t<T-1$，更新下一槽外生移动、真实信道和既有历史；CSI 使用既有固定配置陈旧偏移量计算 $\ell_{ij}^{\mathrm{CSI}}(t)=t-a_{ij}^{\mathrm{CSI}}(t)$，不新增独立的 CSI refresh/increment 过程。若 $t=T-1$，执行 terminal bookkeeping 并在边界 $T$ 结束 episode，不构造 $t=T$ 的 actor 或 service。
+
+因此，完整事件依赖关系冻结为：
+$$
+\text{slot-start state/masks}
+\rightarrow
+\text{actor proposal}
+\rightarrow
+\text{raw zero-power canonicalization}
+\rightarrow
+\text{deterministic executor}
+\rightarrow
+\text{energy downgrade}
+\rightarrow
+\text{final zero-power canonicalization}
+\rightarrow
+\text{final }(y,x,\mathcal S^{\mathrm{exec}},p^{\mathrm{exec}},f)
+\rightarrow
+\text{true channel/SINR/service}
+\rightarrow
+\text{remaining workload update}
+\rightarrow
+\text{slot-end task transition}
+\rightarrow
+\text{done/expired settlement}
+\rightarrow
+\text{reward}
+\rightarrow
+\text{current measurement/history update}
+\rightarrow
+\text{slot-end arrival}
+\rightarrow
+\text{next slot or terminal bookkeeping}.
+$$
+
+固定 horizon 的终止规则如下：若任务满足 $t_n^{\mathrm{ddl}}\le T-1$，则它仍在其 deadline slot 接受最后一次合法 service；该槽服务和剩余工作量更新后，完成则记为 $\mathrm{done}$，否则立即记为 $\mathrm{expired}$，episode 在边界 $T$ 到来时不再改写这一结算结果。若任务在边界 $T$ 仍未完成且 $t_n^{\mathrm{ddl}}\ge T$，则只在 episode terminal bookkeeping 中标记为 $\mathrm{truncated}$，不把该标签加入 $\mathcal S_{\mathrm{task}}$，也不将其视为物理任务状态转移。由统一到达过程在最后一个槽末生成的 $A_i(T-1)$ 同样只用于 terminal bookkeeping，直接记为 $\mathrm{truncated}$；它们不进入 $t=T$ 的 route 或 service，也不影响 $r_{T-1}$。
 
 $\mathrm{truncated}$ 与 $\mathrm{expired}$ 的统计边界保持分离：$\mathrm{truncated}$ 只用于 episode 终止统计、trajectory/replay 终止标记和 evaluation accounting，不计入 expired numerator，不虚构 $t_n^{\mathrm{cmp}}$ 或 $T_n^{\mathrm{E2E}}$，并单独报告其数量或比例。E2E completion latency 只对实际完成的任务统计；outage 仍只使用 $0,\ldots,T-1$ 内真实传输尝试，energy 仍只统计这些时隙内的实际主动能耗。系统不增加 $T,T+1,\ldots$ 的 post-horizon drain/service slots，不为未完成任务等待到 done/expired，也不由 truncation 自动产生 $r(T)$ 或其他额外 terminal penalty。
 
@@ -1846,6 +1976,22 @@ outage 口径的计划测试至少包括：
 18. terminal 不新增虚构 reward；
 19. outage denominator 只使用实际 transmission attempts；
 20. 固定 seed 下 terminal accounting 可复现。
+
+
+本轮 P1-01/P1-07/P1-08 专项计划测试仅记录测试要求，不表示测试代码已经实现：
+
+1. deadline slot 中 unbound 任务执行 route 后可在槽末完成 binding，但 unresolved task 在同槽 settlement 后记为 expired，且不进入下一槽 service。
+2. deadline slot 中 transmission 恰好完成全部 bits、仍有 $C_n^{\mathrm{rem}}>0$ 时，允许 tx $\rightarrow$ CPU bookkeeping，但同槽不 CPU service，随后记为 expired。
+3. deadline slot 中 CPU 恰好完成全部 remaining cycles 时，completion 判断优先，任务记为 done 而不是 expired。
+4. reset 后验证 $E_i^{\mathrm{res}}(0)=E_i^0>0$。
+5. reset 后验证 $Q_i^{\mathrm{unb}}(0)$、$Q_i^{\mathrm{loc}}(0)$、$Q_{i\rightarrow j}^{\mathrm{tx}}(0)$、$Q_{i\rightarrow j}^{\mathrm{cpu}}(0)$ 和 active task collection 全部为空。
+6. reset 后验证 task-ID counter 从 $0$ 开始，并在固定 seed 下按 UAV ID 升序及 generator 稳定顺序分配可复现 ID。
+7. reset 后验证 completed/expired/truncated count、actual attempt count、outage numerator/denominator、energy accumulator 和 latency accumulator/sample list 的初值；无样本 ratio/average 为 $\mathrm{NA}$。
+8. 验证 $\mathrm{actor}(0)$ 前所有 state/history/mask 均为合法数值或明确 $\mathrm{NA}$ 加 mask，且不读取 negative index。
+9. 验证 raw $p_i^{\mathrm{prop}}(t)=0$ 的通信 proposal 不占 half-duplex、执行资源或能量预留，也不产生 interference、$I^{\mathrm{meas}}$ 或 actual attempt。
+10. 验证 candidate downgrade 到 $p_i^{\mathrm{exec}}(t)=0$ 后最终满足 $y_{ij}(t)=0$、$x_{ij,r}(t)=0$ 和 $\mathcal S_i^{\mathrm{exec}}(t)=\varnothing$。
+11. 验证 candidate downgrade 到 $0$ 后不 backtrack/re-arbitrate，不复活前序已拒绝 proposal；既有 executor priority key 和最高可行档位顺序保持不变。
+12. 固定槽初状态、联合动作提案和环境输入重复执行时，executor 与 task settlement 的最终输出完全确定，且 zero-power 不产生 outage 样本。
 
 物理层初始时刻的计划测试至少包括：
 
