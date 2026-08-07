@@ -79,6 +79,10 @@ knowledge/project_plan/方案2.md
 - 最终一致性审计发现的 P0-02 已修复：历史到达率估计在时隙 $t$ 仅使用 $A_i(0),\ldots,A_i(t-1)$，槽末生成的 $A_i(t)$ 不进入当前槽 actor 观测，最早在 $t+1$ 槽初产生影响；
 - 历史到达率已补充短窗口、$t=0$ 缺省值 $0$ 与可用性 mask 的统一定义；
 - 最终一致性审计发现的 P0-03 已修复：episode reset 显式初始化位置、阴影、真实信道与陈旧 CSI 边界，位移和阴影递推不再访问负时隙历史；
+- 最终一致性审计发现的 P1-01/P1-02 已修复：七分支资源动作与资源构造变量已统一映射，inactive width 使用既有定义域中的 canonical encoding，不新增 idle 类别；
+- 已拆分 actor 的 proposed power、executor 内部 candidate power 与最终 executed power，并将 per-RU power、真实 SINR、实际服务、实际通信能耗和 outage 绑定到 executed power；
+- 通信能量预留明确使用 candidate power；executor 拒绝、降档和最终执行语义已写入系统模型的事件顺序；
+- 已补充上述动作接口与功率阶段语义的计划测试，测试代码与实验尚未实现；
 - 已统一 $\Delta s_{ij}(0)=0$、$X_{ij}(0)\sim\mathcal N(0,\sigma_s^2)$、无负索引 CSI 历史、缺省值与可用性 mask，以及当 $\ell_{ij}^{\mathrm{CSI}}(t)=0$ 时首次读取 $h_{ij,r}(0)$ 的语义，并补充对应计划测试；
 - 系统模型仍有其他审计问题待修复，尚未冻结；
 - 本项目尚未实现代码、测试、方法或实验，不得据此声称其已经完成；
