@@ -4,13 +4,13 @@
 
 本项目面向外生移动和动态 U2U 邻居环境，研究在 UAV 资源异构、业务负载异构、建筑物遮挡、有限频谱、不完美 CSI、跨时隙传输/计算队列和任务截止期共同存在时的单跳 U2U-MEC 协同卸载与资源调度问题。
 
-项目的唯一实施基线为：
+项目的既有方案源为：
 
 ```
 knowledge/project_plan/方案2.md
 ```
 
-该方案已冻结为“修订版可实施实验方案（编码冻结版）”。后续 `sections/`、配置文件、代码、测试和实验报告均须与该方案保持一致。
+该文件已冻结为“修订版可实施实验方案（编码冻结版）”，但位于 AGENTS.md 定义的 protected `knowledge/` 目录，本轮自动任务不得修改。当前环境实现规格以已经冻结的 `sections/2_system_model.md` 为准；后续 `sections/`、配置文件、代码、测试和实验报告均须与冻结章节保持一致。
 
 ## 研究主线
 
@@ -90,38 +90,37 @@ knowledge/project_plan/方案2.md
 - 最终一致性审计发现的 P1-04 已修订：已冻结等宽 RU 的 $B_{\mathrm{RU}}=B^{\mathrm{tot}}/R$、噪声 PSD/噪声系数到线性 RU 噪声功率的单位链、executed-action 干扰测量及历史更新时间；
 - 已补齐 CSI 陈旧偏移量、CSI 误差 dB 域与作用对象、干扰历史 mask、消息 AoI 的 refresh/increment 和当前槽测量不得泄漏给 actor 的可执行语义；测试代码与实验尚未实现。
 - 最终一致性审计发现的 P1-05/P1-06 已完成：reward timing 已冻结为 post-service / post-settlement，normalization scales 已冻结为 episode 开始前固定的 reference constants，episode horizon 与 terminal truncation 已定义；
-- 最终冻结审计发现的 P1-01/P1-07/P1-08 已完成本轮修订：已闭合 deadline slot transition/settlement，补齐 reset 状态，并将 zero-power executed communication 统一为 canonical idle；其他最终冻结 P1 仍待处理，`sections/2_system_model.md` 尚未正式冻结；
-- 审计中原有 P0/P1 修订项至此全部处理完成，但 `sections/2_system_model.md` 尚未正式冻结；下一步是第二次全文一致性审计；
+- 最终冻结审计发现的 P1-01/P1-07/P1-08 已完成本轮修订：已闭合 deadline slot transition/settlement，补齐 reset 状态，并将 zero-power executed communication 统一为 canonical idle；
+- 审计中原有 P0/P1 修订项至此全部处理完成；
 - 本轮最终冻结审计已收口 P1-02 至 P1-06：移动边界、reset 安全距离、small-scale fading、CSI error、interference measurement mask 和 historical-quality scalar 的实现规格均已唯一化；
 - Section 2 已补齐固定采样顺序、fixed-seed 可复现性、当前测量不得泄漏给 actor、measured zero 与 missing 区分，以及 proposed resource set 上的 valid-RU arithmetic-mean 聚合；
 - 当前最终 READY TO FREEZE 审计唯一剩余的 P1 已修复：消除 scalar historical quality 观测执行器循环，actor 只读取 proposal 形成前已存在的 per-RU historical quality 及其有效性 mask；
 - executor-only scalar historical quality 仅在 actor 形成 $\mathcal S_i^{\mathrm{prop}}(t)$ 后计算，并继续使用既有 valid-RU masked arithmetic mean、fallback $0$ 和 $(\operatorname{slack},-\widehat\Gamma_{ij}^{\mathrm{hist}},i,j)$ 优先级键；
-- 本轮仍未实现代码或测试、未生成实验产物、未执行 git add/commit；Section 2 仅等待用户复核，不在本轮宣告正式 READY TO FREEZE；
-- 本轮仅更新 sections/2_system_model.md 与本进度说明，未实现代码或测试、未生成实验产物、未执行 git add/commit；Section 2 等待用户复核，不在本轮宣告正式冻结。
-- 本项目尚未实现代码、测试、方法或实验，不得据此声称其已经完成；
+- Section 2 系统模型已完成最终冻结验收：FROZEN；P0 = 0；P1 = 0；
+- 当前尚未开始正式环境代码实现；tests 尚未实现；尚未运行实验；尚无实验结果；Section 3 Methods 尚待冻结；Section 4 Experimental Protocol 尚待冻结；
+- 本项目尚未开始正式环境代码实现；tests 尚未实现；尚未运行实验；尚无实验结果，不得据此声称其已经完成；
 - 当前真实 SINR 仅在联合执行动作确定后由环境计算；
 - 已消除 actor 读取当前联合干扰的未来信息风险；
 - 联合执行器使用保守能量预留上界保证执行前硬可行性；
 - 剩余能量只扣除实际能耗，未使用的预留能量在时隙结束时释放；
 - 已修正端到端时延及 slack 的 off-by-one 语义；
 - 已绑定任务不允许重新路由；
-- 其他系统模型问题仍待逐项修订；
-- 当前仍处于初始化和规格修订阶段；
+- Section 2 系统模型已完成冻结验收，当前不再新增系统模型语义；
+- 当前已完成 Section 2 冻结，进入 Section 3 Methods 与 Section 4 Experimental Protocol 的规格阶段；
 - 最终项目方案已经冻结；
-- 项目状态文档正在与冻结方案同步；
-- `sections/2_system_model.md`、`sections/3_methods.md` 和 `sections/4_experimental_protocol.md` 尚待正式整理；
+- 项目状态文档正在与冻结章节同步；
+- `sections/2_system_model.md` 已冻结，`sections/3_methods.md` 与 `sections/4_experimental_protocol.md` 尚待正式整理和冻结；
 - 环境、算法和实验脚本尚未实现；
 - 当前没有真实实验结果。
 
 ## 下一步
 
-1. 完成 `sections/2_system_model.md`；
-2. 完成 `sections/3_methods.md`；
-3. 完成 `sections/4_experimental_protocol.md`；
-4. 执行系统模型、方法和实验协议的一致性审计；
-5. 修改 `AGENTS.md`，结束初始化阶段；
-6. 开始 Gate P 参数校准和 Gate 0 环境测试；
-7. 依次实现规则基线、Factorized-Action GAT-QMIX 和 CA-GAT-MAPPO。
+1. 完成 `sections/3_methods.md`；
+2. 完成 `sections/4_experimental_protocol.md`；
+3. 执行 Section 2/3/4 跨章节接口一致性审计；
+4. 通过后进入 Python 环境实现阶段。
+
+- `knowledge/project_plan/方案2.md` 仍包含尚未同步的旧系统模型语义，因为该文件位于 AGENTS.md 定义的 protected `knowledge/` 目录，当前自动任务不得修改。当前环境实现规格以已经冻结的 `sections/2_system_model.md` 为准（PROTECTED SYNC DEBT）。
 
 ## 可选扩展
 

@@ -1,6 +1,6 @@
 # sections 目录说明
 
-## 唯一方案源
+## 方案源与当前实现规格
 
 项目的唯一实施基线为：
 
@@ -8,7 +8,7 @@
 knowledge/project_plan/方案2.md
 ```
 
-该文件已经冻结。`sections/` 中的论文正文不得自行改变任务状态机、资源异构定义、动作空间、信息权限、时隙因果或实验边界。
+该文件已经冻结，但位于 AGENTS.md 定义的 protected `knowledge/` 目录，本轮自动任务不得修改。当前环境实现规格以已经冻结的 `sections/2_system_model.md` 为准。`sections/` 中的论文正文不得自行改变任务状态机、资源异构定义、动作空间、信息权限、时隙因果或实验边界。
 
 ## 章节状态与职责
 
@@ -16,17 +16,17 @@ knowledge/project_plan/方案2.md
 | -------------------------------------- | ------------------ | ------------------------------------------------------------ | ------------------------------------ |
 | `0_abstract_keywords.md`               | 等待核心章节冻结   | 摘要与关键词，不提前写实验结论                               | 在系统模型、方法和实验协议完成后整理 |
 | `1_introduction.md`                    | 等待核心章节冻结   | 研究背景、问题、贡献和文章结构                               | 在三章一致性审计后正式撰写           |
-| `2_system_model.md`                    | 下一步进行中       | 系统对象、符号、异构性、任务状态机、队列、时隙因果、信道、动作语义和信息权限 | 按编码冻结版方案正式化               |
-| `3_methods.md`                         | 等待系统模型完成   | CA-GAT-MAPPO、Factorized-Action GAT-QMIX、训练与执行流程     | 不得重新修改系统物理规则             |
-| `4_experimental_protocol.md`           | 等待方法接口完成   | Gate P–Gate 6、实验族 A/B/C、参数校准、统计和日志规范        | 不得重新定义系统和算法接口           |
+| `2_system_model.md`                    | FROZEN / COMPLETE SPECIFICATION | 系统对象、符号、异构性、任务状态机、队列、时隙因果、信道、动作语义和信息权限 | 作为 Section 3/4 接口基线            |
+| `3_methods.md`                         | NEXT / NOT YET FROZEN | CA-GAT-MAPPO、Factorized-Action GAT-QMIX、训练与执行流程     | 完成并冻结方法接口                   |
+| `4_experimental_protocol.md`           | DRAFT / NOT YET FROZEN | Gate P–Gate 6、实验族 A/B/C、参数校准、统计和日志规范        | 在 Section 3 冻结后完成并冻结         |
 | `5_results_template.md`                | 结果占位           | 只接收真实运行结果、图表和统计检验                           | 编码和实验完成后填写                 |
 | `6_discussion_limitations_template.md` | 讨论占位           | 结果解释、失败场景、局限性和外推边界                         | 依据真实结果填写                     |
 | `7_conclusion.md`                      | 等待核心章节和结果 | 总结研究问题、方法、主要结果和局限性                         | 最后阶段完成                         |
 
 ## 核心维护规则
 
-1. `knowledge/project_plan/方案2.md` 是项目唯一方案源。
-2. `2_system_model.md` 是系统对象、符号、资源/负载异构、任务状态机、队列、时隙因果、物理机制、信息权限和动作语义的论文主源。
+1. `knowledge/project_plan/方案2.md` 是既有方案源；该文件位于 protected `knowledge/` 目录，本轮自动任务不得修改。
+2. `2_system_model.md` 是当前环境实现规格源，也是系统对象、符号、资源/负载异构、任务状态机、队列、时隙因果、物理机制、信息权限和动作语义的论文主源。
 3. `3_methods.md` 只能说明算法如何处理已经冻结的系统，不得重新定义物理规则、队列更新、动作含义或信息权限。
 4. `4_experimental_protocol.md` 只能定义如何校准、训练、评价和统计，不得重新定义系统和算法接口。
 5. `route` 与 `tx_select` 必须始终分离：
@@ -55,10 +55,8 @@ knowledge/project_plan/方案2.md
 ## 推荐工作顺序
 
 ```
-2_system_model.md
-    -> 3_methods.md
-    -> 4_experimental_protocol.md
-    -> 三章一致性审计
-    -> 修改 AGENTS.md
-    -> Gate P / Gate 0 编码
+Section 3
+    -> Section 4
+    -> cross-section interface audit
+    -> implementation-stage transition
 ```
