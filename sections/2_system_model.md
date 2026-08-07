@@ -78,7 +78,7 @@
 | 无线信道 | $Q_{ij}^{\mathrm{bit}}(t)$ | 槽初链路 $i\rightarrow j$ 传输队列中的剩余待传输 bit 总量 | bit |
 | 无线信道 | $m_{ij,r}^{I,\mathrm{meas}}(t)$ | 当前已执行接收边 $i\rightarrow j$ 在资源单元 $r$ 上的测量可用性 mask | $\{0,1\}$ |
 | 无线信道 | $m_{j,r}^{I,\mathrm{meas}}(t)$ | 当前接收端资源单元测量的可用性 mask | $\{0,1\}$ |
-| 无线信道 | $\widehat\Gamma_{ij}^{\mathrm{hist}}(t)$ | 在当前 proposed resource set 上由 valid per-RU 历史质量代理量得到的 scalar | 线性值 |
+| 无线信道 | $\widehat\Gamma_{ij}^{\mathrm{hist}}(t)$ | actor proposal 形成后，在当前 proposed resource set 上由 valid per-RU 历史质量代理量得到的 executor-only scalar | 线性值 |
 | 无线信道 | $\widehat\Gamma_{ij,r}^{\mathrm{hist}}(t)$ | 历史干扰链路质量代理量 | 线性值 |
 | 无线信道 | $p_r^{\mathrm{ref}}$ | 固定参考每资源单元功率，$P_{\mathrm{ref}}/R$ | W |
 | 无线信道 | $\beta_I$ | 历史干扰指数滑动平均系数 | $[0,1)$ |
@@ -922,16 +922,16 @@ p_r^{\mathrm{ref}}
 \frac{P_{\mathrm{ref}}}{R}.
 $$
 
-其中 $p_r^{\mathrm{ref}}$ 只用于构造跨时隙、跨动作可比较的观测特征，不是 actor 在当前时隙最终选择的实际功率；$\widehat\Gamma_{ij,r}^{\mathrm{hist}}(t)$ 也不使用当前其他 UAV 的动作，因而不等于当前真实 $\mathrm{SINR}_{ij,r}(t)$。actor 可使用 per-RU 历史质量代理量及其有效性 mask、2.8.5 定义的 scalar historical quality、上一槽已实现的有效速率、仅基于过去实际传输尝试的 outage 率、CSI AoI、消息 AoI 和可用性 mask；$\mathrm{SINR}_{ij,r}(t)$ 仍只由环境在联合动作确定后计算。CSI AoI 和历史摘要/消息 AoI 的更新是环境事件，不是 actor 可直接控制的动作。
+其中 $p_r^{\mathrm{ref}}$ 只用于构造跨时隙、跨动作可比较的 per-RU 历史观测特征，不是 actor 在当前时隙最终选择的实际功率；$\widehat\Gamma_{ij,r}^{\mathrm{hist}}(t)$ 也不使用当前其他 UAV 的动作，因而不等于当前真实 $\mathrm{SINR}_{ij,r}(t)$。actor 在槽初观测阶段只使用 per-RU 历史质量代理量及其有效性 mask、上一槽已实现的有效速率、仅基于过去实际传输尝试的 outage 率、CSI AoI、消息 AoI 和可用性 mask。scalar historical quality 不属于 actor slot-start observation；它只能在 actor 形成 resource proposal、得到 $\mathcal S_i^{\mathrm{prop}}(t)$ 后，由 executor 为确定性仲裁派生。$\mathrm{SINR}_{ij,r}(t)$ 仍只由环境在联合动作确定后计算。CSI AoI 和历史摘要/消息 AoI 的更新是环境事件，不是 actor 可直接控制的动作。
 
-为使 deterministic executor 的输入唯一，定义：
+在 actor proposal 形成并得到 $\mathcal S_i^{\mathrm{prop}}(t)$ 后，为使 deterministic executor 的输入唯一，定义 executor-only 的 valid-RU 集合：
 $$
 m_{ij,r}^{\mathrm{qual}}(t)=m_{ij}^{\mathrm{CSI}}(t)\land m_{j,r}^{I}(t),
 \qquad
 \mathcal V_{ij}(t)=
 \{r\in\mathcal S_i^{\mathrm{prop}}(t):m_{ij,r}^{\mathrm{qual}}(t)=1\}.
 $$
-scalar historical quality 只在该 valid RU 集合上取 arithmetic mean：
+executor-only scalar historical quality 只在该 valid RU 集合上取 arithmetic mean：
 $$
 \widehat\Gamma_{ij}^{\mathrm{hist}}(t)
 =
@@ -941,7 +941,7 @@ $$
 0,&|\mathcal V_{ij}(t)|=0.
 \end{cases}
 $$
-聚合范围严格为 $\mathcal S_i^{\mathrm{prop}}(t)$ 中具有有效 CSI 与有效历史干扰摘要的 RU；不使用全部 RU、$\mathcal S_i^{\mathrm{exec}}(t)$、其他资源组或当前真实 SINR。无 valid RU 时的 $0$ 是 deterministic lowest-quality fallback。
+聚合范围严格为 actor proposal 形成后的 $\mathcal S_i^{\mathrm{prop}}(t)$ 中具有有效 CSI 与有效历史干扰摘要的 RU；不使用全部 RU、$\mathcal S_i^{\mathrm{exec}}(t)$、其他资源组或当前真实 SINR。该 scalar 不回写 actor observation；无 valid RU 时的 $0$ 是 deterministic lowest-quality fallback。
 
 ### 2.8.6 模型边界和第三UAV软遮挡扩展
 
@@ -1711,7 +1711,7 @@ $\mathcal T_0$ 使用 2.14 已定义的 active task collection，不引入第二
 
 reset 同时保持已冻结的移动、阴影和真实信道边界：直接提供 $\mathbf p_i(0)$、$\mathbf v_i(0)$，设置 $\Delta s_{ij}(0)=0$，采样 $X_{ij}(0)\sim\mathcal N(0,\sigma_s^2)$，并生成首个合法 true-channel sample $h_{ij,r}(0)$。不定义或访问 $\mathbf p_i(-1)$、$X_{ij}(-1)$ 或 $h_{ij,r}(-1)$。
 
-陈旧 CSI、历史干扰和历史质量特征也必须在 $\mathrm{actor}(0)$ 前合法定义：沿用既有 CSI stale index/availability、$\widehat I_{j,r}^{\mathrm{hist}}(0)=I_{j,r}^{\mathrm{def}}$、$m_{j,r}^{I}(0)=0$、$a_j^{\mathrm{msg}}(0)=\mathrm{NA}$ 以及 scalar historical quality 的缺省值与 mask。reset 按 2.8.4 的固定 $(i,j,r)$ 顺序生成 $h_{ij,r}(0)$，并按 2.8.5 的同一顺序生成完整 CSI-error tensor；CSI error 不作为持久 $\xi(0)$ state。固定 master seed 和配置下，reset 的信道与 CSI-error realization sequence 必须可复现。
+陈旧 CSI、历史干扰和 per-RU 历史质量特征也必须在 $\mathrm{actor}(0)$ 前合法定义：沿用既有 CSI stale index/availability、$\widehat I_{j,r}^{\mathrm{hist}}(0)=I_{j,r}^{\mathrm{def}}$、$m_{j,r}^{I}(0)=0$、$a_j^{\mathrm{msg}}(0)=\mathrm{NA}$ 以及 per-RU historical-quality proxy 与 $m_{ij,r}^{\mathrm{qual}}(0)$ 的缺省值和 mask。executor-only scalar 不在 actor(0) 前计算，而是在本槽 actor proposal 形成 $\mathcal S_i^{\mathrm{prop}}(t)$ 后按 2.8.5 派生。reset 按 2.8.4 的固定 $(i,j,r)$ 顺序生成 $h_{ij,r}(0)$，并按 2.8.5 的同一顺序生成完整 CSI-error tensor；CSI error 不作为持久 $\xi(0)$ state。固定 master seed 和配置下，reset 的信道与 CSI-error realization sequence 必须可复现。
 
 episode-level bookkeeping 在 reset 时初始化为物理上合法的空状态：completed、expired 和 truncated counters 为 $0$；实际 transmission-attempt count、outage numerator 和 denominator 为 $0$，无样本的 outage ratio/average 为 $\mathrm{NA}$；energy accumulator 为 $0$；latency accumulator 和 latency sample list 为空。既有 normalization reference constants 不在 reset 中重新估计。
 
@@ -1723,7 +1723,7 @@ episode-level bookkeeping 在 reset 时初始化为物理上合法的空状态�
 2. actor 根据槽初局部观测生成七分支动作提案。
 3. 对通信 tx proposal 执行 raw zero-power canonicalization：若 $p_i^{\mathrm{prop}}(t)=0$，该 proposal 作为 communication idle 排除，不进入 half-duplex、资源、能量、干扰或实际 attempt 语义。
 4. 对一个未绑定 EDF 任务执行 route 决策；从槽初已有的非空传输队列中执行 tx_select；解析固定资源组、资源宽度和功率动作，形成 $\mathcal S_i^{\mathrm{prop}}(t)$、$p_i^{\mathrm{prop}}(t)$，并选择一个槽初 CPU 队列和 CPU 频率档位。route 只在槽末 binding，不产生本槽下一阶段 service。
-5. 对剩余合法且非 idle 的通信候选按既有 $\Pi_{ij}^{\mathrm{tx}}(t)$ 升序字典序执行 deterministic executor 和 half-duplex 扫描；该步骤形成暂定接受结果，不改变既有仲裁键、字典序或发送/接收约束。
+5. 在 $\mathcal S_i^{\mathrm{prop}}(t)$ 形成后，仅由 executor 根据 per-RU historical-quality proxy 及其 valid mask 计算 executor-only scalar $\widehat\Gamma_{ij}^{\mathrm{hist}}(t)$；该 scalar 不回写或修改本槽 actor observation。随后，对剩余合法且非 idle 的通信候选按既有 $\Pi_{ij}^{\mathrm{tx}}(t)$ 升序字典序执行 deterministic executor 和 half-duplex 扫描；该步骤形成暂定接受结果，不改变既有仲裁键、字典序或发送/接收约束。
 6. 对暂定接受通信候选沿既有 $1.0\rightarrow0.5\rightarrow0.25\rightarrow0$ candidate power 顺序进行 power-first energy downgrade；只有通信功率降至 $0$ 且联合能量仍不可行时，才按既有顺序执行 CPU frequency downgrade，并选择最高可行档位。
 7. 若 raw proposal 或 candidate downgrade 的最终执行功率为 $0$，执行 final zero-power canonicalization；本槽不进行 backtracking 或 re-arbitration，不复活前序已拒绝的低优先级 proposal。
 8. 形成最终 $y_{ij}(t)$、$x_{ij,r}(t)$、$\mathcal S_i^{\mathrm{exec}}(t)$、$p_i^{\mathrm{exec}}(t)$ 和 $f_i(t)$；其中 $p_i^{\mathrm{exec}}(t)=0$ 时最终通信变量必须全部为 idle/zero。
@@ -1749,6 +1749,10 @@ $$
 \text{actor proposal}
 \rightarrow
 \text{raw zero-power canonicalization}
+\rightarrow
+\text{resource proposal }(\mathcal S^{\mathrm{prop}},p^{\mathrm{prop}})
+\rightarrow
+\text{executor-only scalar historical quality}
 \rightarrow
 \text{deterministic executor}
 \rightarrow
@@ -1814,7 +1818,7 @@ m_i(t)
 \right).
 $$
 
-局部观测至少包括自身剩余能量比例、归一化资源能力、历史到达率估计 $\hat{\lambda}_i(t)$ 及其可用性 mask $m_i^\lambda(t)$、本地/传输/CPU 队列摘要、候选传输队列的任务数与剩余 bit、CPU 队列的任务数与剩余 cycle、队首 slack、上一槽动作和资源利用率；邻居特征包括相对位置、相对速度、广播剩余能量、广播资源能力、CPU 负载摘要和消息 AoI；边特征包括估计距离、陈旧期望链路增益或其归一化形式、历史干扰链路质量代理量 $\widehat\Gamma_{ij,r}^{\mathrm{hist}}(t)$、其有效性 mask 以及由 2.8.5 在 $\mathcal S_i^{\mathrm{prop}}(t)$ 上得到的 scalar $\widehat\Gamma_{ij}^{\mathrm{hist}}(t)$、上一槽有效速率、仅基于过去实际传输尝试的 outage 率、CSI AoI、历史干扰摘要 AoI、相对速度和特征可用性 mask。上一槽有效速率只表示已结束时隙的实际结果；未调度链路没有该观测时使用缺省值加 mask，NA 不视为失败；outage 率只使用 $\tau\le t-1$ 的 $\chi_{ij}^{\mathrm{att}}(\tau)=1$ 样本，不读取当前时隙尚未产生的真实 SINR 或执行结果。当前槽的 $I_{ij,r}^{\mathrm{meas}}(t)$ 同样不属于 $o_i(t)$；它只能通过槽末更新后的历史摘要在 $o_i(t+1)$ 或更晚时隙中间接出现。
+局部观测至少包括自身剩余能量比例、归一化资源能力、历史到达率估计 $\hat{\lambda}_i(t)$ 及其可用性 mask $m_i^\lambda(t)$、本地/传输/CPU 队列摘要、候选传输队列的任务数与剩余 bit、CPU 队列的任务数与剩余 cycle、队首 slack、上一槽动作和资源利用率；邻居特征包括相对位置、相对速度、广播剩余能量、广播资源能力、CPU 负载摘要和消息 AoI；边特征包括估计距离、陈旧期望链路增益或其归一化形式、历史干扰链路质量代理量 $\widehat\Gamma_{ij,r}^{\mathrm{hist}}(t)$、其有效性 mask、上一槽有效速率、仅基于过去实际传输尝试的 outage 率、CSI AoI、历史干扰摘要 AoI、相对速度和特征可用性 mask。executor-only scalar $\widehat\Gamma_{ij}^{\mathrm{hist}}(t)$ 不属于 $o_i(t)$，而是在 actor proposal 形成 $\mathcal S_i^{\mathrm{prop}}(t)$ 后按 2.8.5 计算并仅供 deterministic executor 使用。上一槽有效速率只表示已结束时隙的实际结果；未调度链路没有该观测时使用缺省值加 mask，NA 不视为失败；outage 率只使用 $\tau\le t-1$ 的 $\chi_{ij}^{\mathrm{att}}(\tau)=1$ 样本，不读取当前时隙尚未产生的真实 SINR 或执行结果。当前槽的 $I_{ij,r}^{\mathrm{meas}}(t)$ 同样不属于 $o_i(t)$；它只能通过槽末更新后的历史摘要在 $o_i(t+1)$ 或更晚时隙中间接出现。
 
 actor 不得读取以下信息：
 
@@ -2075,7 +2079,7 @@ outage 口径的计划测试至少包括：
 - normalized Rayleigh/Rician 的 $z$ 实部和虚部方差均为 $1/2$，$\mathbb E[|g|^2]=1$，跨 slot/link/RU 独立，且 fixed seed 按 $(i,j,r)$ 生成完整 tensor；
 - CSI error 为 dB 域 $\mathcal N(0,\sigma_{\mathrm{CSI}}^2)$，$\xi=10^{\epsilon/10}$，每槽/link/RU 独立重采样；不可用分支使用 placeholder+mask 且不改变 RNG 顺序；
 - measurement mask 只由 executed desired reception、正 executed power 和槽初正 bit 共同决定；有效零测量进入 EMA，missing 不进入 EMA，当前测量下一槽才可见；
-- scalar historical quality 只对 $\mathcal S_i^{\mathrm{prop}}(t)$ 中的 valid RU 求 arithmetic mean，无 valid RU 时固定为 $0$，不使用 $\mathcal S_i^{\mathrm{exec}}(t)$ 或 current true SINR；
+- executor-only scalar historical quality 只对 $\mathcal S_i^{\mathrm{prop}}(t)$ 中的 valid RU 求 arithmetic mean，无 valid RU 时固定为 $0$，不使用 $\mathcal S_i^{\mathrm{exec}}(t)$ 或 current true SINR；
 - 固定槽初状态、联合动作和 master seed 重复执行时，CSI、history、scalar quality 与 executor priority order 完全一致。
 
 物理层初始时刻的计划测试至少包括：

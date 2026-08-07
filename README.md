@@ -94,6 +94,9 @@ knowledge/project_plan/方案2.md
 - 审计中原有 P0/P1 修订项至此全部处理完成，但 `sections/2_system_model.md` 尚未正式冻结；下一步是第二次全文一致性审计；
 - 本轮最终冻结审计已收口 P1-02 至 P1-06：移动边界、reset 安全距离、small-scale fading、CSI error、interference measurement mask 和 historical-quality scalar 的实现规格均已唯一化；
 - Section 2 已补齐固定采样顺序、fixed-seed 可复现性、当前测量不得泄漏给 actor、measured zero 与 missing 区分，以及 proposed resource set 上的 valid-RU arithmetic-mean 聚合；
+- 当前最终 READY TO FREEZE 审计唯一剩余的 P1 已修复：消除 scalar historical quality 观测执行器循环，actor 只读取 proposal 形成前已存在的 per-RU historical quality 及其有效性 mask；
+- executor-only scalar historical quality 仅在 actor 形成 $\mathcal S_i^{\mathrm{prop}}(t)$ 后计算，并继续使用既有 valid-RU masked arithmetic mean、fallback $0$ 和 $(\operatorname{slack},-\widehat\Gamma_{ij}^{\mathrm{hist}},i,j)$ 优先级键；
+- 本轮仍未实现代码或测试、未生成实验产物、未执行 git add/commit；Section 2 仅等待用户复核，不在本轮宣告正式 READY TO FREEZE；
 - 本轮仅更新 sections/2_system_model.md 与本进度说明，未实现代码或测试、未生成实验产物、未执行 git add/commit；Section 2 等待用户复核，不在本轮宣告正式冻结。
 - 本项目尚未实现代码、测试、方法或实验，不得据此声称其已经完成；
 - 当前真实 SINR 仅在联合执行动作确定后由环境计算；
