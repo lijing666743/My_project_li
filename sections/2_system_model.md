@@ -55,6 +55,12 @@
 | 业务到达 | $K_\lambda(t)$ | 时隙 $t$ 槽初实际可用的历史样本数 | 样本数 |
 | 业务到达 | $m_i^\lambda(t)$ | 历史到达率估计的可用性 mask | $\{0,1\}$ |
 | 无线信道 | $f_c$ | 载频 | Hz |
+| 无线信道 | $B^{\mathrm{tot}}$ | 系统总通信带宽 | Hz |
+| 无线信道 | $B_{\mathrm{RU}}$ | 单个等效资源单元带宽 | Hz |
+| 无线信道 | $N_0$ | 线性热噪声功率谱密度 | W/Hz |
+| 无线信道 | $F_{\mathrm{dB}}$ | 接收机噪声系数 | dB |
+| 无线信道 | $F$ | 线性 noise factor | 无量纲 |
+| 无线信道 | $P_{\mathrm{noise,RU}}$ | 单个等效资源单元的接收噪声功率 | W |
 | 无线信道 | $\mathcal B$ | 建筑物集合 | 三维柱体集合 |
 | 无线信道 | $I_{ij}^{\mathrm{bld}}(t)$ | 几何遮挡指示量 | $\{0,1\}$ |
 | 无线信道 | $PL_{ij}(t)$ | $i\rightarrow j$ 路径损耗 | dB |
@@ -67,7 +73,8 @@
 | 无线信道 | $\ell_{ij}^{\mathrm{CSI}}(t)$ | 陈旧 CSI 的原始历史索引，$t-a_{ij}^{\mathrm{CSI}}(t)$ | 整数，可为负 |
 | 无线信道 | $m_{ij}^{\mathrm{CSI}}(t)$ | 陈旧 CSI 历史索引的可用性 mask | $\{0,1\}$ |
 | 无线信道 | $\widehat Z_{j,r}^{\mathrm{hist}}(t)$ | 历史干扰加噪声摘要 | W |
-| 无线信道 | $I_{j,r}^{\mathrm{meas}}(t)$ | 已结束时隙中的可用干扰测量 | W |
+| 无线信道 | $I_{ij,r}^{\mathrm{meas}}(t)$ | 当前已执行接收边 $i\rightarrow j$ 在资源单元 $r$ 上的 interference-only 测量；写入接收端历史时记作 $I_{j,r}^{\mathrm{meas}}(t)$ | W |
+| 无线信道 | $m_{j,r}^{I,\mathrm{meas}}(t)$ | 当前接收端资源单元测量的可用性 mask | $\{0,1\}$ |
 | 无线信道 | $\widehat\Gamma_{ij}^{\mathrm{hist}}(t)$ | 候选链路使用的既有历史干扰链路质量代理量；若正文已有固定资源组聚合，则沿用该聚合定义 | 线性值 |
 | 无线信道 | $\widehat\Gamma_{ij,r}^{\mathrm{hist}}(t)$ | 历史干扰链路质量代理量 | 线性值 |
 | 无线信道 | $p_r^{\mathrm{ref}}$ | 固定参考每资源单元功率，$P_{\mathrm{ref}}/R$ | W |
@@ -149,7 +156,8 @@ route 决策在槽末生效并使任务进入 local 或 tx 队列时，任务才
 | $\Delta t$ | $20$ | ms | 已冻结 |
 | $T$ | $500$ | slot | 敏感性参数 |
 | $f_c$ | $3.5$ | GHz | Gate P 待校准 |
-| 总带宽 | $20$ | MHz | Gate P 待校准 |
+| $B^{\mathrm{tot}}$ | $20$ | MHz | Gate P 待校准 |
+| $B_{\mathrm{RU}}$ | $B^{\mathrm{tot}}/R=1$ | MHz | 由等宽 RU 划分得到 |
 | $R$ | $20$ | 等效资源单元 | Gate P 待校准 |
 | $G$ | $5$ | 组 | 已冻结 |
 | $P_{\mathrm{ref}}$ | $1$ | W | Gate P 待校准 |
@@ -158,7 +166,8 @@ route 决策在槽末生效并使任务进入 local 或 tx 队列时，任务才
 | $E_{\mathrm{ref}}^0$ | $30$ | J | Gate P 待校准 |
 | $R_{\mathrm{ref}}$ | $20$ | Mbit/s | Gate P 待校准 |
 | 天线增益 | $2$ | dBi | Gate P 待校准 |
-| 噪声系数 | $7$ | dB | Gate P 待校准 |
+| $F_{\mathrm{dB}}$ | $7$ | dB | Gate P 待校准 |
+| $F$ | $10^{F_{\mathrm{dB}}/10}$ | 无量纲 | 由 dB 噪声系数转换得到 |
 | $\gamma_{\min}^{\mathrm{dB}}$ | $-3$ | dB | 敏感性参数 |
 | $\gamma_{\min}^{\mathrm{lin}}$ | $10^{-3/10}\approx0.5012$ | 线性无量纲值 | 由 dB 门限转换 |
 | $\sigma_s$ | $4$ | dB | 敏感性参数 |
@@ -744,7 +753,7 @@ $$
 \hat h_{ij,r}(t)
 =
 \begin{cases}
-h_{ij,r}\!\left(\ell_{ij}^{\mathrm{CSI}}(t)\right)\xi_{ij,r}(t),
+h_{ij,r}\!\left(\ell_{ij}^{\mathrm{CSI}}(t)\right)\sqrt{\xi_{ij,r}(t)},
 &m_{ij}^{\mathrm{CSI}}(t)=1,
 \\[6pt]
 0,
@@ -753,8 +762,9 @@ h_{ij,r}\!\left(\ell_{ij}^{\mathrm{CSI}}(t)\right)\xi_{ij,r}(t),
 $$
 
 当 $\ell_{ij}^{\mathrm{CSI}}(t)<0$ 时，$m_{ij}^{\mathrm{CSI}}(t)=0$，不访问负时隙信道；此时的零值只表示缺省占位，并不表示真实零信道。只有当 $\ell_{ij}^{\mathrm{CSI}}(t)\ge0$ 时才读取已经存在的历史样本。当当前时隙满足 $\ell_{ij}^{\mathrm{CSI}}(t)=0$ 时，首次读取 $h_{ij,r}(0)$。若 AoI 固定为常数 $d$，则在 $t=d$ 时有 $\ell_{ij}^{\mathrm{CSI}}(t)=0$，首次读取 $h_{ij,r}(0)$。本轮不生成 pre-episode 信道历史，也不通过 clamp 或当前真实 $h_{ij,r}(t)$ 回填指定 AoI 的历史样本。
+正文参数表中的 $a^{\mathrm{CSI}}$ 是外生配置的陈旧偏移量；主场景将其作为固定的敏感性设置（例如 $0$、$3$ 或 $5$ slot），并在整个 episode 内保持不变。因此记号 $a_{ij}^{\mathrm{CSI}}(t)$ 在本模型中表示该既有配置值，而不是另行定义的刷新/递推 freshness process；其唯一作用仍是通过 $\ell_{ij}^{\mathrm{CSI}}(t)=t-a_{ij}^{\mathrm{CSI}}(t)$ 选择可读取的历史信道样本。本轮不对该固定陈旧偏移量新增 refresh 或 increment 规则，也不改变既有 CSI 历史索引语义。
 
-误差幅度以 dB 域建模为：
+误差参数以既有的正乘性因子模型定义为：
 
 $$
 10\log_{10}\xi_{ij,r}(t)
@@ -765,24 +775,58 @@ $$
 \right).
 $$
 
+其中 $\xi_{ij,r}(t)>0$ 是无量纲的功率增益因子，$10\log_{10}\xi_{ij,r}(t)$ 是功率增益误差的 dB 表示；$\sigma_{\mathrm{CSI}}$ 是该 dB 域随机变量的标准差，单位为 dB，不是线性域标准差。由于 $h_{ij,r}$ 是复信道幅度/复系数，实际作用于 $h_{ij,r}$ 的线性乘性因子为 $\sqrt{\xi_{ij,r}(t)}$，从而 $\left|\hat h_{ij,r}(t)\right|^2=\left|h_{ij,r}(\ell_{ij}^{\mathrm{CSI}}(t))\right|^2\xi_{ij,r}(t)$；本轮不再对功率增益额外施加一次 $\sigma_{\mathrm{CSI}}$ 误差。
+
 actor 使用 $\hat h_{ij,r}(t)$ 时必须同时读取对应的 $m_{ij}^{\mathrm{CSI}}(t)$；缺省值不能脱离 mask 单独解释为真实测量。
-上述 $\hat h_{ij,r}(t)$ 只描述期望链路 $i\rightarrow j$ 的陈旧信道估计，不包含本时隙其他 UAV 尚未确定的资源选择、功率或执行器接受结果；actor 也不得读取当前真实信道 $h_{ij,r}(t)$。为给槽初决策提供可实现的干扰线索，接收 UAV $j$ 对每个资源单元维护只由上一时隙或更早信息形成的历史干扰摘要。对 $t\ge1$，采用指数滑动平均：
+上述 $\hat h_{ij,r}(t)$ 只描述期望链路 $i\rightarrow j$ 的陈旧信道估计，不包含本时隙其他 UAV 尚未确定的资源选择、功率或执行器接受结果；actor 也不得读取当前真实信道 $h_{ij,r}(t)$。为给槽初决策提供可实现的干扰线索，接收 UAV $j$ 对每个资源单元维护只由上一时隙或更早信息形成的历史干扰摘要。当前槽初的历史干扰量必须只由已结束时隙形成。对所有 $t\ge0$，在 actor 读取槽初观测时，$\widehat I_{j,r}^{\mathrm{hist}}(t)$、$m_{j,r}^{I}(t)$ 和 $a_j^{\mathrm{msg}}(t)$ 均不得依赖当前槽尚未形成的 $I_{j,r}^{\mathrm{meas}}(t)$；当前槽测量最早在槽末形成，并在下一槽槽初使用。令 $m_{j,r}^{I,\mathrm{meas}}(t)$ 表示既有接收端测量条件在资源单元 $r$ 上是否有效；对当前已执行接收边 $i\rightarrow j$，可写作 $m_{ij,r}^{I,\mathrm{meas}}(t)\equiv m_{j,r}^{I,\mathrm{meas}}(t)$。在槽 $t$ 的最终执行结果和真实信道已知后，历史摘要按以下下一槽递推更新：
 
 $$
-\widehat I_{j,r}^{\mathrm{hist}}(t)
+\widehat I_{j,r}^{\mathrm{hist}}(t+1)
 =
 \begin{cases}
-\beta_I\widehat I_{j,r}^{\mathrm{hist}}(t-1)
-+(1-\beta_I)I_{j,r}^{\mathrm{meas}}(t-1),
+\beta_I\widehat I_{j,r}^{\mathrm{hist}}(t)
++
+(1-\beta_I)I_{j,r}^{\mathrm{meas}}(t),
 &
-\text{上一时隙有环境规定的可用测量},\\[4pt]
-\widehat I_{j,r}^{\mathrm{hist}}(t-1),
+m_{j,r}^{I,\mathrm{meas}}(t)=1,
+\\[4pt]
+\widehat I_{j,r}^{\mathrm{hist}}(t),
 &
-\text{上一时隙无可用测量}.
+m_{j,r}^{I,\mathrm{meas}}(t)=0.
 \end{cases}
 $$
 
-其中 $I_{j,r}^{\mathrm{meas}}(t-1)$ 是接收端在已结束时隙形成的干扰测量，只在环境规定为可观测时参与更新；无测量时保持上一历史值，并使相应摘要的 AoI 增加。episode 初始时设置 $\widehat I_{j,r}^{\mathrm{hist}}(0)=I_{j,r}^{\mathrm{def}}$、$m_{j,r}^{I}(0)=0$，并将消息 AoI $a_j^{\mathrm{msg}}(0)$ 置为预先约定的不可用哨值。该缺省值不是测量结果，actor 必须同时读取 $m_{j,r}^{I}(t)$；有可用历史摘要时 $m_{j,r}^{I}(t)=1$，若 episode 尚无任何历史测量则保持 $m_{j,r}^{I}(t)=0$，后续无新测量时不把已有历史值伪装成当前测量。接收 UAV $j$ 通过既有控制消息广播该摘要，actor 可获得其消息 AoI $a_j^{\mathrm{msg}}(t)$。
+缺测时保持上一历史估计，不把缺测编码为 $I^{\mathrm{meas}}=0$；历史可用性 mask 只在首次获得有效测量后置为 1：
+
+$$
+m_{j,r}^{I}(t+1)
+=
+m_{j,r}^{I}(t)
+\lor
+m_{j,r}^{I,\mathrm{meas}}(t).
+$$
+
+其中 $\widehat I_{j,r}^{\mathrm{hist}}$ 始终是 interference-only 的线性功率，热噪声不进入该量。历史摘要通过既有接收端控制消息广播，现有唯一的摘要消息 AoI $a_j^{\mathrm{msg}}(t)$ 按消息生成时点更新：
+
+$$
+a_j^{\mathrm{msg}}(t+1)
+=
+\begin{cases}
+1,
+&
+\exists r:\ m_{j,r}^{I,\mathrm{meas}}(t)=1,
+\\[4pt]
+a_j^{\mathrm{msg}}(t)+1,
+&
+\text{本槽无新测量且此前已有可用摘要},
+\\[4pt]
+\mathrm{NA},
+&
+\text{本槽无新测量且 episode 尚无任何可用摘要}.
+\end{cases}
+$$
+
+测量在槽 $t$ 末生成、在槽 $t+1$ 槽初第一次可见，因此刷新后的消息 AoI 按既有槽时间语义为 $1$，而不是 $0$；无新测量时下一槽增加 $1$。$a_j^{\mathrm{msg}}$ 是历史干扰广播摘要的消息 AoI，不与固定配置的 CSI 陈旧偏移量 $a_{ij}^{\mathrm{CSI}}$ 混用。episode 初始时设置 $\widehat I_{j,r}^{\mathrm{hist}}(0)=I_{j,r}^{\mathrm{def}}$、$m_{j,r}^{I}(0)=0$ 和 $a_j^{\mathrm{msg}}(0)=\mathrm{NA}$。这里的测量可用性由既有接收端测量条件提供，不新增独立的信道观测过程。
 
 历史摘要先与噪声功率合成为：
 
@@ -818,6 +862,29 @@ $$
 主模型只包含两端 UAV 与建筑物几何遮挡，不把第三 UAV 对 Fresnel 区域的软遮挡加入训练环境。只有主模型通过 Gate P、Gate 0 及后续机制闸门后，才可将第三 UAV 软遮挡作为几何启发式消融或离线高保真回放扩展。该扩展只能用于敏感性和趋势验证，不能被表述为实测遮挡模型，也不能反向改变主模型的 actor 信息权限。
 
 ## 2.9 固定资源组、SINR、有效速率和outage
+
+
+由于 $R$ 个资源单元采用等带宽划分，单个资源单元带宽与系统总通信带宽的关系唯一确定为：
+
+$$
+B_{\mathrm{RU}}
+=
+\frac{B^{\mathrm{tot}}}{R}.
+$$
+
+噪声链统一在功率域中计算。$N_0$ 表示线性热噪声功率谱密度，单位为 W/Hz；若外部参数以 dBm/Hz 或 dBW/Hz 给出，必须先转换为线性 W/Hz。接收机噪声系数以 $F_{\mathrm{dB}}$（dB）给出，其线性 noise factor 为：
+
+$$
+F
+=
+10^{F_{\mathrm{dB}}/10},
+\qquad
+P_{\mathrm{noise,RU}}
+=
+N_0B_{\mathrm{RU}}F.
+$$
+
+因此后续 SINR 分母中的 $N_0B_{\mathrm{RU}}F$ 与 $P_{\mathrm{noise,RU}}$ 等价；同一计算链中不混用 dB 和线性功率。
 
 系统将 $R$ 个等效资源单元预先划分为 $G=5$ 个连续、互不重叠的固定资源组：
 
@@ -984,6 +1051,16 @@ x_{kl,r}(t)p_{kl,r}(t)|h_{kj,r}(t)|^2
 $$
 
 其中 $N_0$ 是噪声谱密度，$B_{\mathrm{RU}}$ 是单个等效资源单元带宽，$F$ 是由噪声系数换算得到的线性因子。分母中的求和仅包含同一资源单元上被联合执行器接受的其他传输边。该真实 SINR 始终是线性无量纲比值，不是 dB 值；它仅用于环境状态转移、有效速率、实际服务量、outage 以及集中训练期允许使用的真实全局状态。
+为使槽末测量与上述真实 SINR 的干扰项完全一致，若当前槽存在已被联合执行器接受的接收边 $i\rightarrow j$，则在执行结果已确定后定义：
+
+$$
+I_{ij,r}^{\mathrm{meas}}(t)
+=
+\sum_{\substack{k,l\in\mathcal U,\ k\ne l\\(k,l)\ne(i,j)}}
+x_{kl,r}(t)p_{kl,r}(t)\left|h_{kj,r}(t)\right|^2.
+$$
+
+该式直接复用真实 SINR 分母中的 interference term；由于半双工约束，接收 UAV $j$ 至多对应一条当前已接受的入边，因此历史摘要仍以接收端形式记作 $I_{j,r}^{\mathrm{meas}}(t)\equiv I_{ij,r}^{\mathrm{meas}}(t)$。计算前提是联合执行器已经确定 $y$、$x$、$p^{\mathrm{exec}}$ 和 $p_{ij,r}$；求和只包含最终 executed 的 $x_{kl,r}(t)$ 和 $p_{kl,r}(t)$，不包含 proposed power、candidate power、被拒绝的传输或没有执行资源的链路。式中没有 $N_0B_{\mathrm{RU}}F$，所以该测量是 interference-only，不是 interference-plus-noise；热噪声只在构造 $\widehat Z_{j,r}^{\mathrm{hist}}(t)$ 时加入一次。
 
 设 $\gamma_{\min}^{\mathrm{dB}}$ 为 dB 表示的最小可用 SINR 阈值，并定义对应的线性阈值为：
 
@@ -1472,6 +1549,8 @@ $$
 
 每个 episode 在时隙 $0$ 开始前先执行 reset：初始化 $\mathbf p_i(0)$、$\mathbf v_i(0)$ 及其他移动状态，设置 $\Delta s_{ij}(0)=0$，直接采样 $X_{ij}(0)$，并依据初始环境状态生成首个真实信道样本 $h_{ij,r}(0)$；随后按 2.8.5 计算 $t=0$ 的 CSI 历史索引、可用性 mask 和陈旧 CSI 特征。reset 不生成 pre-episode 信道历史，也不定义 $\mathbf p_i(-1)$、$X_{ij}(-1)$ 或 $h_{ij,r}(-1)$。
 
+若 $t=0$ 的 CSI 或历史干扰测量不可用，则分别使用既有缺省 CSI、$I_{j,r}^{\mathrm{def}}$、$m_{ij}^{\mathrm{CSI}}(0)=0$ 或 $m_{j,r}^{I}(0)=0$；历史质量代理按既有 $\widehat\Gamma_{ij,r}^{\mathrm{hist}}(0)$ 公式由缺省 $\widehat h$ 和 $\widehat Z$ 形成，并始终与相应 mask 配对，不把占位值解释为真实信道或零干扰。
+
 每个时隙严格按以下顺序执行，以保持任务、bit、cycle 和能量的因果一致性。槽初读取已有队列，槽内完成服务，槽末统一处理状态更新和事件入队：
 
 1. 槽初读取已有任务、四类队列、候选邻居、陈旧 CSI、历史干扰摘要和延迟消息；历史到达率估计按 2.4 节仅使用 $A_i(0),\ldots,A_i(t-1)$ 及对应的 $m_i^\lambda(t)$，$t=0$ 使用固定缺省值和无效 mask；
@@ -1486,8 +1565,8 @@ $$
 10. 更新任务剩余 bit、剩余 cycle，并计算和扣除实际主动能耗；随后仅按 $\chi_{ij}^{\mathrm{att}}(t)$ 生成单次 outage 样本 $o_{ij}(t)$，并释放未实际消耗的预留；
 11. 在本槽服务量和剩余工作量更新完成后，结算按时完成任务和过期任务；
 12. 将本槽 route 任务、本槽传输完成任务和新到达任务在槽末入队；新到达任务数记为 $A_i(t)$，并记录 $t_n^{\mathrm{arr}}=t$，在下一时隙首次可 route。本槽 route 决策在此时生效并锁定目的地，绑定为 local 的 route 任务同步设置 $d_n^{\mathrm{dst}}\leftarrow i_n$ 和 $D_n^{\mathrm{rem}}\leftarrow0$，绑定为远程 UAV $j$ 的 route 任务同步设置 $d_n^{\mathrm{dst}}\leftarrow j$（$j\ne i_n$），本槽传输完成任务在下一时隙首次可计算；$A_i(t)$ 不影响时隙 $t$ 的 actor 观测，最早在时隙 $t+1$ 槽初进入历史到达率或队列观测；
-13. 时隙结束后，对环境规定可观测的接收端形成 $I_{j,r}^{\mathrm{meas}}(t)$，供未来时隙更新历史干扰摘要；无可用测量时保持上一历史值并增加其 AoI，已有历史值仍保持可用性 mask，只有 episode 尚无任何历史测量时 mask 为 $0$。
-14. 更新外生移动、真实信道、CSI AoI 和消息 AoI，并进入下一槽；这些更新从已定义的 $t\ge0$ 状态开始，不引入负时隙索引。
+13. 在当前真实信道、最终 executed 传输、真实 SINR、服务量和 outage 均已计算后，按 2.9 的干扰求和形成 $I_{ij,r}^{\mathrm{meas}}(t)$，并在接收端历史摘要中记作 $I_{j,r}^{\mathrm{meas}}(t)$；同时生成既有测量可用性 mask。该测量只在槽末形成，缺测不等同于真实零干扰。其 EMA、历史 mask 和消息 AoI 按 2.8.5 更新为下一槽状态，当前测量不返回给当前槽 actor。
+14. 更新外生移动和下一槽真实信道状态，并进入下一槽；CSI 使用既有固定配置陈旧偏移量计算 $\ell_{ij}^{\mathrm{CSI}}(t)=t-a_{ij}^{\mathrm{CSI}}(t)$，不新增独立的 CSI refresh/increment 过程。事件依赖关系固定为：slot-start history $\rightarrow$ actor $\rightarrow$ executor $\rightarrow$ true channel/SINR/service $\rightarrow I^{\mathrm{meas}}(t)$ $\rightarrow$ history/AoI update $\rightarrow t+1$。
 
 该顺序带来三条不可绕过的可用性规则：新 route 任务不能在本槽由 tx_select 服务；本槽传输完成任务不能在本槽计算；槽末生成的新任务不能在本槽再次参与 route。完成和过期结算均发生在本槽服务量及剩余工作量更新之后，且 deadline 时隙仍允许服务。因而任何算法都共享相同的服务边界，不能通过改变网络输出顺序获得额外的槽内服务。
 
@@ -1526,7 +1605,7 @@ m_i(t)
 \right).
 $$
 
-局部观测至少包括自身剩余能量比例、归一化资源能力、历史到达率估计 $\hat{\lambda}_i(t)$ 及其可用性 mask $m_i^\lambda(t)$、本地/传输/CPU 队列摘要、候选传输队列的任务数与剩余 bit、CPU 队列的任务数与剩余 cycle、队首 slack、上一槽动作和资源利用率；邻居特征包括相对位置、相对速度、广播剩余能量、广播资源能力、CPU 负载摘要和消息 AoI；边特征包括估计距离、陈旧期望链路增益或其归一化形式、历史干扰链路质量代理量 $\widehat\Gamma_{ij,r}^{\mathrm{hist}}(t)$ 或固定资源组聚合值、上一槽有效速率、仅基于过去实际传输尝试的 outage 率、CSI AoI、历史干扰摘要 AoI、相对速度和特征可用性 mask。上一槽有效速率只表示已结束时隙的实际结果；未调度链路没有该观测时使用缺省值加 mask，NA 不视为失败；outage 率只使用 $\tau\le t-1$ 的 $\chi_{ij}^{\mathrm{att}}(\tau)=1$ 样本，不读取当前时隙尚未产生的真实 SINR 或执行结果。
+局部观测至少包括自身剩余能量比例、归一化资源能力、历史到达率估计 $\hat{\lambda}_i(t)$ 及其可用性 mask $m_i^\lambda(t)$、本地/传输/CPU 队列摘要、候选传输队列的任务数与剩余 bit、CPU 队列的任务数与剩余 cycle、队首 slack、上一槽动作和资源利用率；邻居特征包括相对位置、相对速度、广播剩余能量、广播资源能力、CPU 负载摘要和消息 AoI；边特征包括估计距离、陈旧期望链路增益或其归一化形式、历史干扰链路质量代理量 $\widehat\Gamma_{ij,r}^{\mathrm{hist}}(t)$ 或固定资源组聚合值、上一槽有效速率、仅基于过去实际传输尝试的 outage 率、CSI AoI、历史干扰摘要 AoI、相对速度和特征可用性 mask。上一槽有效速率只表示已结束时隙的实际结果；未调度链路没有该观测时使用缺省值加 mask，NA 不视为失败；outage 率只使用 $\tau\le t-1$ 的 $\chi_{ij}^{\mathrm{att}}(\tau)=1$ 样本，不读取当前时隙尚未产生的真实 SINR 或执行结果。当前槽的 $I_{ij,r}^{\mathrm{meas}}(t)$ 同样不属于 $o_i(t)$；它只能通过槽末更新后的历史摘要在 $o_i(t+1)$ 或更晚时隙中间接出现。
 
 actor 不得读取以下信息：
 
@@ -1741,6 +1820,21 @@ outage 口径的计划测试至少包括：
 - 缺省 CSI 不得被解释为真实零信道，且不得通过当前真实信道回填历史；
 - actor 观测不包含当前时隙的真实 $h_{ij,r}(t)$。
 
+P1-04 计划测试还应覆盖以下物理层可执行性边界（仅新增测试计划，不表示已经实现）：
+
+- 等宽资源单元满足 $B_{\mathrm{RU}}=B^{\mathrm{tot}}/R$，并验证主场景由 $20$ MHz 与 $R=20$ 得到 $1$ MHz；
+- 噪声系数从 $F_{\mathrm{dB}}$ 到 $F=10^{F_{\mathrm{dB}}/10}$ 的转换正确，且 $N_0$ 先以线性 W/Hz 进入 $P_{\mathrm{noise,RU}}=N_0B_{\mathrm{RU}}F$；
+- SINR 分母中的热噪声只加入一次，历史 interference-only 不重复携带热噪声；
+- $I_{ij,r}^{\mathrm{meas}}(t)$ 与真实 SINR 的 interference term 完全一致且不含 thermal noise；
+- proposed、candidate、被拒绝传输或无执行资源的链路均不产生 $I^{\mathrm{meas}}$ 干扰，测量只使用 executed action；
+- actor 在槽 $t$ 不能读取 $I^{\mathrm{meas}}(t)$，当前测量最早在槽 $t+1$ 影响历史观测；
+- 当前测量缺失时历史估计保持不变，且缺测不会被编码为真实零干扰；
+- EMA 只在槽末由 $I^{\mathrm{meas}}(t)$ 更新到下一槽，消息 AoI 在有效测量时刷新为 $1$、缺测时递增 $1$，初始无历史保持 $\mathrm{NA}$；
+- 固定 CSI 陈旧偏移量只按既有 $\ell_{ij}^{\mathrm{CSI}}(t)=t-a_{ij}^{\mathrm{CSI}}(t)$ 读取，不新增递推 freshness process；
+- $10\log_{10}\xi$ 在 dB 域描述功率增益误差，$\sqrt{\xi}$ 作为线性乘性因子作用于复信道 $h$，并验证不被再次当作线性功率误差使用；
+- reset 后历史干扰估计、mask、消息 AoI、CSI mask 和历史质量代理均有合法初值，slot 0 不访问负索引；
+- 若测量或 AoI 过程包含随机性，固定 seed 下应可复现。
+
 | 系统规则 | 形式化对象或不变量 | 计划实现位置 | 计划测试或 Gate |
 |---|---|---|---|
 | 任务记录与生命周期 | $\tau_n$、$\mathcal S_{\mathrm{task}}$、$\mathcal T_{\mathrm{task}}$；unbound→local/tx 时一次性绑定目的地，且 local、tx、cpu 状态下目的地不可变 | src/env/tasks.py | 目的地标记与任务生命周期测试，Gate 0 |
@@ -1754,6 +1848,7 @@ outage 口径的计划测试至少包括：
 | 建筑物遮挡 | 存在量词几何相交判定 | src/env/buildings.py | 遮挡几何测试，Gate 1 |
 | 固定资源组 | $\mathcal G_1,\ldots,\mathcal G_5$ 及宽度 mask | src/env/resource_groups.py | 资源组边界测试，Gate 0 |
 | SINR 与有效速率 | $\mathrm{SINR}_{ij,r}$、$R_{ij}^{\mathrm{eff}}$ | src/env/channel.py | 干扰和速率单元测试，Gate 1 |
+| RU、噪声与历史干扰 | $B_{\mathrm{RU}}$、$P_{\mathrm{noise,RU}}$、$I_{ij,r}^{\mathrm{meas}}$、$\widehat I_{j,r}^{\mathrm{hist}}$、AoI | src/env/channel.py，src/agents/observation.py | P1-04 测量、单位链、时序、mask 和 freshness 计划测试，Gate 1 |
 | outage 统计 | 仅对 $y_{ij}=1$、$p_i^{\mathrm{exec}}(t)>0$、实际资源占用非空且队列剩余 bit 大于零的实际传输尝试统计；其余为 NA | src/env/channel.py，src/evaluation/ | outage 口径测试，Gate 1 |
 | 能量守恒 | $\overline E_i^{\mathrm{act,cand}}(t;\ell^\star)\le E_i^{\mathrm{res}}(t)$；$E_i^{\mathrm{res}}(t+1)=E_i^{\mathrm{res}}(t)-E_i^{\mathrm{act}}(t)$ | src/env/energy.py | candidate 预留硬约束、executed 实际能耗守恒与非负测试，Gate 0 |
 | 实际服务与能耗 | $\tau_{ij}^{\mathrm{tx}}$、$\tau_i^{\mathrm{cpu}}$；提前完成后按实际活跃时间扣除，executed power 的 outage 尝试按整槽计 | src/env/energy.py，src/env/queues.py | 提前完成能耗、executed-power outage 整槽发射尝试、实际能耗不超过 candidate 预留、剩余能量按实际能耗更新，均为计划测试，Gate 0 |
