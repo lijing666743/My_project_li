@@ -1551,7 +1551,7 @@ $$
 
 若 $t=0$ 的 CSI 或历史干扰测量不可用，则分别使用既有缺省 CSI、$I_{j,r}^{\mathrm{def}}$、$m_{ij}^{\mathrm{CSI}}(0)=0$ 或 $m_{j,r}^{I}(0)=0$；历史质量代理按既有 $\widehat\Gamma_{ij,r}^{\mathrm{hist}}(0)$ 公式由缺省 $\widehat h$ 和 $\widehat Z$ 形成，并始终与相应 mask 配对，不把占位值解释为真实信道或零干扰。
 
-每个时隙严格按以下顺序执行，以保持任务、bit、cycle 和能量的因果一致性。槽初读取已有队列，槽内完成服务，槽末统一处理状态更新和事件入队：
+每个 episode 的决策与服务时隙固定为 $t=0,1,\ldots,T-1$，其中 $T-1$ 是最后一个可执行 service slot；不存在 $t=T$ 的额外 actor decision、通信或 CPU service。每个时隙严格按以下顺序执行，以保持任务、bit、cycle 和能量的因果一致性。槽初读取已有队列，槽内完成服务，槽末统一处理状态更新和事件入队：
 
 1. 槽初读取已有任务、四类队列、候选邻居、陈旧 CSI、历史干扰摘要和延迟消息；历史到达率估计按 2.4 节仅使用 $A_i(0),\ldots,A_i(t-1)$ 及对应的 $m_i^\lambda(t)$，$t=0$ 使用固定缺省值和无效 mask；
 2. actor 根据槽初局部观测生成七分支动作提案；
@@ -1564,11 +1564,15 @@ $$
 9. 执行本地或远程 CPU 服务并计算 CPU 实际活跃时间；
 10. 更新任务剩余 bit、剩余 cycle，并计算和扣除实际主动能耗；随后仅按 $\chi_{ij}^{\mathrm{att}}(t)$ 生成单次 outage 样本 $o_{ij}(t)$，并释放未实际消耗的预留；
 11. 在本槽服务量和剩余工作量更新完成后，结算按时完成任务和过期任务；
-12. 将本槽 route 任务、本槽传输完成任务和新到达任务在槽末入队；新到达任务数记为 $A_i(t)$，并记录 $t_n^{\mathrm{arr}}=t$，在下一时隙首次可 route。本槽 route 决策在此时生效并锁定目的地，绑定为 local 的 route 任务同步设置 $d_n^{\mathrm{dst}}\leftarrow i_n$ 和 $D_n^{\mathrm{rem}}\leftarrow0$，绑定为远程 UAV $j$ 的 route 任务同步设置 $d_n^{\mathrm{dst}}\leftarrow j$（$j\ne i_n$），本槽传输完成任务在下一时隙首次可计算；$A_i(t)$ 不影响时隙 $t$ 的 actor 观测，最早在时隙 $t+1$ 槽初进入历史到达率或队列观测；
-13. 在当前真实信道、最终 executed 传输、真实 SINR、服务量和 outage 均已计算后，按 2.9 的干扰求和形成 $I_{ij,r}^{\mathrm{meas}}(t)$，并在接收端历史摘要中记作 $I_{j,r}^{\mathrm{meas}}(t)$；同时生成既有测量可用性 mask。该测量只在槽末形成，缺测不等同于真实零干扰。其 EMA、历史 mask 和消息 AoI 按 2.8.5 更新为下一槽状态，当前测量不返回给当前槽 actor。
-14. 更新外生移动和下一槽真实信道状态，并进入下一槽；CSI 使用既有固定配置陈旧偏移量计算 $\ell_{ij}^{\mathrm{CSI}}(t)=t-a_{ij}^{\mathrm{CSI}}(t)$，不新增独立的 CSI refresh/increment 过程。事件依赖关系固定为：slot-start history $\rightarrow$ actor $\rightarrow$ executor $\rightarrow$ true channel/SINR/service $\rightarrow I^{\mathrm{meas}}(t)$ $\rightarrow$ history/AoI update $\rightarrow t+1$。
-
+12. 使用步骤 10 已确定的全体 UAV 实际主动能耗、步骤 11 已完成的按时完成/过期结算，以及服务后的任务工作量计算 $r_t$。该 reward 计算发生在槽末到达生成与入队之前，因此不读取刚生成且只能在 $t+1$ 槽初可见的 $A_i(t)$，也不产生额外的 terminal reward；
+13. 将本槽 route 任务、本槽传输完成任务和新到达任务在槽末入队；新到达任务数记为 $A_i(t)$，并记录 $t_n^{\mathrm{arr}}=t$，在下一时隙首次可 route。本槽 route 决策在此时生效并锁定目的地，绑定为 local 的 route 任务同步设置 $d_n^{\mathrm{dst}}\leftarrow i_n$ 和 $D_n^{\mathrm{rem}}\leftarrow0$，绑定为远程 UAV $j$ 的 route 任务同步设置 $d_n^{\mathrm{dst}}\leftarrow j$（$j\ne i_n$），本槽传输完成任务在下一时隙首次可计算；$A_i(t)$ 不影响时隙 $t$ 的 actor 观测，最早在时隙 $t+1$ 槽初进入历史到达率或队列观测；
+14. 在当前真实信道、最终 executed 传输、真实 SINR、服务量和 outage 均已计算后，按 2.9 的干扰求和形成 $I_{ij,r}^{\mathrm{meas}}(t)$，并在接收端历史摘要中记作 $I_{j,r}^{\mathrm{meas}}(t)$；同时生成既有测量可用性 mask。该测量只在槽末形成，缺测不等同于真实零干扰。其 EMA、历史 mask 和消息 AoI 按 2.8.5 更新为下一槽状态，当前测量不返回给当前槽 actor。
+15. 若 $t<T-1$，更新外生移动和下一槽真实信道状态，并进入下一槽；CSI 使用既有固定配置陈旧偏移量计算 $\ell_{ij}^{\mathrm{CSI}}(t)=t-a_{ij}^{\mathrm{CSI}}(t)$，不新增独立的 CSI refresh/increment 过程。若 $t=T-1$，完成上述 reward 与槽末必要更新后执行 terminal bookkeeping，并在边界 $T$ 结束 episode，不构造 $t=T$ 的 actor 或 service。普通槽的事件依赖关系固定为：slot-start history $\rightarrow$ actor $\rightarrow$ executor $\rightarrow$ true channel/SINR/service $\rightarrow$ actual energy $\rightarrow$ completion/deadline settlement $\rightarrow r_t \rightarrow$ slot-end updates/arrivals $\rightarrow t+1$。
 该顺序带来三条不可绕过的可用性规则：新 route 任务不能在本槽由 tx_select 服务；本槽传输完成任务不能在本槽计算；槽末生成的新任务不能在本槽再次参与 route。完成和过期结算均发生在本槽服务量及剩余工作量更新之后，且 deadline 时隙仍允许服务。因而任何算法都共享相同的服务边界，不能通过改变网络输出顺序获得额外的槽内服务。
+
+固定 horizon 的终止规则如下。若任务满足 $t_n^{\mathrm{ddl}}\le T-1$，则它仍在其 deadline slot 接受最后一次合法 service；该槽服务和剩余工作量更新后，完成则记为 $\mathrm{done}$，否则立即记为 $\mathrm{expired}$，episode 在边界 $T$ 到来时不再改写这一结算结果。若任务在边界 $T$ 仍未完成且 $t_n^{\mathrm{ddl}}\ge T$，则只在 episode terminal bookkeeping 中标记为 $\mathrm{truncated}$，不把该标签加入 $\mathcal S_{\mathrm{task}}$，也不将其视为物理任务状态转移。由统一到达过程在最后一个槽末生成的 $A_i(T-1)$ 同样只用于 terminal bookkeeping，直接记为 $\mathrm{truncated}$；它们不进入 $t=T$ 的 route 或 service，也不影响 $r_{T-1}$。
+
+$\mathrm{truncated}$ 与 $\mathrm{expired}$ 的统计边界保持分离：$\mathrm{truncated}$ 只用于 episode 终止统计、trajectory/replay 终止标记和 evaluation accounting，不计入 expired numerator，不虚构 $t_n^{\mathrm{cmp}}$ 或 $T_n^{\mathrm{E2E}}$，并单独报告其数量或比例。E2E completion latency 只对实际完成的任务统计；outage 仍只使用 $0,\ldots,T-1$ 内真实传输尝试，energy 仍只统计这些时隙内的实际主动能耗。系统不增加 $T,T+1,\ldots$ 的 post-horizon drain/service slots，不为未完成任务等待到 done/expired，也不由 truncation 自动产生 $r(T)$ 或其他额外 terminal penalty。
 
 时间轴示例：时隙 $t$ 槽末任务到达，记录 $t_n^{\mathrm{arr}}=t$；时隙 $t+1$ 任务首次可 route，槽末完成绑定；时隙 $t+2$ 首次可接受传输或 CPU 服务。若在时隙 $t+2$ 槽末完成，则 $t_n^{\mathrm{cmp}}=t+2$，端到端时延为 $((t+2)-t)\Delta t=2\Delta t$。
 
@@ -1652,7 +1656,7 @@ $$
 
 转移核包含真实信道和遮挡对服务量的影响、传输与 CPU 队列更新、能量扣除、任务完成/过期结算、槽末入队、外生移动和 CSI AoI 更新。它不把 actor 的局部估计直接当作真实环境状态。
 
-为了刻画截止期和资源代价，定义活动任务的紧迫工作量：
+为了刻画截止期和资源代价，定义活动任务的紧迫工作量。下式中的 $W(t)$ 在时隙 $t$ 的 reward 计算阶段读取，即已完成本槽 service、实际能耗计算和 completion/deadline settlement 之后、槽末新到达任务 $A_i(t)$ 生成与入队之前的 post-service/pre-next-arrival 值：
 
 $$
 W(t)
@@ -1667,7 +1671,7 @@ C_n^{\mathrm{rem}}(t)/f_{\mathrm{ref}}
 }.
 $$
 
-其中 $\mathcal T_t^{\mathrm{active}}$ 是尚未处于 done 或 expired 的任务集合。本地绑定任务因满足 $D_n^{\mathrm{rem}}=0$，不计入通信剩余工作量。设 $N_{\mathrm{on}}(t)$ 为本槽按 deadline 完成的任务数，$N_{\mathrm{exp}}(t)$ 为本槽结算的过期任务数，$E^{\mathrm{act}}(t)$ 为全体 UAV 主动能耗，则团队即时奖励定义为：
+其中，在 reward 读取边界上，$\mathcal T_t^{\mathrm{active}}$ 是完成本槽 settlement 后仍未处于 done 或 expired 的任务集合，$D_n^{\mathrm{rem}}(t)$ 和 $C_n^{\mathrm{rem}}(t)$ 是同一 post-service 边界的剩余量；槽末刚生成且仅在 $t+1$ 可见的 $A_i(t)$ 不包含在其中。本地绑定任务因满足 $D_n^{\mathrm{rem}}=0$，不计入通信剩余工作量。$N_{\mathrm{on}}(t)$ 统计经过 slot $t$ service 后在本槽完成且满足 hard deadline 的任务数，$N_{\mathrm{exp}}(t)$ 统计同一 settlement 中在 deadline slot service/update 后仍未完成而标记为 expired 的任务数；deadline slot 本身仍可用于合法 service。$E^{\mathrm{act}}(t)$ 为全体 UAV 在本槽最终执行产生的实际主动能耗，不使用 reservation、candidate 或 proposed energy，则团队即时奖励定义为：
 
 $$
 r_t
@@ -1681,7 +1685,19 @@ w_q\widetilde W(t)
 w_e\widetilde E^{\mathrm{act}}(t).
 $$
 
-波浪号表示使用预先固定的参考尺度归一化，不使用当前 batch 均值动态归一化。$w_c,w_d,w_q,w_e$ 的编码初始值为 $1.0,1.0,0.2,0.05$，仅作为调试起点，不作为已验证的最优权重。
+波浪号的参考尺度定义为：
+
+$$
+\widetilde W(t)=\frac{W(t)}{W^{\mathrm{ref}}},
+\qquad
+\widetilde N_{\mathrm{on}}(t)=\frac{N_{\mathrm{on}}(t)}{N^{\mathrm{ref}}},
+\qquad
+\widetilde N_{\mathrm{exp}}(t)=\frac{N_{\mathrm{exp}}(t)}{N^{\mathrm{ref}}},
+\qquad
+\widetilde E^{\mathrm{act}}(t)=\frac{E^{\mathrm{act}}(t)}{E_{\mathrm{act}}^{\mathrm{ref}}}.
+$$
+
+其中 $W^{\mathrm{ref}}>0$ 是 workload reference，单位为 s；$N^{\mathrm{ref}}>0$ 是每槽任务数 reference，单位为 task；$E_{\mathrm{act}}^{\mathrm{ref}}=\sum_{i\in\mathcal U}E_i^0>0$ 是全体 UAV 的固定 episode 初始主动能量 reference，单位为 J。三者均在实验开始前确定，在一个 episode 内、各次 reset 之间以及 evaluation 中保持不变；它们不是当前 slot 或 episode 的 observed maximum、未来 maximum、batch statistics 或训练过程中的动态 min/max，且不随 seed 改变。后续配置只负责给出这些 fixed constants 的具体数值，不重新定义其物理含义。$w_c,w_d,w_q,w_e$ 的编码初始值为 $1.0,1.0,0.2,0.05$，仅作为调试起点，不作为已验证的最优权重。
 
 Dec-POMDP 可用元组表示为：
 
@@ -1807,6 +1823,29 @@ outage 口径的计划测试至少包括：
 - 修改尚未在槽末生成的 $A_i(t)$ 不得改变时隙 $t$ 的 actor 观测；
 - $A_i(t)$ 最早只能影响时隙 $t+1$ 的历史到达率或队列观测；
 - 缺省值 $0$ 必须始终与 $m_i^\lambda(t)=0$ 的不可用标志配对，不能被解释为真实零到达率。
+
+本轮 reward 与 episode 终止语义的计划测试仅用于后续实现，不表示测试已经实现：
+
+1. reward 使用 post-service/post-settlement 状态；
+2. deadline slot 在 service/update 后再决定 done 或 expired；
+3. $E^{\mathrm{act}}(t)$ 使用 actual energy 而非 reservation energy；
+4. $A_i(t)$ 不影响同槽 reward；
+5. $A_i(t)$ 最早影响 $t+1$ 的 state/observation；
+6. 所有 normalization denominator 在 episode 开始前固定；
+7. normalization 不依赖运行中的 max/min 或 batch statistics；
+8. 相同物理量输入得到相同 normalized value；
+9. slot $T-1$ 是最后 service slot；
+10. 不存在 slot $T$ 的 actor 或 service；
+11. $t_n^{\mathrm{ddl}}=T-1$ 的任务可以在最后槽完成；
+12. $t_n^{\mathrm{ddl}}=T-1$ 且最后槽未完成的任务记为 expired；
+13. $t_n^{\mathrm{ddl}}\ge T$ 且边界仍未完成的任务记为 truncated 而非 expired；
+14. $A_i(T-1)$ 不获得 route/service，并在 terminal bookkeeping 中按冻结规则处理；
+15. truncated task 不虚构 $t_n^{\mathrm{cmp}}$ 或 $T_n^{\mathrm{E2E}}$；
+16. truncated 不计入 expired numerator；
+17. truncated 单独统计；
+18. terminal 不新增虚构 reward；
+19. outage denominator 只使用实际 transmission attempts；
+20. 固定 seed 下 terminal accounting 可复现。
 
 物理层初始时刻的计划测试至少包括：
 
