@@ -92,6 +92,9 @@ knowledge/project_plan/方案2.md
 - 最终一致性审计发现的 P1-05/P1-06 已完成：reward timing 已冻结为 post-service / post-settlement，normalization scales 已冻结为 episode 开始前固定的 reference constants，episode horizon 与 terminal truncation 已定义；
 - 最终冻结审计发现的 P1-01/P1-07/P1-08 已完成本轮修订：已闭合 deadline slot transition/settlement，补齐 reset 状态，并将 zero-power executed communication 统一为 canonical idle；其他最终冻结 P1 仍待处理，`sections/2_system_model.md` 尚未正式冻结；
 - 审计中原有 P0/P1 修订项至此全部处理完成，但 `sections/2_system_model.md` 尚未正式冻结；下一步是第二次全文一致性审计；
+- 本轮最终冻结审计已收口 P1-02 至 P1-06：移动边界、reset 安全距离、small-scale fading、CSI error、interference measurement mask 和 historical-quality scalar 的实现规格均已唯一化；
+- Section 2 已补齐固定采样顺序、fixed-seed 可复现性、当前测量不得泄漏给 actor、measured zero 与 missing 区分，以及 proposed resource set 上的 valid-RU arithmetic-mean 聚合；
+- 本轮仅更新 sections/2_system_model.md 与本进度说明，未实现代码或测试、未生成实验产物、未执行 git add/commit；Section 2 等待用户复核，不在本轮宣告正式冻结。
 - 本项目尚未实现代码、测试、方法或实验，不得据此声称其已经完成；
 - 当前真实 SINR 仅在联合执行动作确定后由环境计算；
 - 已消除 actor 读取当前联合干扰的未来信息风险；
