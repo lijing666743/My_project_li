@@ -406,8 +406,40 @@ class RunConfig:
         env = self.environment
         if env.episode_horizon <= 0 or env.slot_duration_s <= 0:
             raise ConfigError("episode_horizon and slot_duration_s must be positive")
+        if env.uav_count <= 0 or env.height_m <= 0:
+            raise ConfigError("uav_count and height_m must be positive")
+        bounds = env.bounds
+        if bounds.x_max_m <= bounds.x_min_m or bounds.y_max_m <= bounds.y_min_m:
+            raise ConfigError("environment bounds must have positive width and height")
+        if env.boundary_rule != "coordinate-wise specular reflection":
+            raise ConfigError("boundary_rule must be 'coordinate-wise specular reflection'")
+        if env.reset_safe_distance_m <= 0 or env.candidate_neighbor_radius_m <= 0:
+            raise ConfigError("reset safe distance and candidate neighbor radius must be positive")
+        if len(env.velocity_mean_mps) != 2 or len(env.velocity_std_mps) != 2:
+            raise ConfigError("velocity mean/std must each contain x and y values")
+        if any(value < 0 for value in env.velocity_std_mps):
+            raise ConfigError("velocity standard deviations must be non-negative")
+        if not 0.0 <= env.gauss_markov_alpha <= 1.0:
+            raise ConfigError("gauss_markov_alpha must be in [0, 1]")
         if env.ru_count <= 0 or env.resource_group_count <= 0 or env.ru_count % env.resource_group_count:
             raise ConfigError("ru_count must be positive and divisible by resource_group_count")
+        if env.total_bandwidth_hz <= 0 or env.carrier_frequency_hz <= 0:
+            raise ConfigError("bandwidth and carrier frequency must be positive")
+        if env.reference_transmit_power_w <= 0:
+            raise ConfigError("reference_transmit_power_w must be positive")
+        if env.shadowing_std_db < 0 or env.shadowing_correlation_distance_m <= 0:
+            raise ConfigError("shadowing std must be non-negative and correlation distance positive")
+        if env.csi_error_std_db < 0 or env.initial_interference_w < 0:
+            raise ConfigError("CSI error std and initial interference must be non-negative")
+        if env.building_loss_db < 0:
+            raise ConfigError("building_loss_db must be non-negative")
+        for building in env.building_layout:
+            if (
+                building.x_max_m <= building.x_min_m
+                or building.y_max_m <= building.y_min_m
+                or building.height_m <= 0
+            ):
+                raise ConfigError(f"building {building.name!r} has invalid bounds or height")
         if len(env.arrival_probabilities) != env.uav_count:
             raise ConfigError("arrival_probabilities length must equal environment.uav_count")
         if len(env.profile_assignment) != env.uav_count:
@@ -416,8 +448,8 @@ class RunConfig:
             raise ConfigError("arrival_probabilities must be in [0, 1]")
         if env.fixed_csi_aoi_slots < 0:
             raise ConfigError("fixed_csi_aoi_slots must be non-negative")
-        if not 0.0 <= env.interference_ema_beta <= 1.0:
-            raise ConfigError("interference_ema_beta must be in [0, 1]")
+        if not 0.0 <= env.interference_ema_beta < 1.0:
+            raise ConfigError("interference_ema_beta must be in [0, 1)")
         if env.minimum_task_slack_slots <= 0 or env.maximum_task_slack_slots < env.minimum_task_slack_slots:
             raise ConfigError("task slack clip bounds are invalid")
         if self.action.resource_group_count != env.resource_group_count:

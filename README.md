@@ -103,7 +103,8 @@ knowledge/project_plan/方案2.md
 - 已接通 `python main.py` 无参数交互菜单与 `python main.py --mode random --seed 42` 直连入口；当前尚无 environment backend，未生成伪造 metrics、dashboard 或 checkpoint；
 - 已新增 Config/CLI/Runner 单元测试并通过 6 项；后续仍需实现 environment sanity、Gate 0、random policy 和 heuristic policy 的真实后端与 raw metrics；
 - 已完成 02-Task-Queue-Lifecycle：新增 typed Task、确定性 task ID、EDF 队列、单一队列所有权、route/service 时序、目的地锁定、剩余 bit/cycle bookkeeping、hard deadline、done/expired 与 horizon-only truncated 结算；新增 Task/Queue/Lifecycle 测试并与 Implementation 01 回归测试合计通过 29 项；
-- 当前 Gate 0 状态仅为 Task/Lifecycle subset: PASS；environment backend、mobility、channel、executor、energy、observation/reward、完整 reset/step、random/heuristic rollout 和 RL 仍未实现；
+- 已完成 03-Mobility-Topology-Channel：新增统一 seed stream、Gauss-Markov 移动与安全 reset、coordinate-wise specular reflection、动态候选邻居、建筑物遮挡、相关阴影、directed per-RU Rician/Rayleigh 真实信道、stale CSI/CSI error、历史干扰 EMA/消息 AoI、历史 denominator、per-RU 历史质量代理量与 validity masks；新增 18 项测试并与既有 29 项回归测试合计通过 47 项；
+- 当前 Gate 0 状态为 Task/Lifecycle subset: PASS、Mobility/Topology/Channel-History subset: PASS；Full Gate 0 = NOT YET，仍缺 executor、tx/CPU service、energy、observation/reward、完整 reset/step 和 random/heuristic rollout；
 - 当前真实 SINR 仅在联合执行动作确定后由环境计算；
 - 已消除 actor 读取当前联合干扰的未来信息风险；
 - 联合执行器使用保守能量预留上界保证执行前硬可行性；
@@ -114,7 +115,7 @@ knowledge/project_plan/方案2.md
 - Section 2 系统模型、Section 3 方法接口和 Section 4 实验协议共同构成后续实现的冻结基线；
 - 最终项目方案已经冻结；
 - 项目状态文档正在与冻结章节同步；
-- 环境、算法和实验脚本尚未实现；Gate 0 通过前不启动正式 RL training；
+- 完整 environment backend、算法和实验脚本尚未实现；Gate 0 通过前不启动正式 RL training；
 - 当前没有真实实验结果。
 
 ## 下一步
