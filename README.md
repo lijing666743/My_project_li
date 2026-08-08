@@ -102,6 +102,8 @@ knowledge/project_plan/方案2.md
 - 已完成 01-Config-CLI-Runner：新增 typed `RunConfig`、Section 4 场景默认值、配置文件/CLI/交互覆盖优先级、seed stream 元数据、registry 和统一 runner；
 - 已接通 `python main.py` 无参数交互菜单与 `python main.py --mode random --seed 42` 直连入口；当前尚无 environment backend，未生成伪造 metrics、dashboard 或 checkpoint；
 - 已新增 Config/CLI/Runner 单元测试并通过 6 项；后续仍需实现 environment sanity、Gate 0、random policy 和 heuristic policy 的真实后端与 raw metrics；
+- 已完成 02-Task-Queue-Lifecycle：新增 typed Task、确定性 task ID、EDF 队列、单一队列所有权、route/service 时序、目的地锁定、剩余 bit/cycle bookkeeping、hard deadline、done/expired 与 horizon-only truncated 结算；新增 Task/Queue/Lifecycle 测试并与 Implementation 01 回归测试合计通过 29 项；
+- 当前 Gate 0 状态仅为 Task/Lifecycle subset: PASS；environment backend、mobility、channel、executor、energy、observation/reward、完整 reset/step、random/heuristic rollout 和 RL 仍未实现；
 - 当前真实 SINR 仅在联合执行动作确定后由环境计算；
 - 已消除 actor 读取当前联合干扰的未来信息风险；
 - 联合执行器使用保守能量预留上界保证执行前硬可行性；
