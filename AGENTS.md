@@ -15,4 +15,4 @@
 - Python 文件、类和函数使用英文命名；README 和论文说明使用中文。
 - 公式使用标准 LaTeX，并为符号提供清晰定义。
 - 不得随意扩大研究范围；若需变更技术路线或任务边界，应先记录并确认。
-- 本项目初始化阶段不实现信道模型、队列模型、强化学习算法或实验脚本。
+- 当前项目已切换至 Environment Implementation 阶段。允许开始实现 configuration、CLI、registry、runner、task lifecycle、queues、mobility、topology、channel、stale CSI/history、interference measurement、deterministic executor、communication service、CPU service、energy accounting、observation、reward、reset、step、metrics、Gate 0 tests、environment sanity、random policy 和 heuristic policy；Gate 0 通过前不得启动正式 RL training，不得声称 MAPPO/QMIX 已完成或生成正式训练结果。

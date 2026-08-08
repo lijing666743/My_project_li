@@ -17,8 +17,8 @@ knowledge/project_plan/方案2.md
 | `0_abstract_keywords.md`               | 等待核心章节冻结   | 摘要与关键词，不提前写实验结论                               | 在系统模型、方法和实验协议完成后整理 |
 | `1_introduction.md`                    | 等待核心章节冻结   | 研究背景、问题、贡献和文章结构                               | 在三章一致性审计后正式撰写           |
 | `2_system_model.md`                    | FROZEN / COMPLETE SPECIFICATION | 系统对象、符号、异构性、任务状态机、队列、时隙因果、信道、动作语义和信息权限 | 作为 Section 3/4 接口基线            |
-| `3_methods.md`                         | NEXT / NOT YET FROZEN | CA-GAT-MAPPO、Factorized-Action GAT-QMIX、训练与执行流程     | 完成并冻结方法接口                   |
-| `4_experimental_protocol.md`           | DRAFT / NOT YET FROZEN | Gate P–Gate 6、实验族 A/B/C、参数校准、统计和日志规范        | 在 Section 3 冻结后完成并冻结         |
+| `3_methods.md`                         | FROZEN / COMPLETE LEARNING INTERFACE | CA-GAT-MAPPO、Factorized-Action GAT-QMIX、训练与执行流程     | 作为 RL implementation interface      |
+| `4_experimental_protocol.md`           | FROZEN / COMPLETE IMPLEMENTATION CONTRACT | Gate P–Gate 6、实验族 A/B/C、参数校准、统计和日志规范        | 作为 config/runner/Gate 0 interface    |
 | `5_results_template.md`                | 结果占位           | 只接收真实运行结果、图表和统计检验                           | 编码和实验完成后填写                 |
 | `6_discussion_limitations_template.md` | 讨论占位           | 结果解释、失败场景、局限性和外推边界                         | 依据真实结果填写                     |
 | `7_conclusion.md`                      | 等待核心章节和结果 | 总结研究问题、方法、主要结果和局限性                         | 最后阶段完成                         |
@@ -50,13 +50,15 @@ knowledge/project_plan/方案2.md
 14. 能量不可行时只能执行离散降档或 idle，不得映射为档位集合之外的连续值。
 15. 第三 UAV 软遮挡、连续资源动作、Sionna RT、数量 OOD 和类型 embedding 均为可选扩展。
 16. 结果和讨论章节只能使用真实运行结果，不得填入虚构数字、曲线、显著性或结论。
-17. `AGENTS.md` 暂不修改。只有 `2_system_model.md`、`3_methods.md` 和 `4_experimental_protocol.md` 完成并通过一致性审计后，才结束初始化阶段。
+17. `2_system_model.md`、`3_methods.md` 和 `4_experimental_protocol.md` 已完成并通过当前一致性审计，初始化/specification 阶段结束，项目当前阶段为 Environment Implementation；冻结章节仍是唯一实现基线。
 
 ## 推荐工作顺序
 
 ```
-Section 3
-    -> Section 4
-    -> cross-section interface audit
-    -> implementation-stage transition
+Environment Implementation
+    -> environment skeleton
+    -> Gate 0
+    -> random policy rollout
+    -> heuristic policy rollout
+    -> RL implementation only after Gate 0
 ```

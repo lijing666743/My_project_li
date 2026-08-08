@@ -97,8 +97,8 @@ knowledge/project_plan/方案2.md
 - 当前最终 READY TO FREEZE 审计唯一剩余的 P1 已修复：消除 scalar historical quality 观测执行器循环，actor 只读取 proposal 形成前已存在的 per-RU historical quality 及其有效性 mask；
 - executor-only scalar historical quality 仅在 actor 形成 $\mathcal S_i^{\mathrm{prop}}(t)$ 后计算，并继续使用既有 valid-RU masked arithmetic mean、fallback $0$ 和 $(\operatorname{slack},-\widehat\Gamma_{ij}^{\mathrm{hist}},i,j)$ 优先级键；
 - Section 2 系统模型已完成最终冻结验收：FROZEN；P0 = 0；P1 = 0；
-- 当前尚未开始正式环境代码实现；tests 尚未实现；尚未运行实验；尚无实验结果；Section 3 Methods 尚待冻结；Section 4 Experimental Protocol 尚待冻结；
-- 本项目尚未开始正式环境代码实现；tests 尚未实现；尚未运行实验；尚无实验结果，不得据此声称其已经完成；
+- Section 2、Section 3 和 Section 4 的实现契约均已冻结并通过当前跨章节接口检查；三章状态均为 FROZEN，P0 = 0，P1 = 0；
+- 项目阶段已切换为 Environment Implementation；允许开始环境、配置、运行器和 Gate 0 相关代码实现；当前实现、测试和实验结果仍未产生，不得据此声称代码或实验已经完成；
 - 当前真实 SINR 仅在联合执行动作确定后由环境计算；
 - 已消除 actor 读取当前联合干扰的未来信息风险；
 - 联合执行器使用保守能量预留上界保证执行前硬可行性；
@@ -106,19 +106,18 @@ knowledge/project_plan/方案2.md
 - 已修正端到端时延及 slack 的 off-by-one 语义；
 - 已绑定任务不允许重新路由；
 - Section 2 系统模型已完成冻结验收，当前不再新增系统模型语义；
-- 当前已完成 Section 2 冻结，进入 Section 3 Methods 与 Section 4 Experimental Protocol 的规格阶段；
+- Section 2 系统模型、Section 3 方法接口和 Section 4 实验协议共同构成后续实现的冻结基线；
 - 最终项目方案已经冻结；
 - 项目状态文档正在与冻结章节同步；
-- `sections/2_system_model.md` 已冻结，`sections/3_methods.md` 与 `sections/4_experimental_protocol.md` 尚待正式整理和冻结；
-- 环境、算法和实验脚本尚未实现；
+- 环境、算法和实验脚本尚未实现；Gate 0 通过前不启动正式 RL training；
 - 当前没有真实实验结果。
 
 ## 下一步
 
-1. 完成 `sections/3_methods.md`；
-2. 完成 `sections/4_experimental_protocol.md`；
-3. 执行 Section 2/3/4 跨章节接口一致性审计；
-4. 通过后进入 Python 环境实现阶段。
+1. 建立与冻结章节一致的 environment skeleton、configuration、CLI、registry 和 runner；
+2. 实现任务生命周期、队列、移动、拓扑、信道、历史 CSI/干扰、确定性执行器、通信/CPU service、能量、观测、reward、reset 和 step；
+3. 实现并通过 Gate 0 测试与 environment sanity；
+4. 运行 random policy rollout 和 heuristic policy rollout，保留真实 raw metrics 后再进入 RL 实现。
 
 - `knowledge/project_plan/方案2.md` 仍包含尚未同步的旧系统模型语义，因为该文件位于 AGENTS.md 定义的 protected `knowledge/` 目录，当前自动任务不得修改。当前环境实现规格以已经冻结的 `sections/2_system_model.md` 为准（PROTECTED SYNC DEBT）。
 
