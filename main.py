@@ -1,13 +1,13 @@
-"""项目轻量化程序入口。
+"""Student-facing entry point for the U2U-MEC experiment launcher."""
 
-本文件暂不实现环境、模型、算法或仿真功能。
-"""
+from src.cli import main as _cli_main
 
 
-def main() -> None:
-    """运行当前项目的最小入口。"""
-    pass
+def main() -> int:
+    """Run interactive or direct CLI configuration through the common runner."""
+
+    return _cli_main()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

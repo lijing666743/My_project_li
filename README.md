@@ -99,6 +99,9 @@ knowledge/project_plan/方案2.md
 - Section 2 系统模型已完成最终冻结验收：FROZEN；P0 = 0；P1 = 0；
 - Section 2、Section 3 和 Section 4 的实现契约均已冻结并通过当前跨章节接口检查；三章状态均为 FROZEN，P0 = 0，P1 = 0；
 - 项目阶段已切换为 Environment Implementation；允许开始环境、配置、运行器和 Gate 0 相关代码实现；当前实现、测试和实验结果仍未产生，不得据此声称代码或实验已经完成；
+- 已完成 01-Config-CLI-Runner：新增 typed `RunConfig`、Section 4 场景默认值、配置文件/CLI/交互覆盖优先级、seed stream 元数据、registry 和统一 runner；
+- 已接通 `python main.py` 无参数交互菜单与 `python main.py --mode random --seed 42` 直连入口；当前尚无 environment backend，未生成伪造 metrics、dashboard 或 checkpoint；
+- 已新增 Config/CLI/Runner 单元测试并通过 6 项；后续仍需实现 environment sanity、Gate 0、random policy 和 heuristic policy 的真实后端与 raw metrics；
 - 当前真实 SINR 仅在联合执行动作确定后由环境计算；
 - 已消除 actor 读取当前联合干扰的未来信息风险；
 - 联合执行器使用保守能量预留上界保证执行前硬可行性；
