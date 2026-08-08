@@ -12,6 +12,7 @@ import ast
 import copy
 import hashlib
 import json
+import math
 import platform
 import re
 import subprocess
@@ -116,6 +117,7 @@ class EnvironmentConfig:
     interference_ema_beta: float = 0.8
     initial_interference_w: float = 0.0
     outage_threshold_db: float = -3.0
+    energy_tolerance_j: float = 1.0e-12
     minimum_task_slack_slots: int = 10
     maximum_task_slack_slots: int = 150
     uav_count: int = 4
@@ -151,6 +153,22 @@ class EnvironmentConfig:
     @property
     def ru_per_group(self) -> int:
         return self.ru_count // self.resource_group_count
+
+    @property
+    def resource_groups(self) -> tuple[tuple[int, ...], ...]:
+        """Return the frozen one-based, equal-width contiguous RU groups."""
+
+        width = self.ru_per_group
+        return tuple(
+            tuple(range(index * width + 1, (index + 1) * width + 1))
+            for index in range(self.resource_group_count)
+        )
+
+    @property
+    def outage_threshold_linear(self) -> float:
+        """Return the configured dB outage threshold in the linear domain."""
+
+        return 10.0 ** (self.outage_threshold_db / 10.0)
 
 
 @dataclass(frozen=True)
@@ -431,6 +449,10 @@ class RunConfig:
             raise ConfigError("shadowing std must be non-negative and correlation distance positive")
         if env.csi_error_std_db < 0 or env.initial_interference_w < 0:
             raise ConfigError("CSI error std and initial interference must be non-negative")
+        if not math.isfinite(env.energy_tolerance_j) or env.energy_tolerance_j <= 0:
+            raise ConfigError("energy_tolerance_j must be finite and positive")
+        if not math.isfinite(env.outage_threshold_db):
+            raise ConfigError("outage_threshold_db must be finite")
         if env.building_loss_db < 0:
             raise ConfigError("building_loss_db must be non-negative")
         for building in env.building_layout:

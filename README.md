@@ -104,7 +104,8 @@ knowledge/project_plan/方案2.md
 - 已新增 Config/CLI/Runner 单元测试并通过 6 项；后续仍需实现 environment sanity、Gate 0、random policy 和 heuristic policy 的真实后端与 raw metrics；
 - 已完成 02-Task-Queue-Lifecycle：新增 typed Task、确定性 task ID、EDF 队列、单一队列所有权、route/service 时序、目的地锁定、剩余 bit/cycle bookkeeping、hard deadline、done/expired 与 horizon-only truncated 结算；新增 Task/Queue/Lifecycle 测试并与 Implementation 01 回归测试合计通过 29 项；
 - 已完成 03-Mobility-Topology-Channel：新增统一 seed stream、Gauss-Markov 移动与安全 reset、coordinate-wise specular reflection、动态候选邻居、建筑物遮挡、相关阴影、directed per-RU Rician/Rayleigh 真实信道、stale CSI/CSI error、历史干扰 EMA/消息 AoI、历史 denominator、per-RU 历史质量代理量与 validity masks；新增 18 项测试并与既有 29 项回归测试合计通过 47 项；
-- 当前 Gate 0 状态为 Task/Lifecycle subset: PASS、Mobility/Topology/Channel-History subset: PASS；Full Gate 0 = NOT YET，仍缺 executor、tx/CPU service、energy、observation/reward、完整 reset/step 和 random/heuristic rollout；
+- 已完成 04-Executor-Service-Energy：新增七分支 proposal adapter、确定性 half-duplex executor、power-first/CPU-after 离散能量降档、同 RU 复用下的真实 interference/SINR/rate、跨任务 EDF 传输、单队首 CPU service、实际活跃时间能耗、剩余能量扣除、I_meas 与 outage NA 语义；新增 23 项测试并与既有 47 项回归测试合计通过 70 项；
+- 当前 Gate 0 状态为 Task/Lifecycle subset: PASS、Mobility/Topology/Channel-History subset: PASS、Executor/Service/Energy/Outage subset: PASS；Full Gate 0 = NOT YET，仍缺 observation/reward、完整 reset/step、端到端环境断言和 random/heuristic rollout；
 - 当前真实 SINR 仅在联合执行动作确定后由环境计算；
 - 已消除 actor 读取当前联合干扰的未来信息风险；
 - 联合执行器使用保守能量预留上界保证执行前硬可行性；
@@ -120,8 +121,8 @@ knowledge/project_plan/方案2.md
 
 ## 下一步
 
-1. 建立与冻结章节一致的 environment skeleton、configuration、CLI、registry 和 runner；
-2. 实现任务生命周期、队列、移动、拓扑、信道、历史 CSI/干扰、确定性执行器、通信/CPU service、能量、观测、reward、reset 和 step；
+1. 集成当前已完成的 configuration/runner、task lifecycle、mobility/channel-history 与物理执行核，形成完整 environment reset/step；
+2. 补齐 final actor observation、centralized state、reward、metrics 与端到端环境断言；
 3. 实现并通过 Gate 0 测试与 environment sanity；
 4. 运行 random policy rollout 和 heuristic policy rollout，保留真实 raw metrics 后再进入 RL 实现。
 

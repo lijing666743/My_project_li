@@ -1,5 +1,40 @@
 """Environment building blocks shared by future reset/step backends."""
 
+from .actions import (
+    ActionError,
+    ActionProposal,
+    PreparedAction,
+    PreparedCommunication,
+    PreparedCpu,
+    ProposalAdapter,
+)
+from .energy import (
+    ActualEnergyDebit,
+    DowngradeSelection,
+    EnergyError,
+    EnergyReservation,
+    UavEnergyState,
+    actual_transmit_energy_j,
+    debit_actual_energy,
+)
+from .executor import (
+    CommunicationExecution,
+    CpuExecution,
+    DeterministicExecutor,
+    ExecutedAction,
+    ExecutorError,
+    JointExecutionResult,
+)
+from .outage import OutageError, OutageResult, actual_attempt_outage
+from .service import (
+    CpuServiceResult,
+    LinkServiceResult,
+    PhysicalService,
+    ServiceError,
+    SlotPhysicalResult,
+    TaskServiceRecord,
+)
+
 from .channel import (
     BuildingPrism,
     ChannelError,
@@ -39,6 +74,34 @@ from .topology import (
 )
 
 __all__ = [
+    "ActionError",
+    "ActionProposal",
+    "ActualEnergyDebit",
+    "CommunicationExecution",
+    "CpuExecution",
+    "CpuServiceResult",
+    "DeterministicExecutor",
+    "DowngradeSelection",
+    "EnergyError",
+    "EnergyReservation",
+    "ExecutedAction",
+    "ExecutorError",
+    "JointExecutionResult",
+    "LinkServiceResult",
+    "OutageError",
+    "OutageResult",
+    "PhysicalService",
+    "PreparedAction",
+    "PreparedCommunication",
+    "PreparedCpu",
+    "ProposalAdapter",
+    "ServiceError",
+    "SlotPhysicalResult",
+    "TaskServiceRecord",
+    "UavEnergyState",
+    "actual_attempt_outage",
+    "actual_transmit_energy_j",
+    "debit_actual_energy",
     "ActorChannelFeatures",
     "BuildingPrism",
     "ChannelError",
