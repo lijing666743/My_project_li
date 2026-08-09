@@ -1,10 +1,10 @@
 # 4 极速仿真契约
 
-> 状态：SECTION 4 READY FOR INTERFACE AUDIT
+> 状态：SECTION 4 HEURISTIC BASELINE SPECIFICATION FROZEN
 >
 > 本章是进入 Python 实现前的最小实验契约，不是实验结果、收敛证明或物理层标定报告。本文所有数值均为已冻结的 Section 2 数值、Section 3 接口数值化结果，或明确标记为 IMPLEMENTATION DEFAULT — Section 4 的实现默认值。
 >
-> 最后更新：2026-08-08
+> 最后更新：2026-08-09
 
 ## 4.1 适用范围与来源优先级
 
@@ -341,9 +341,94 @@ random policy 只在当前 branch 的 valid mask 集合内抽样，按固定七�
 
 ### 4.7.2 Heuristic policy
 
-heuristic policy 只可读取 actor-visible information：槽初本地队列、合法邻居、历史 CSI、历史干扰摘要、历史质量代理、AoI、历史到达率、资源/能量状态和 masks。它不得读取 current true channel、current SINR、current interference、current measurement、future arrival、future queue 或 executor-only scalar。heuristic proposal 仍必须经过相同 deterministic executor。
+本项目冻结的 heuristic 名称为 **Deadline-and-Historical-Link-Aware Lexicographic Heuristic**。它是 deterministic、non-learning、actor-visible、EDF-aware、deadline-aware、historical-link-aware 的 operational-control baseline，不是 optimizer、MPC、dynamic programming、exhaustive search、oracle 或 RL method。该 baseline 不包含 learned parameter、任意 weighted score、人工调参阈值或新的数值超参数；所有比较只使用已冻结的模型量、deadline/slack、历史质量排序、离散合法资源档位和 action masks。
 
-第一版 heuristic 只使用已有 EDF 顺序、合法 destination/queue preference 和 valid-mask fallback；本章不引入复杂优化器、look-ahead、MILP、oracle 或新的方法分支。
+heuristic policy 与 actor 使用完全相同的信息边界。允许读取：自身资源状态和剩余能量、槽初队列摘要、EDF 队首任务的剩余 bit/cycle 与 slack、合法候选邻居、public/sanitized neighbor information、stale CSI、CSI mask/AoI、历史干扰摘要、历史干扰 mask/AoI、actor-visible per-RU historical quality 及其 mask、历史到达率、资源/能量状态和 action masks。禁止读取：current true channel、current true SINR、current interference、current interference measurement、future arrival、future queue、centralized critic state、executor-only historical-quality scalar、current executed action 以及 rejection/downgrade result。
+
+#### 4.7.2.1 Historical-quality aggregation
+
+heuristic 的历史链路排序只能对 actor-visible 的 per-RU historical quality 做 masked aggregation。对候选资源单元集合 $A$，令
+
+$$
+A_{\mathrm{valid}}(t)=\{r\in A:m_{ij,r}^{\mathrm{qual}}(t)=1\}.
+$$
+
+当 $|A_{\mathrm{valid}}(t)|>0$ 时，定义
+
+$$
+Q_{ij}^{\mathrm{hist}}(A,t)=
+\frac{1}{|A_{\mathrm{valid}}(t)|}
+\sum_{r\in A_{\mathrm{valid}}(t)}
+\widehat{\Gamma}_{ij,r}^{\mathrm{hist}}(t).
+$$
+
+当 $|A_{\mathrm{valid}}(t)|=0$ 时，$Q_{ij}^{\mathrm{hist}}(A,t)$ 标记为 **invalid**，不得把缺失历史的默认值 $0$ 解释为真实的零 link quality，也不得让该默认值参与有效质量的数值比较。所有需要比较历史质量的规则首先按 `history_valid` 排序：存在至少一个 valid RU 的候选优先于完全没有 valid history 的候选；完全无 valid history 的候选再按冻结的离散 identifier 升序处理。该聚合只使用形成 proposal 前已经存在的 per-RU historical quality 和 mask，不调用 executor-only scalar，不使用当前真实 SINR、当前干扰或当前测量。
+
+#### 4.7.2.2 Seven-branch lexicographic decision rules
+
+heuristic 按既有唯一顺序
+
+`route -> tx_select -> resource_group -> resource_width -> power_level -> cpu_queue -> cpu_frequency`
+
+依次形成七分支 proposal。每一分支只读取当前 branch 的合法 mask、已经选择的合法前置 branch 和 actor-visible information；后续 branch 或 executed result 不得反向改变前序 branch。
+
+1. **Route branch.** 若当前没有 unbound EDF head，选择既有 canonical `route=idle`。否则令 $s_i(t)$ 为该 EDF head 在槽初的 slack。
+
+   - 若 $s_i(t)\le 1$，选择 `route=defer`。这是由 route 在当前槽末才生效所得到的 deterministic deadline rule，不是 completion guarantee。
+   - 若 $s_i(t)\ge 2$，从现有 observation 的 local queue aggregate 中读取本地 backlog remaining cycles，并定义
+     $$
+     C_{i}^{\mathrm{local,total}}(t)=
+     C_{i}^{\mathrm{local,backlog}}(t)+C_{i}^{\mathrm{unbound,head}}(t),
+     \qquad
+     C_{i}^{\mathrm{local,cap}}(t)=f_i^{\max}\Delta t\bigl(s_i(t)-1\bigr).
+     $$
+     若 `local` 合法且 $C_{i}^{\mathrm{local,total}}(t)\le C_{i}^{\mathrm{local,cap}}(t)$，选择 `local`。
+   - 否则，若 $s_i(t)\ge 3$ 且存在合法 remote destination，选择 remote。对每个合法 destination $j$ 使用其全部 valid per-RU historical quality 的 masked arithmetic mean；先选择 history valid 的 destination，再选择更高的均值，最后按 destination UAV ID 升序。若所有合法 destination 都没有 valid history，则直接按 destination UAV ID 升序选择。$s_i(t)\ge 3$ 只表示当前 route 生效后仍至少保留一个后续 TX service slot 和一个后续 CPU service slot，不构成完成保证。
+   - 若上述条件不满足且 `local` 仍合法，选择 `local` 作为 deterministic fallback；否则选择 `defer`。
+
+2. **TX-select branch.** 若没有可 service 的 TX queue，选择既有 canonical `tx_select=idle`。否则对所有合法 TX candidate 按以下 lexicographic key 升序选择：
+   $$
+   \bigl(\text{head slack ascending},\;
+   \text{invalid\_history\_flag ascending},\;
+   \text{mean historical quality descending},\;
+   \text{destination UAV ID ascending}\bigr).
+   $$
+   $$
+   \text{invalid\_history\_flag}=\begin{cases}
+   0,&\text{destination 至少有一个 valid historical-quality RU},\\
+   1,&\text{destination 没有 valid historical-quality RU}.
+   \end{cases}
+   $$
+   无 valid history 的 candidate 不参与真实质量值比较，而只按上述 flag 和 destination UAV ID 处理。
+
+3. **Resource-group branch.** 若通信 branch inactive，选择既有 canonical `resource_group=idle`。若 active，只考虑当前 mask 合法的固定 resource group。对每个 group 使用该 group 覆盖 RU 中 valid historical quality 的 masked arithmetic mean，按“至少一个 valid RU 优先、均值较高优先、group ID 较小优先”的顺序选择；若所有合法 group 都没有 valid history，选择最小合法 group ID。该选择不得依赖尚未选择的 `resource_width`、`power_level`、future branch 或 executed result。
+
+4. **Resource-width branch.** 若通信 branch inactive，保持既有 canonical `resource_width=1`；该值不是新的 idle action。若 active，在已选 resource group 下选择当前 mask 允许的最大 width；在当前固定 domain `{1,2}` 中，`width=2` 合法时选择 `2`，否则选择 `1`。不新增 throughput prediction、threshold 或其他 width 评分。
+
+5. **Power branch.** 若通信 branch inactive，选择既有 `power_level=0`。若 active，只考虑当前 action/energy mask 合法的离散 power levels，选择最大的合法正功率档位；若没有合法正功率档位，选择 `0`。该规则不预测 current rate，不读取 current SINR/current interference，不增加 power threshold；proposal 仍必须交给 deterministic executor，由 executor 决定最终 executed power。
+
+6. **CPU-queue branch.** 若没有可 service 的 CPU queue，选择既有 canonical `cpu_queue=idle`。否则对所有合法 CPU candidate 按以下 key 升序选择：
+   $$
+   \bigl(\text{EDF head slack ascending},\;
+   \text{head task ID ascending},\;
+   \text{source UAV ID ascending}\bigr).
+   $$
+   source UAV ID 按现有 CPU queue 语义编码；该规则不读取其他 UAV 的私有队列，也不新增 centralized information。
+
+7. **CPU-frequency branch.** 若 CPU branch inactive，选择既有 canonical `cpu_frequency=0`。若 active，令所选 CPU head 的 remaining cycles 为 $C_{\mathrm{head}}^{\mathrm{rem}}(t)$，slot-start slack 为 $s_{\mathrm{head}}(t)$，定义
+   $$
+   f_{\mathrm{req}}(t)=
+   \frac{C_{\mathrm{head}}^{\mathrm{rem}}(t)}{s_{\mathrm{head}}(t)\Delta t}.
+   $$
+   这里使用 $s_{\mathrm{head}}(t)$，而不是 $s_{\mathrm{head}}(t)-1$：当前 CPU head 已在 CPU queue 中，当前 slot 可以立即接受 CPU service；刚 route 的任务不会在当前 slot 被 CPU service，其 slack 会在下一个 decision slot 按既有环境语义自然减少。随后在当前 mask 合法的离散正 CPU-frequency levels 中选择满足 $f\ge f_{\mathrm{req}}(t)$ 的最小档位；若不存在满足者，选择最大的合法正档位；若不存在任何合法正档位，选择 `0`。该规则是 deadline-aware deterministic frequency heuristic，不是 completion guarantee。
+
+所有未另行说明的平局均使用 stable ascending discrete identifier，包括 destination ID、source ID、task ID、group ID 和 action index；禁止 random tie-break。上述规则不改变 action domain、mask、observation field、environment transition、executor semantics、random semantics、MAPPO/QMIX semantics 或 evaluation protocol。
+
+#### 4.7.2.3 Proposal/execution boundary and freeze invariants
+
+heuristic 输出的是七分支 proposal，不是 executed action。每个 proposal 必须经过已有 deterministic joint executor；executor 继续负责 hard constraints、half-duplex、joint conflict、energy reservation、power downgrade、CPU-frequency downgrade、service、post-service/post-settlement 和 proposal/executed separation。heuristic 不得绕过 executor，不得读取 rejection/downgrade result，也不得用 executed action 重算 policy decision。
+
+因此，本节冻结的新增内容仅是上述 deterministic decision rules：不新增 observation field，不新增 numeric hyperparameter，不改变环境参数、scenario、arrival、deadline、channel、reward、action domain、resource group、power/CPU levels、seed stream、MAPPO/QMIX hyperparameters 或 evaluation protocol。该 baseline 的性能相对 random、QMIX 或 MAPPO 的任何结论，都必须等待真实 rollout 和正式统计后再作出。
 
 RL 只有在 Gate 0、random rollout 和 heuristic rollout 均留下真实 raw metrics 后才允许启动；早期实现菜单可以显示 RL，但在算法未实现时必须返回明确的 unavailable/not implemented 状态，不得伪装成已可用训练。
 
