@@ -116,6 +116,14 @@ $F=10^{F_{\mathrm{dB}}/10}$，$P_{\mathrm{noise,RU}}=N_0B_{\mathrm{RU}}F$。所�
 
 三个场景的 horizon 均为 $T=500$；场景规模差异只由 $N$、任务到达向量和 profile assignment 产生，不引入未声明的 horizon 变化。
 
+历史到达率的实现默认配置固定为：
+
+| 配置项 | 唯一值 | 来源与说明 |
+|---|---:|---|
+| arrival-rate history window $W_\lambda$ | 500 slot | IMPLEMENTATION DEFAULT — Section 4；与当前 episode horizon $T=500$ 一致 |
+
+实际历史样本数仍按 Section 2 的既有定义取 $K_\lambda(t)=\min(W_\lambda,t)$。actor 在时隙 $t$ 只使用当前决策时刻之前已经发生的 arrival history，即至多读取 $A_i(0),\ldots,A_i(t-1)$；它不读取当前槽末尚未生成的 $A_i(t)$，也不读取未来 arrival。所有方法共用同一 $W_\lambda$ 配置；本节只数值化历史窗口，不修改 Section 2 的 arrival estimator 公式或任务到达分布。
+
 每个 UAV 的资源参数由 Section 2 的 profile 比例乘以参考值，再使用独立、可复现的逐参数扰动 $\delta_{i,m}\sim\operatorname{Uniform}(-0.05,0.05)$ 生成。五类 profile 的比例固定如下：
 
 | profile | $f_{\max}/f_{\mathrm{ref}}$ | $P_{\max}/P_{\mathrm{ref}}$ | $E^0/E_{\mathrm{ref}}^0$ | $\kappa/\kappa_{\mathrm{ref}}$ |
@@ -125,6 +133,15 @@ $F=10^{F_{\mathrm{dB}}/10}$，$P_{\mathrm{noise,RU}}=N_0B_{\mathrm{RU}}F$。所�
 | Compute-rich | 1.5 | 1.0 | 1.1 | 0.90 |
 | Energy-limited | 1.0 | 0.8 | 0.5 | 1.10 |
 | Communication-rich | 1.0 | 1.5 | 1.1 | 1.00 |
+
+上述 $\delta_{i,m}\sim\operatorname{Uniform}(-0.05,0.05)$ 及其 $\pm5\%$ 扰动语义保持不变。第一版正式实现的 hardware perturbation ownership 固定为 fixed versioned scenario hardware snapshot，而不是 episode-time RNG sampling。具体规则为：
+
+- 每个 scenario 对应一个固定 hardware perturbation snapshot；runtime reset 不重新采样，改变 master seed 也不改变同一 scenario 的 hardware snapshot；
+- train seed、evaluation seed，以及 random、heuristic、CA-GAT-MAPPO 和 Factorized-Action GAT-QMIX 共用同一 scenario snapshot；
+- 该 snapshot 是 canonical `RunConfig`/scenario definition 的组成部分，其 snapshot version 固定为 `hardware_profile_v1`；当前 `profile_perturbations` 即第一版 snapshot；
+- 不新增 hardware `SeedSequence` stream，不修改第 4.5.1 节已冻结的任何 stream ID，也不在运行期重新生成 perturbation 数值。
+
+该 ownership 将 scenario hardware heterogeneity 与 episode stochasticity 分离，使跨 method/seed 的比较使用相同的 hardware realization。以上规则标记为 IMPLEMENTATION DEFAULT — Section 4。
 
 ### 4.3.3 任务、移动和环境几何
 
@@ -178,6 +195,17 @@ reset 时所有队列为空，task-ID counter 为 0，新任务按槽末 UAV-ID 
 | B4 | [750,850] | [650,850] | 120 |
 
 建筑物按 Section 2 的三维线段相交规则判定遮挡；不使用随机建筑物、不使用实时射线追踪、不加入第三 UAV Fresnel 软遮挡。
+
+### 4.3.4 Reward reference constants
+
+为与实现字段命名一致，本节用 $W_{\mathrm{ref}}$ 和 $N_{\mathrm{ref}}$ 分别指代 Section 2 已冻结的 $W^{\mathrm{ref}}$ 和 $N^{\mathrm{ref}}$；二者不是新的归一化量。其实现默认值固定为：
+
+| `RunConfig` 字段 | 唯一值 | 来源与说明 |
+|---|---:|---|
+| `reward_workload_reference_s`，即 $W_{\mathrm{ref}}$ | $1.0\,\mathrm{s}$ | IMPLEMENTATION DEFAULT — Section 4 |
+| `reward_task_count_reference`，即 $N_{\mathrm{ref}}$ | $1.0$ task | IMPLEMENTATION DEFAULT — Section 4 |
+
+这两个常数只负责数值化 Section 2 已冻结的 reward，不改变 reward 公式结构或任何 reward coefficient。所有 scenario、method、train seed 和 evaluation seed 均使用相同的固定 reference；runtime 和 reset 均不重新估计。该数值化不使用 batch normalization、min-max normalization、运行中极值或 batch statistics。当前默认值仅用于形成唯一可执行配置，不表示已经 sensitivity study 验证为最优。
 
 ## 4.4 Seven-branch action configuration
 
