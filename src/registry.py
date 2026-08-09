@@ -13,7 +13,7 @@ Handler = Callable[[RunConfig], "RunResult"]
 
 @dataclass(frozen=True)
 class RunResult:
-    """Small lifecycle result used before real environment handlers exist."""
+    """Artifact-aware lifecycle result returned by every registered handler."""
 
     status: str
     run_id: str
@@ -84,6 +84,36 @@ def unavailable_handler(config: RunConfig) -> RunResult:
         ),
     )
 
+def environment_sanity_handler(config: RunConfig) -> RunResult:
+    """Run the real environment reset/step sanity validation."""
+
+    from .env.validation import run_environment_sanity
+
+    outcome = run_environment_sanity(config)
+    return RunResult(
+        status=outcome.status,
+        run_id=config.run_id,
+        mode=config.mode,
+        method_id=config.method_id,
+        message=outcome.message,
+    )
+
+
+def gate0_handler(config: RunConfig) -> RunResult:
+    """Run the explicit end-to-end G0-01..G0-21 test module."""
+
+    from .env.validation import run_gate0_tests
+
+    outcome = run_gate0_tests(config)
+    return RunResult(
+        status=outcome.status,
+        run_id=config.run_id,
+        mode=config.mode,
+        method_id=config.method_id,
+        message=outcome.message,
+    )
+
+
 
 def build_default_registry() -> Registry:
     """Register the frozen menu surface with honest early-stage handlers."""
@@ -105,8 +135,13 @@ def build_default_registry() -> Registry:
         ("ablation", "ca_gat_mappo"),
         ("plot", "environment"),
     )
+    implemented_handlers: dict[tuple[str, str], Handler] = {
+        ("environment_sanity", "environment"): environment_sanity_handler,
+        ("gate0", "environment"): gate0_handler,
+    }
     for mode, method_id in pairs:
-        registry.register(mode, method_id, unavailable_handler)
+        handler = implemented_handlers.get((mode, method_id), unavailable_handler)
+        registry.register(mode, method_id, handler)
     return registry
 
 
@@ -116,5 +151,7 @@ __all__ = [
     "RegistryEntry",
     "RunResult",
     "build_default_registry",
+    "environment_sanity_handler",
+    "gate0_handler",
     "unavailable_handler",
 ]

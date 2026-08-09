@@ -120,6 +120,19 @@ class EnvironmentConfig:
     energy_tolerance_j: float = 1.0e-12
     minimum_task_slack_slots: int = 10
     maximum_task_slack_slots: int = 150
+    task_data_bits_min: float = 0.25e6
+    task_data_bits_max: float = 1.5e6
+    task_cycles_per_bit_min: float = 300.0
+    task_cycles_per_bit_max: float = 1000.0
+    task_deadline_factor_min: float = 1.5
+    task_deadline_factor_max: float = 3.0
+    arrival_history_window_slots: int = 500
+    reward_workload_reference_s: float = 1.0
+    reward_task_count_reference: float = 1.0
+    reward_completion_weight: float = 1.0
+    reward_expiration_weight: float = 1.0
+    reward_workload_weight: float = 0.2
+    reward_energy_weight: float = 0.05
     uav_count: int = 4
     arrival_probabilities: tuple[float, ...] = (0.04, 0.05, 0.06, 0.05)
     profile_assignment: tuple[str, ...] = (
@@ -127,6 +140,15 @@ class EnvironmentConfig:
         "Resource-poor",
         "Compute-rich",
         "Energy-limited",
+    )
+    # One explicit scenario-level realization of the frozen +/-5% hardware
+    # perturbation. It is canonical config rather than episode RNG, so resource
+    # capabilities and E_act^ref do not drift across train/evaluation seeds.
+    profile_perturbations: tuple[tuple[float, float, float, float], ...] = (
+        (-0.013814309988, 0.044593840641, 0.044559189965, 0.033901094602),
+        (0.024305247334, -0.014446956216, 0.005750819819, -0.029482012276),
+        (-0.000601140633, -0.015719950799, 0.049877636039, 0.034480593142),
+        (-0.000524427719, 0.006763643213, -0.028161367743, -0.001054193533),
     )
     building_layout: tuple[BuildingConfig, ...] = field(
         default_factory=lambda: (
@@ -474,6 +496,48 @@ class RunConfig:
             raise ConfigError("interference_ema_beta must be in [0, 1)")
         if env.minimum_task_slack_slots <= 0 or env.maximum_task_slack_slots < env.minimum_task_slack_slots:
             raise ConfigError("task slack clip bounds are invalid")
+        positive_task_values = (
+            env.task_data_bits_min,
+            env.task_data_bits_max,
+            env.task_cycles_per_bit_min,
+            env.task_cycles_per_bit_max,
+            env.task_deadline_factor_min,
+            env.task_deadline_factor_max,
+        )
+        if any(not math.isfinite(value) or value <= 0.0 for value in positive_task_values):
+            raise ConfigError("task workload/deadline distribution bounds must be finite and positive")
+        if env.task_data_bits_max < env.task_data_bits_min:
+            raise ConfigError("task_data_bits_max must be >= task_data_bits_min")
+        if env.task_cycles_per_bit_max < env.task_cycles_per_bit_min:
+            raise ConfigError("task_cycles_per_bit_max must be >= task_cycles_per_bit_min")
+        if env.task_deadline_factor_max < env.task_deadline_factor_min:
+            raise ConfigError("task_deadline_factor_max must be >= task_deadline_factor_min")
+        if env.arrival_history_window_slots <= 0:
+            raise ConfigError("arrival_history_window_slots must be positive")
+        reward_references = (
+            env.reward_workload_reference_s,
+            env.reward_task_count_reference,
+        )
+        if any(not math.isfinite(value) or value <= 0.0 for value in reward_references):
+            raise ConfigError("reward reference constants must be finite and positive")
+        reward_weights = (
+            env.reward_completion_weight,
+            env.reward_expiration_weight,
+            env.reward_workload_weight,
+            env.reward_energy_weight,
+        )
+        if any(not math.isfinite(value) or value < 0.0 for value in reward_weights):
+            raise ConfigError("reward weights must be finite and non-negative")
+        if len(env.profile_perturbations) < env.uav_count:
+            raise ConfigError("profile_perturbations must provide at least one row per UAV")
+        for perturbation in env.profile_perturbations[: env.uav_count]:
+            if len(perturbation) != 4:
+                raise ConfigError("each profile perturbation must contain four resource values")
+            if any(not math.isfinite(value) or not -0.05 <= value <= 0.05 for value in perturbation):
+                raise ConfigError("profile perturbations must be finite and lie in [-0.05, 0.05]")
+        unknown_profiles = sorted(set(env.profile_assignment) - set(env.profile_ratios))
+        if unknown_profiles:
+            raise ConfigError(f"unknown resource profiles: {unknown_profiles}")
         if self.action.resource_group_count != env.resource_group_count:
             raise ConfigError("action.resource_group_count must equal environment.resource_group_count")
         if tuple(self.action.sampling_order) != (
@@ -493,12 +557,26 @@ SCENARIO_DEFAULTS: dict[str, dict[str, Any]] = {
         "uav_count": 4,
         "arrival_probabilities": [0.04, 0.05, 0.06, 0.05],
         "profile_assignment": ["Balanced", "Resource-poor", "Compute-rich", "Energy-limited"],
+        "profile_perturbations": [
+            [-0.013814309988, 0.044593840641, 0.044559189965, 0.033901094602],
+            [0.024305247334, -0.014446956216, 0.005750819819, -0.029482012276],
+            [-0.000601140633, -0.015719950799, 0.049877636039, 0.034480593142],
+            [-0.000524427719, 0.006763643213, -0.028161367743, -0.001054193533],
+        ],
     },
     "medium": {
         "uav_count": 6,
         "arrival_probabilities": [0.03, 0.04, 0.05, 0.06, 0.05, 0.07],
         "profile_assignment": [
             "Balanced", "Resource-poor", "Compute-rich", "Energy-limited", "Communication-rich", "Balanced"
+        ],
+        "profile_perturbations": [
+            [-0.013814309988, 0.044593840641, 0.044559189965, 0.033901094602],
+            [0.024305247334, -0.014446956216, 0.005750819819, -0.029482012276],
+            [-0.000601140633, -0.015719950799, 0.049877636039, 0.034480593142],
+            [-0.000524427719, 0.006763643213, -0.028161367743, -0.001054193533],
+            [-0.048552394638, 0.010776985782, -0.02486412725, -0.0013647122],
+            [-0.01912646906, -0.012256723723, 0.001229671851, 0.011639336192],
         ],
     },
     "large": {
@@ -507,6 +585,16 @@ SCENARIO_DEFAULTS: dict[str, dict[str, Any]] = {
         "profile_assignment": [
             "Resource-poor", "Balanced", "Compute-rich", "Energy-limited", "Communication-rich",
             "Resource-poor", "Balanced", "Compute-rich",
+        ],
+        "profile_perturbations": [
+            [-0.013814309988, 0.044593840641, 0.044559189965, 0.033901094602],
+            [0.024305247334, -0.014446956216, 0.005750819819, -0.029482012276],
+            [-0.000601140633, -0.015719950799, 0.049877636039, 0.034480593142],
+            [-0.000524427719, 0.006763643213, -0.028161367743, -0.001054193533],
+            [-0.048552394638, 0.010776985782, -0.02486412725, -0.0013647122],
+            [-0.01912646906, -0.012256723723, 0.001229671851, 0.011639336192],
+            [-0.005497708292, -0.026275079713, -0.016823141819, 0.017532792782],
+            [0.024883910851, 0.023672284376, 0.010141524582, -0.001992215387],
         ],
     },
 }

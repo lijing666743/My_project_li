@@ -105,7 +105,8 @@ knowledge/project_plan/方案2.md
 - 已完成 02-Task-Queue-Lifecycle：新增 typed Task、确定性 task ID、EDF 队列、单一队列所有权、route/service 时序、目的地锁定、剩余 bit/cycle bookkeeping、hard deadline、done/expired 与 horizon-only truncated 结算；新增 Task/Queue/Lifecycle 测试并与 Implementation 01 回归测试合计通过 29 项；
 - 已完成 03-Mobility-Topology-Channel：新增统一 seed stream、Gauss-Markov 移动与安全 reset、coordinate-wise specular reflection、动态候选邻居、建筑物遮挡、相关阴影、directed per-RU Rician/Rayleigh 真实信道、stale CSI/CSI error、历史干扰 EMA/消息 AoI、历史 denominator、per-RU 历史质量代理量与 validity masks；新增 18 项测试并与既有 29 项回归测试合计通过 47 项；
 - 已完成 04-Executor-Service-Energy：新增七分支 proposal adapter、确定性 half-duplex executor、power-first/CPU-after 离散能量降档、同 RU 复用下的真实 interference/SINR/rate、跨任务 EDF 传输、单队首 CPU service、实际活跃时间能耗、剩余能量扣除、I_meas 与 outage NA 语义；新增 23 项测试并与既有 47 项回归测试合计通过 70 项；
-- 当前 Gate 0 状态为 Task/Lifecycle subset: PASS、Mobility/Topology/Channel-History subset: PASS、Executor/Service/Energy/Outage subset: PASS；Full Gate 0 = NOT YET，仍缺 observation/reward、完整 reset/step、端到端环境断言和 random/heuristic rollout；
+- 已完成 05-Full-Environment-Integration：统一接通确定性 reset/step、槽末到达、route、执行器与物理服务、deadline settlement、因果 observation/action masks、centralized state、固定参考 reward、history、horizon truncation、metrics 以及 runner/registry/CLI environment backend；新增 28 项测试并与既有 70 项回归测试合计通过 98 项；
+- Full Gate 0 已由 G0-01 至 G0-21 的逐项可复现测试全部验证通过；environment sanity、direct CLI 与 interactive CLI 均调用同一真实环境 backend；
 - 当前真实 SINR 仅在联合执行动作确定后由环境计算；
 - 已消除 actor 读取当前联合干扰的未来信息风险；
 - 联合执行器使用保守能量预留上界保证执行前硬可行性；
@@ -116,15 +117,13 @@ knowledge/project_plan/方案2.md
 - Section 2 系统模型、Section 3 方法接口和 Section 4 实验协议共同构成后续实现的冻结基线；
 - 最终项目方案已经冻结；
 - 项目状态文档正在与冻结章节同步；
-- 完整 environment backend、算法和实验脚本尚未实现；Gate 0 通过前不启动正式 RL training；
+- 完整 environment backend 已实现；random/heuristic rollout、MAPPO、QMIX、训练、绘图和正式实验结果仍未实现；
 - 当前没有真实实验结果。
 
 ## 下一步
 
-1. 集成当前已完成的 configuration/runner、task lifecycle、mobility/channel-history 与物理执行核，形成完整 environment reset/step；
-2. 补齐 final actor observation、centralized state、reward、metrics 与端到端环境断言；
-3. 实现并通过 Gate 0 测试与 environment sanity；
-4. 运行 random policy rollout 和 heuristic policy rollout，保留真实 raw metrics 后再进入 RL 实现。
+1. 下一阶段再实现 random policy rollout 与 heuristic policy rollout，并保留真实 raw metrics；
+2. 在真实基线流程验证完成后再进入 MAPPO/QMIX 与训练实现，本轮不启动 Implementation 06。
 
 - `knowledge/project_plan/方案2.md` 仍包含尚未同步的旧系统模型语义，因为该文件位于 AGENTS.md 定义的 protected `knowledge/` 目录，当前自动任务不得修改。当前环境实现规格以已经冻结的 `sections/2_system_model.md` 为准（PROTECTED SYNC DEBT）。
 

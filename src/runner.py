@@ -12,10 +12,10 @@ from .registry import Registry, RunResult, build_default_registry
 class Runner:
     """Dispatch a canonical ``RunConfig`` through one registry.
 
-    The current wave deliberately contains no environment backend.  A future
-    handler can return ``completed`` and call ``write_config_snapshot`` only
-    after it has produced real raw metrics.  The default handlers return
-    ``unavailable`` and therefore create no fake artifacts.
+    Environment sanity and Gate 0 use the real unified environment backend.
+    Later policy/training handlers remain explicitly unavailable and therefore
+    create no fake artifacts.
+
     """
 
     registry: Registry

@@ -95,6 +95,7 @@ class Task:
     terminal_reason: str | None = None
     binding_slot: int | None = None
     service_eligible_slot: int | None = None
+    cpu_entry_slot: int | None = None
     outcome: TaskOutcome = TaskOutcome.NONE
 
     def __post_init__(self) -> None:
@@ -268,7 +269,7 @@ class Task:
         if transition_slot is not None:
             if isinstance(transition_slot, bool) or not isinstance(transition_slot, int):
                 raise TypeError("transition_slot must be an integer")
-            self.binding_slot = transition_slot
+            self.cpu_entry_slot = transition_slot
         if service_eligible_slot is not None:
             if isinstance(service_eligible_slot, bool) or not isinstance(service_eligible_slot, int):
                 raise TypeError("service_eligible_slot must be an integer")
@@ -344,6 +345,7 @@ class Task:
             "terminal_reason": self.terminal_reason,
             "binding_slot": self.binding_slot,
             "service_eligible_slot": self.service_eligible_slot,
+            "cpu_entry_slot": self.cpu_entry_slot,
             "outcome": self.outcome.value,
         }
 

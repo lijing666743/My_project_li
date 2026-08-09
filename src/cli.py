@@ -156,7 +156,7 @@ def _dispatch(config, *, output_fn: Callable[[str], None]) -> int:
     output_fn(f"status={result.status}: {result.message}")
     if result.artifacts:
         output_fn("artifacts=" + ", ".join(result.artifacts))
-    return 0
+    return 0 if result.status in {"completed", "unavailable"} else 1
 
 
 def _prompt_choice(
