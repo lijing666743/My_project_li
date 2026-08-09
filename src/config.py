@@ -11,6 +11,8 @@ from __future__ import annotations
 import ast
 import copy
 import hashlib
+import importlib.metadata
+import importlib.util
 import json
 import math
 import platform
@@ -18,6 +20,7 @@ import re
 import subprocess
 import sys
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping, Sequence, TypeVar, get_args, get_origin, get_type_hints
 
@@ -62,6 +65,58 @@ _T = TypeVar("_T")
 
 class ConfigError(ValueError):
     """Raised when a config file or CLI override violates the schema."""
+
+
+def _installed_distribution_version(name: str) -> str:
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return "not-installed"
+
+
+@lru_cache(maxsize=1)
+def _detected_runtime_versions() -> dict[str, str]:
+    """Detect versions without importing the heavyweight Torch runtime."""
+
+    torch_version = _installed_distribution_version("torch")
+    cuda_version = "not-available"
+    try:
+        torch_spec = importlib.util.find_spec("torch")
+    except (ImportError, ModuleNotFoundError, ValueError):
+        torch_spec = None
+    if torch_spec is not None and torch_spec.origin:
+        version_file = Path(torch_spec.origin).resolve().parent / "version.py"
+        if version_file.is_file():
+            try:
+                tree = ast.parse(version_file.read_text(encoding="utf-8"))
+                assignments: dict[str, Any] = {}
+                for node in tree.body:
+                    if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                        continue
+                    target = node.targets[0]
+                    if not isinstance(target, ast.Name):
+                        continue
+                    try:
+                        assignments[target.id] = ast.literal_eval(node.value)
+                    except (ValueError, TypeError):
+                        continue
+                if isinstance(assignments.get("__version__"), str):
+                    torch_version = assignments["__version__"]
+                if isinstance(assignments.get("cuda"), str):
+                    cuda_version = assignments["cuda"]
+            except (OSError, SyntaxError, UnicodeError):
+                pass
+
+    conda_version = _installed_distribution_version("conda")
+    return {
+        "python": platform.python_version(),
+        "numpy": _installed_distribution_version("numpy"),
+        "torch": torch_version,
+        "cuda": cuda_version,
+        "miniconda": (
+            conda_version if conda_version != "not-installed" else "not-installed-or-not-active"
+        ),
+    }
 
 
 @dataclass(frozen=True)
@@ -241,11 +296,19 @@ class ReproducibilityConfig:
     stream_ids: Mapping[str, int] = field(default_factory=lambda: dict(STREAM_IDS))
     snapshot_enabled: bool = True
     backend_schema_version: str = CONFIG_VERSION
-    python_version: str = "TO VERIFY AT IMPLEMENTATION PREFLIGHT"
-    numpy_version: str = "TO VERIFY AT IMPLEMENTATION PREFLIGHT"
-    torch_version: str = "TO VERIFY AT IMPLEMENTATION PREFLIGHT"
-    cuda_version: str = "TO VERIFY AT IMPLEMENTATION PREFLIGHT"
-    miniconda_version: str = "TO VERIFY AT IMPLEMENTATION PREFLIGHT"
+    python_version: str = field(
+        default_factory=lambda: _detected_runtime_versions()["python"]
+    )
+    numpy_version: str = field(
+        default_factory=lambda: _detected_runtime_versions()["numpy"]
+    )
+    torch_version: str = field(
+        default_factory=lambda: _detected_runtime_versions()["torch"]
+    )
+    cuda_version: str = field(default_factory=lambda: _detected_runtime_versions()["cuda"])
+    miniconda_version: str = field(
+        default_factory=lambda: _detected_runtime_versions()["miniconda"]
+    )
 
 
 @dataclass(frozen=True)

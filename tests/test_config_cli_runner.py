@@ -20,6 +20,10 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.environment.uav_count, 4)
         self.assertEqual(config.environment.ru_bandwidth_hz, 1_000_000.0)
         self.assertEqual(config.derived_stream_ids["task_arrival"], 20)
+        runtime_versions = config.snapshot_dict()["_metadata"]["runtime_versions"]
+        self.assertEqual(set(runtime_versions), {"python", "numpy", "torch", "cuda", "miniconda"})
+        for value in runtime_versions.values():
+            self.assertNotIn("TO VERIFY", value)
 
         medium = load_run_config(cli_overrides={"scenario_id": "medium"})
         self.assertEqual(medium.environment.uav_count, 6)
@@ -54,18 +58,37 @@ class ConfigTests(unittest.TestCase):
 
 class RunnerAndCliTests(unittest.TestCase):
     def test_unavailable_runner_does_not_fabricate_artifacts(self) -> None:
-        config = load_run_config(cli_overrides={"mode": "random"})
+        config = load_run_config(cli_overrides={"mode": "heuristic"})
         result = Runner().run(config)
         self.assertEqual(result.status, "unavailable")
+        self.assertIn("HEURISTIC SPECIFICATION BLOCKER", result.message)
         for artifact in config.artifact_paths().values():
             self.assertFalse(Path(artifact).exists())
 
     def test_direct_cli_uses_common_runner(self) -> None:
-        output: list[str] = []
-        status = main(["--mode", "random", "--seed", "7"], output_fn=output.append)
-        self.assertEqual(status, 0)
-        self.assertTrue(any("mode=random" in line for line in output))
-        self.assertTrue(any("status=unavailable" in line for line in output))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "random.json"
+            path.write_text(json.dumps({
+                "environment": {
+                    "episode_horizon": 3,
+                    "arrival_probabilities": [1.0, 1.0, 1.0, 1.0],
+                },
+                "output": {
+                    "logs_dir": str(root / "logs"),
+                    "dashboard_logs_dir": str(root / "dashboard_logs"),
+                    "plots_dir": str(root / "plots"),
+                },
+            }), encoding="utf-8")
+            output: list[str] = []
+            status = main(
+                ["--mode", "random", "--config", str(path), "--seed", "7"],
+                output_fn=output.append,
+            )
+            self.assertEqual(status, 0)
+            self.assertTrue(any("mode=random" in line for line in output))
+            self.assertTrue(any("status=completed" in line for line in output))
+            self.assertTrue(any("raw_metrics.jsonl" in line for line in output))
 
     def test_real_no_argument_path_can_exit_from_menu(self) -> None:
         answers = iter(["0"])

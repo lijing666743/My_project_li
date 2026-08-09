@@ -84,6 +84,7 @@ def unavailable_handler(config: RunConfig) -> RunResult:
         ),
     )
 
+
 def environment_sanity_handler(config: RunConfig) -> RunResult:
     """Run the real environment reset/step sanity validation."""
 
@@ -114,6 +115,50 @@ def gate0_handler(config: RunConfig) -> RunResult:
     )
 
 
+def random_rollout_handler(config: RunConfig) -> RunResult:
+    """Run one real masked-random episode through the unified backend."""
+
+    from .policies.random_policy import RandomPolicy
+    from .rollout import RolloutRunner
+
+    try:
+        outcome = RolloutRunner(config, RandomPolicy(config.seed)).run()
+    except Exception as exc:
+        return RunResult(
+            status="failed",
+            run_id=config.run_id,
+            mode=config.mode,
+            method_id=config.method_id,
+            message=f"random policy rollout failed: {exc}",
+        )
+    tasks = outcome.summary["tasks"]
+    return RunResult(
+        status="completed",
+        run_id=config.run_id,
+        mode=config.mode,
+        method_id=config.method_id,
+        message=(
+            "random policy rollout completed through U2UMECEnvironment: "
+            f"generated={tasks['generated']}, completed={tasks['completed']}, "
+            f"expired={tasks['expired']}, truncated={tasks['truncated']}"
+        ),
+        artifacts=outcome.artifacts,
+    )
+
+
+def heuristic_blocked_handler(config: RunConfig) -> RunResult:
+    """Report the Frozen Section 4 blocker without fabricating a baseline."""
+
+    from .policies.heuristic_policy import heuristic_blocker_message
+
+    return RunResult(
+        status="unavailable",
+        run_id=config.run_id,
+        mode=config.mode,
+        method_id=config.method_id,
+        message=heuristic_blocker_message(),
+    )
+
 
 def build_default_registry() -> Registry:
     """Register the frozen menu surface with honest early-stage handlers."""
@@ -138,6 +183,8 @@ def build_default_registry() -> Registry:
     implemented_handlers: dict[tuple[str, str], Handler] = {
         ("environment_sanity", "environment"): environment_sanity_handler,
         ("gate0", "environment"): gate0_handler,
+        ("random", "random"): random_rollout_handler,
+        ("heuristic", "heuristic"): heuristic_blocked_handler,
     }
     for mode, method_id in pairs:
         handler = implemented_handlers.get((mode, method_id), unavailable_handler)
@@ -153,5 +200,7 @@ __all__ = [
     "build_default_registry",
     "environment_sanity_handler",
     "gate0_handler",
+    "heuristic_blocked_handler",
+    "random_rollout_handler",
     "unavailable_handler",
 ]

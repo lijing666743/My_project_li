@@ -12,10 +12,9 @@ from .registry import Registry, RunResult, build_default_registry
 class Runner:
     """Dispatch a canonical ``RunConfig`` through one registry.
 
-    Environment sanity and Gate 0 use the real unified environment backend.
-    Later policy/training handlers remain explicitly unavailable and therefore
-    create no fake artifacts.
-
+    Environment sanity, Gate 0, and masked-random rollout use the real unified
+    environment backend. Under-specified or future training handlers remain
+    explicitly unavailable and therefore create no fake artifacts.
     """
 
     registry: Registry
