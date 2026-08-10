@@ -12,14 +12,16 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
+
 from src.cli import main as cli_main
 from src.config import STREAM_IDS, load_run_config
 from src.env.actions import ActionProposal
 from src.env.environment import U2UMECEnvironment
+from src.env.observation import ActionMasks
 from src.policies.heuristic_policy import (
     HeuristicPolicy,
-    HeuristicSpecificationBlocker,
-    heuristic_blocker_message,
+    masked_historical_quality,
 )
 from src.policies.random_policy import RandomPolicy
 from src.registry import build_default_registry
@@ -59,6 +61,190 @@ def make_random_config(
             "output.plots_dir": str(output_root / "plots"),
         })
     return load_run_config(cli_overrides=overrides)
+
+
+def make_heuristic_config(
+    *,
+    horizon: int = 8,
+    arrivals: tuple[float, ...] = (0.0, 0.0, 0.0, 0.0),
+    output_root: Path | None = None,
+):
+    overrides: dict[str, object] = {
+        "mode": "heuristic",
+        "method_id": "heuristic",
+        "scenario_id": "small",
+        "seed": 42,
+        "environment.episode_horizon": horizon,
+        "environment.arrival_probabilities": list(arrivals),
+    }
+    if output_root is not None:
+        overrides.update({
+            "output.logs_dir": str(output_root / "logs"),
+            "output.dashboard_logs_dir": str(output_root / "dashboard_logs"),
+            "output.plots_dir": str(output_root / "plots"),
+        })
+    return load_run_config(cli_overrides=overrides)
+
+
+def make_heuristic_observation(
+    *,
+    unbound_slack: int | None = None,
+    unbound_cycles: float = 20.0,
+    local_backlog_cycles: float = 0.0,
+    route_remotes: tuple[int, ...] = (),
+    tx_candidates: tuple[int, ...] = (),
+    tx_slacks: dict[int, int] | None = None,
+    cpu_candidates: tuple[int, ...] = (),
+    cpu_slacks: dict[int, int] | None = None,
+    cpu_task_ids: dict[int, int] | None = None,
+    cpu_cycles: dict[int, float] | None = None,
+    quality_values: dict[int, tuple[float, ...]] | None = None,
+    quality_masks: dict[int, tuple[bool, ...]] | None = None,
+    power_legal: tuple[float, ...] = (0.0, 0.25, 0.5, 1.0),
+    cpu_frequency_legal: dict[int, tuple[float, ...]] | None = None,
+    max_cpu_frequency_hz: float = 1000.0,
+):
+    count = 4
+    ru_count = 20
+    route_domain = ("idle", "local", "defer", 1, 2, 3)
+    tx_domain = ("idle", 1, 2, 3)
+    group_domain = ("idle", 1, 2, 3, 4, 5)
+    width_domain = (1, 2)
+    power_domain = (0.0, 0.25, 0.5, 1.0)
+    cpu_queue_domain = ("idle", 0, 1, 2, 3)
+    cpu_frequency_domain = (0.0, 0.25, 0.5, 1.0)
+
+    route_mask = np.zeros(len(route_domain), dtype=np.bool_)
+    if unbound_slack is None:
+        route_mask[0] = True
+    else:
+        route_mask[1:3] = True
+        for destination in route_remotes:
+            route_mask[route_domain.index(destination)] = True
+
+    tx_mask = np.zeros(len(tx_domain), dtype=np.bool_)
+    tx_mask[0] = True
+    for destination in tx_candidates:
+        tx_mask[tx_domain.index(destination)] = True
+
+    cpu_queue_mask = np.zeros(len(cpu_queue_domain), dtype=np.bool_)
+    cpu_queue_mask[0] = True
+    for source in cpu_candidates:
+        cpu_queue_mask[cpu_queue_domain.index(source)] = True
+
+    power_mask = np.array(
+        [level in power_legal for level in power_domain],
+        dtype=np.bool_,
+    )
+    cpu_frequency_mask = np.ones(
+        (count, len(cpu_frequency_domain)),
+        dtype=np.bool_,
+    )
+    for source, legal_levels in (cpu_frequency_legal or {}).items():
+        cpu_frequency_mask[source] = [
+            level in legal_levels for level in cpu_frequency_domain
+        ]
+
+    masks = ActionMasks(
+        uav_id=0,
+        paper_uav_id=1,
+        sampling_order=BRANCH_ORDER,
+        route_domain=route_domain,
+        tx_select_domain=tx_domain,
+        resource_group_domain=group_domain,
+        resource_width_domain=width_domain,
+        power_level_domain=power_domain,
+        cpu_queue_domain=cpu_queue_domain,
+        cpu_frequency_domain=cpu_frequency_domain,
+        route_mask=route_mask,
+        tx_select_mask=tx_mask,
+        cpu_queue_mask=cpu_queue_mask,
+        power_energy_mask=power_mask,
+        cpu_frequency_energy_mask=cpu_frequency_mask,
+        route_branch_active=unbound_slack is not None,
+        tx_branch_active=bool(tx_candidates),
+        cpu_queue_branch_active=bool(cpu_candidates),
+        resource_group_count=5,
+        tx_idle_action="idle",
+        cpu_idle_action="idle",
+        canonical_width=1,
+        canonical_power=0.0,
+        canonical_cpu_frequency=0.0,
+    )
+
+    tx_slacks = tx_slacks or {}
+    cpu_slacks = cpu_slacks or {}
+    cpu_task_ids = cpu_task_ids or {}
+    cpu_cycles = cpu_cycles or {}
+
+    def indexed_queues(
+        candidates: tuple[int, ...],
+        slacks: dict[int, int],
+        task_ids: dict[int, int],
+        cycles: dict[int, float],
+    ):
+        valid = np.zeros(count, dtype=np.bool_)
+        head_slack = np.zeros(count, dtype=np.int64)
+        head_task_id = np.full(count, -1, dtype=np.int64)
+        head_cycles = np.zeros(count, dtype=np.float64)
+        for source in candidates:
+            valid[source] = True
+            head_slack[source] = slacks.get(source, 3)
+            head_task_id[source] = task_ids.get(source, source)
+            head_cycles[source] = cycles.get(source, 20.0)
+        return SimpleNamespace(
+            head_valid_mask=valid,
+            head_slack_slots=head_slack,
+            head_task_id=head_task_id,
+            head_remaining_cycles=head_cycles,
+        )
+
+    quality = np.zeros((count, ru_count), dtype=np.float64)
+    quality_valid = np.zeros((count, ru_count), dtype=np.bool_)
+    for destination, values in (quality_values or {}).items():
+        if len(values) != ru_count:
+            raise ValueError("quality fixture must contain 20 RUs")
+        quality[destination] = values
+    for destination, values in (quality_masks or {}).items():
+        if len(values) != ru_count:
+            raise ValueError("quality-mask fixture must contain 20 RUs")
+        quality_valid[destination] = values
+
+    unbound = SimpleNamespace(
+        head_valid_mask=unbound_slack is not None,
+        head_slack_slots=0 if unbound_slack is None else unbound_slack,
+        head_remaining_cycles=0.0 if unbound_slack is None else unbound_cycles,
+    )
+    observation = SimpleNamespace(
+        uav_id=0,
+        self_resources=SimpleNamespace(
+            max_cpu_frequency_hz=max_cpu_frequency_hz,
+        ),
+        private_queues=SimpleNamespace(
+            unbound=unbound,
+            local_cpu=SimpleNamespace(
+                remaining_cycles=local_backlog_cycles,
+            ),
+            tx_by_destination=indexed_queues(
+                tx_candidates,
+                tx_slacks,
+                {},
+                {},
+            ),
+            cpu_by_source=indexed_queues(
+                cpu_candidates,
+                cpu_slacks,
+                cpu_task_ids,
+                cpu_cycles,
+            ),
+        ),
+        edge_history=SimpleNamespace(
+            historical_quality=quality,
+            quality_valid_mask=quality_valid,
+        ),
+        action_masks=masks,
+    )
+    return make_heuristic_config(), observation
 
 
 def observations_with_active_queues():
@@ -310,27 +496,388 @@ class TestRolloutRunner(unittest.TestCase):
             )
 
 
-class TestHeuristicSpecificationBlocker(unittest.TestCase):
-    def test_heuristic_is_unavailable_without_artifacts(self) -> None:
+class TestHeuristicPolicy(unittest.TestCase):
+    def test_masked_history_excludes_invalid_and_distinguishes_missing(self) -> None:
+        partial = masked_historical_quality(
+            (2.0, 0.0, 4.0),
+            (True, False, True),
+        )
+        self.assertTrue(partial.history_valid)
+        self.assertEqual(partial.mean, 3.0)
+
+        missing = masked_historical_quality(
+            (0.0, 0.0, 0.0),
+            (False, False, False),
+        )
+        valid_zero = masked_historical_quality(
+            (0.0, 0.0, 0.0),
+            (True, False, False),
+        )
+        self.assertFalse(missing.history_valid)
+        self.assertIsNone(missing.mean)
+        self.assertTrue(valid_zero.history_valid)
+        self.assertEqual(valid_zero.mean, 0.0)
+
+    def test_route_idle_defer_local_proxy_and_fallback(self) -> None:
+        config, observation = make_heuristic_observation()
+        self.assertEqual(HeuristicPolicy(config).act(observation).route, "idle")
+
+        config, observation = make_heuristic_observation(
+            unbound_slack=1,
+            route_remotes=(1,),
+        )
+        self.assertEqual(HeuristicPolicy(config).act(observation).route, "defer")
+
+        config, observation = make_heuristic_observation(
+            unbound_slack=3,
+            unbound_cycles=20.0,
+            local_backlog_cycles=20.0,
+            route_remotes=(1,),
+        )
+        self.assertEqual(HeuristicPolicy(config).act(observation).route, "local")
+
+        config, observation = make_heuristic_observation(
+            unbound_slack=2,
+            unbound_cycles=20.0,
+            local_backlog_cycles=100.0,
+            route_remotes=(1,),
+        )
+        self.assertEqual(HeuristicPolicy(config).act(observation).route, "local")
+
+        config, observation = make_heuristic_observation(
+            unbound_slack=3,
+            unbound_cycles=20.0,
+            local_backlog_cycles=100.0,
+        )
+        self.assertEqual(HeuristicPolicy(config).act(observation).route, "local")
+
+    def test_route_remote_history_valid_mean_and_id_rules(self) -> None:
+        invalid = (False,) * 20
+        first_only = (True,) + (False,) * 19
+        zeros = (0.0,) * 20
+
+        config, observation = make_heuristic_observation(
+            unbound_slack=3,
+            local_backlog_cycles=100.0,
+            route_remotes=(1, 2),
+            quality_values={1: zeros, 2: zeros},
+            quality_masks={1: invalid, 2: first_only},
+        )
+        self.assertEqual(HeuristicPolicy(config).act(observation).route, 2)
+
+        config, observation = make_heuristic_observation(
+            unbound_slack=3,
+            local_backlog_cycles=100.0,
+            route_remotes=(1, 2),
+            quality_values={1: (1.0,) * 20, 2: (2.0,) * 20},
+            quality_masks={1: (True,) * 20, 2: (True,) * 20},
+        )
+        self.assertEqual(HeuristicPolicy(config).act(observation).route, 2)
+
+        config, observation = make_heuristic_observation(
+            unbound_slack=3,
+            local_backlog_cycles=100.0,
+            route_remotes=(1, 2),
+            quality_values={1: (2.0,) * 20, 2: (2.0,) * 20},
+            quality_masks={1: (True,) * 20, 2: (True,) * 20},
+        )
+        self.assertEqual(HeuristicPolicy(config).act(observation).route, 1)
+
+    def test_tx_lexicographic_slack_history_mean_and_destination(self) -> None:
+        valid = (True,) * 20
+        invalid = (False,) * 20
+
+        config, observation = make_heuristic_observation(
+            tx_candidates=(1, 2),
+            tx_slacks={1: 2, 2: 3},
+            quality_values={1: (1.0,) * 20, 2: (10.0,) * 20},
+            quality_masks={1: valid, 2: valid},
+        )
+        self.assertEqual(HeuristicPolicy(config).act(observation).tx_select, 1)
+
+        config, observation = make_heuristic_observation(
+            tx_candidates=(1, 2),
+            tx_slacks={1: 2, 2: 2},
+            quality_values={1: (0.0,) * 20, 2: (0.0,) * 20},
+            quality_masks={1: invalid, 2: valid},
+        )
+        self.assertEqual(HeuristicPolicy(config).act(observation).tx_select, 2)
+
+        config, observation = make_heuristic_observation(
+            tx_candidates=(1, 2),
+            tx_slacks={1: 2, 2: 2},
+            quality_values={1: (1.0,) * 20, 2: (2.0,) * 20},
+            quality_masks={1: valid, 2: valid},
+        )
+        self.assertEqual(HeuristicPolicy(config).act(observation).tx_select, 2)
+
+        config, observation = make_heuristic_observation(
+            tx_candidates=(1, 2),
+            tx_slacks={1: 2, 2: 2},
+            quality_values={1: (2.0,) * 20, 2: (2.0,) * 20},
+            quality_masks={1: valid, 2: valid},
+        )
+        self.assertEqual(HeuristicPolicy(config).act(observation).tx_select, 1)
+
+    def test_resource_group_masked_history_ties_and_width_independence(self) -> None:
+        values = [0.0] * 20
+        masks = [False] * 20
+        masks[4] = True
+        config, observation = make_heuristic_observation(
+            tx_candidates=(1,),
+            quality_values={1: tuple(values)},
+            quality_masks={1: tuple(masks)},
+        )
+        self.assertEqual(HeuristicPolicy(config).act(observation).resource_group, 2)
+
+        values = [0.0] * 20
+        masks = [False] * 20
+        values[0], values[2] = 10.0, 2.0
+        masks[0], masks[2] = True, True
+        values[4:8] = [5.0] * 4
+        masks[4:8] = [True] * 4
+        config, observation = make_heuristic_observation(
+            tx_candidates=(1,),
+            quality_values={1: tuple(values)},
+            quality_masks={1: tuple(masks)},
+        )
+        self.assertEqual(HeuristicPolicy(config).act(observation).resource_group, 1)
+
+        values = [0.0] * 20
+        masks = [False] * 20
+        values[0:4] = [5.0] * 4
+        values[4:8] = [5.0] * 4
+        masks[0:8] = [True] * 8
+        config, observation = make_heuristic_observation(
+            tx_candidates=(1,),
+            quality_values={1: tuple(values)},
+            quality_masks={1: tuple(masks)},
+        )
+        self.assertEqual(HeuristicPolicy(config).act(observation).resource_group, 1)
+
+        config, observation = make_heuristic_observation(
+            tx_candidates=(1,),
+        )
+        self.assertEqual(HeuristicPolicy(config).act(observation).resource_group, 1)
+
+        values = [0.0] * 20
+        masks = [False] * 20
+        values[8:12] = [9.0] * 4
+        masks[8:12] = [True] * 4
+        config, observation = make_heuristic_observation(
+            tx_candidates=(1,),
+            quality_values={1: tuple(values)},
+            quality_masks={1: tuple(masks)},
+        )
+        normal = HeuristicPolicy(config).act(observation)
+        width_one = SimpleNamespace(**vars(observation))
+        width_one.action_masks = replace(
+            observation.action_masks,
+            resource_width_domain=(1,),
+        )
+        constrained = HeuristicPolicy(config).act(width_one)
+        self.assertEqual(normal.resource_group, 3)
+        self.assertEqual(constrained.resource_group, 3)
+        self.assertEqual(constrained.resource_width, 1)
+
+    def test_resource_width_maximum_and_inactive_canonical(self) -> None:
+        config, observation = make_heuristic_observation(
+            tx_candidates=(1,),
+        )
+        self.assertEqual(HeuristicPolicy(config).act(observation).resource_width, 2)
+
+        config, observation = make_heuristic_observation()
+        self.assertEqual(HeuristicPolicy(config).act(observation).resource_width, 1)
+
+    def test_power_maximum_zero_fallback_and_inactive_canonical(self) -> None:
+        config, observation = make_heuristic_observation(
+            tx_candidates=(1,),
+            power_legal=(0.0, 0.25, 0.5),
+        )
+        self.assertEqual(HeuristicPolicy(config).act(observation).power_level, 0.5)
+
+        config, observation = make_heuristic_observation(
+            tx_candidates=(1,),
+            power_legal=(0.0,),
+        )
+        self.assertEqual(HeuristicPolicy(config).act(observation).power_level, 0.0)
+
+        config, observation = make_heuristic_observation()
+        self.assertEqual(HeuristicPolicy(config).act(observation).power_level, 0.0)
+
+    def test_cpu_queue_slack_task_id_and_source_tie_breaks(self) -> None:
+        config, observation = make_heuristic_observation(
+            cpu_candidates=(1, 2),
+            cpu_slacks={1: 2, 2: 3},
+            cpu_task_ids={1: 9, 2: 1},
+        )
+        self.assertEqual(HeuristicPolicy(config).act(observation).cpu_queue, 1)
+
+        config, observation = make_heuristic_observation(
+            cpu_candidates=(1, 2),
+            cpu_slacks={1: 2, 2: 2},
+            cpu_task_ids={1: 9, 2: 1},
+        )
+        self.assertEqual(HeuristicPolicy(config).act(observation).cpu_queue, 2)
+
+        config, observation = make_heuristic_observation(
+            cpu_candidates=(1, 2),
+            cpu_slacks={1: 2, 2: 2},
+            cpu_task_ids={1: 1, 2: 1},
+        )
+        self.assertEqual(HeuristicPolicy(config).act(observation).cpu_queue, 1)
+
+        config, observation = make_heuristic_observation(
+            cpu_candidates=(0, 1),
+            cpu_slacks={0: 2, 1: 2},
+            cpu_task_ids={0: 1, 1: 1},
+        )
+        self.assertEqual(HeuristicPolicy(config).act(observation).cpu_queue, 0)
+
+    def test_cpu_frequency_uses_slack_exact_threshold_and_fallbacks(self) -> None:
+        config, observation = make_heuristic_observation(
+            cpu_candidates=(0,),
+            cpu_slacks={0: 2},
+            cpu_cycles={0: 20.0},
+        )
+        self.assertEqual(HeuristicPolicy(config).act(observation).cpu_frequency, 0.5)
+
+        config, observation = make_heuristic_observation(
+            cpu_candidates=(0,),
+            cpu_slacks={0: 2},
+            cpu_cycles={0: 10.0},
+        )
+        self.assertEqual(HeuristicPolicy(config).act(observation).cpu_frequency, 0.25)
+
+        config, observation = make_heuristic_observation(
+            cpu_candidates=(0,),
+            cpu_slacks={0: 2},
+            cpu_cycles={0: 21.0},
+        )
+        self.assertEqual(HeuristicPolicy(config).act(observation).cpu_frequency, 1.0)
+
+        config, observation = make_heuristic_observation(
+            cpu_candidates=(0,),
+            cpu_slacks={0: 1},
+            cpu_cycles={0: 100.0},
+        )
+        self.assertEqual(HeuristicPolicy(config).act(observation).cpu_frequency, 1.0)
+
+        config, observation = make_heuristic_observation(
+            cpu_candidates=(0,),
+            cpu_slacks={0: 2},
+            cpu_cycles={0: 20.0},
+            cpu_frequency_legal={0: (0.0,)},
+        )
+        self.assertEqual(HeuristicPolicy(config).act(observation).cpu_frequency, 0.0)
+
+    def test_canonical_values_order_actor_boundary_and_seed_independence(self) -> None:
+        config, observation = make_heuristic_observation()
+        proposal = HeuristicPolicy(config).act(observation)
+        self.assertEqual(
+            proposal.branches,
+            ("idle", "idle", "idle", 1, 0.0, "idle", 0.0),
+        )
+        self.assertEqual(len(proposal.branches), 7)
+        self.assertEqual(
+            tuple(inspect.signature(HeuristicPolicy.act).parameters),
+            ("self", "observation"),
+        )
+        for privileged in (
+            "centralized_state",
+            "true_channel",
+            "true_sinr",
+            "current_interference",
+            "I_meas",
+            "executed_action",
+        ):
+            self.assertFalse(hasattr(observation, privileged))
+
+        calls: list[str] = []
+        original = observation.action_masks
+
+        class RecordingMasks:
+            sampling_order = original.sampling_order
+
+            @staticmethod
+            def domain_for(branch: str):
+                return original.domain_for(branch)
+
+            @staticmethod
+            def mask_for(branch: str, previous=None):
+                calls.append(branch)
+                return original.mask_for(branch, previous)
+
+            @staticmethod
+            def is_legal(candidate: ActionProposal) -> bool:
+                return original.is_legal(candidate)
+
+        actor_only = SimpleNamespace(**vars(observation))
+        actor_only.action_masks = RecordingMasks()
+        first = HeuristicPolicy(config, policy_seed=42).act(actor_only)
+        second = HeuristicPolicy(config, policy_seed=999).act(actor_only)
+        self.assertEqual(calls[:7], list(BRANCH_ORDER))
+        self.assertEqual(first, second)
+        self.assertIsNone(HeuristicPolicy(config).policy_stream_id)
+
+    def test_real_rollout_artifacts_direct_and_interactive_cli(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            config = load_run_config(cli_overrides={
-                "mode": "heuristic",
-                "method_id": "heuristic",
-                "scenario_id": "small",
-                "seed": 42,
-                "output.logs_dir": str(root / "logs"),
-                "output.dashboard_logs_dir": str(root / "dashboard_logs"),
-                "output.plots_dir": str(root / "plots"),
-            })
-            result = Runner().run(config)
-            self.assertEqual(result.status, "unavailable")
-            self.assertEqual(result.artifacts, ())
-            self.assertIn("HEURISTIC SPECIFICATION BLOCKER", result.message)
-            self.assertEqual(result.message, heuristic_blocker_message())
-            self.assertFalse((root / "logs").exists())
-            with self.assertRaises(HeuristicSpecificationBlocker):
-                HeuristicPolicy()
+            config = make_heuristic_config(
+                horizon=5,
+                arrivals=(1.0, 1.0, 1.0, 1.0),
+                output_root=root,
+            )
+            outcome = RolloutRunner(
+                config,
+                HeuristicPolicy(config),
+            ).run()
+            self.assertEqual(len(outcome.raw_records), 5)
+            self.assertEqual(len(outcome.artifacts), 4)
+            self.assertEqual(outcome.summary["method_id"], "heuristic")
+            self.assertEqual(outcome.summary["policy_seed"], 42)
+            self.assertIsNone(outcome.summary["policy_stream_id"])
+            self.assertTrue(outcome.summary["conservation"]["is_conserved"])
+            for artifact in outcome.artifacts:
+                self.assertTrue(Path(artifact).is_file())
+            self.assertFalse(
+                Path(config.artifact_paths()["dashboard_png"]).exists()
+            )
+
+            config_path = root / "heuristic.json"
+            config_path.write_text(json.dumps({
+                "environment": {
+                    "episode_horizon": 3,
+                    "arrival_probabilities": [1.0, 1.0, 1.0, 1.0],
+                },
+                "output": {
+                    "logs_dir": str(root / "cli_logs"),
+                    "dashboard_logs_dir": str(root / "cli_dashboard_logs"),
+                    "plots_dir": str(root / "cli_plots"),
+                },
+            }), encoding="utf-8")
+            direct_output: list[str] = []
+            direct_status = cli_main(
+                ["--mode", "heuristic", "--config", str(config_path), "--seed", "42"],
+                output_fn=direct_output.append,
+            )
+            answers = iter(("4", "small", str(config_path), "42"))
+            interactive_output: list[str] = []
+            interactive_status = cli_main(
+                [],
+                input_fn=lambda _prompt: next(answers),
+                output_fn=interactive_output.append,
+            )
+            self.assertEqual(direct_status, 0)
+            self.assertEqual(interactive_status, 0)
+            self.assertTrue(any("status=completed" in line for line in direct_output))
+            self.assertTrue(any("status=completed" in line for line in interactive_output))
+            self.assertEqual(
+                build_default_registry().resolve(
+                    "heuristic", "heuristic"
+                ).__name__,
+                "heuristic_rollout_handler",
+            )
 
 
 if __name__ == "__main__":

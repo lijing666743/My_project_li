@@ -107,6 +107,9 @@ knowledge/project_plan/方案2.md
 - 已完成 04-Executor-Service-Energy：新增七分支 proposal adapter、确定性 half-duplex executor、power-first/CPU-after 离散能量降档、同 RU 复用下的真实 interference/SINR/rate、跨任务 EDF 传输、单队首 CPU service、实际活跃时间能耗、剩余能量扣除、I_meas 与 outage NA 语义；新增 23 项测试并与既有 47 项回归测试合计通过 70 项；
 - 已完成 05-Full-Environment-Integration：统一接通确定性 reset/step、槽末到达、route、执行器与物理服务、deadline settlement、因果 observation/action masks、centralized state、固定参考 reward、history、horizon truncation、metrics 以及 runner/registry/CLI environment backend；新增 28 项测试并与既有 70 项回归测试合计通过 98 项；
 - Full Gate 0 已由 G0-01 至 G0-21 的逐项可复现测试全部验证通过；environment sanity、direct CLI 与 interactive CLI 均调用同一真实环境 backend；
+- 已完成 06-Random-and-Heuristic-Rollout：RandomPolicy 与 Deadline-and-Historical-Link-Aware Lexicographic Heuristic 均通过统一 RolloutRunner、确定性 executor、direct CLI 和 interactive menu 运行；Heuristic 只使用 actor-visible 槽初信息与 action masks，并保持七分支 proposal/executed 分离；
+- 全量回归测试现为 119/119 PASS，Full Gate 0 继续 PASS；small 场景、500 slots、seed=42 的 Random 与 Heuristic 单种子工程 smoke 已真实完成并保留 raw/aggregate/dashboard CSV，未生成 plot；
+- 上述 rollout 仅用于工程正确性与 sanity 对比，不是正式论文性能结果；MAPPO、QMIX 和 RL training 仍未实现；
 - 当前真实 SINR 仅在联合执行动作确定后由环境计算；
 - 已消除 actor 读取当前联合干扰的未来信息风险；
 - 联合执行器使用保守能量预留上界保证执行前硬可行性；
@@ -117,13 +120,13 @@ knowledge/project_plan/方案2.md
 - Section 2 系统模型、Section 3 方法接口和 Section 4 实验协议共同构成后续实现的冻结基线；
 - 最终项目方案已经冻结；
 - 项目状态文档正在与冻结章节同步；
-- 完整 environment backend 已实现；random/heuristic rollout、MAPPO、QMIX、训练、绘图和正式实验结果仍未实现；
-- 当前没有真实实验结果。
+- 完整 environment backend 与 Random/Heuristic rollout pipeline 已实现；MAPPO、QMIX、RL training、绘图和正式论文实验结果仍未实现；
+- 当前仅有 single-seed engineering smoke 产物，没有正式论文实验结果。
 
 ## 下一步
 
-1. 下一阶段再实现 random policy rollout 与 heuristic policy rollout，并保留真实 raw metrics；
-2. 在真实基线流程验证完成后再进入 MAPPO/QMIX 与训练实现，本轮不启动 Implementation 06。
+1. 人工复核 Implementation 06 的 Heuristic 规则一致性、单种子工程 smoke 指标与真实 raw/aggregate/dashboard CSV；
+2. 人工确认基线流程后再规划 MAPPO/QMIX 与 RL training；在正式多 seed 评估前不作性能、稳定性或优越性结论。
 
 - `knowledge/project_plan/方案2.md` 仍包含尚未同步的旧系统模型语义，因为该文件位于 AGENTS.md 定义的 protected `knowledge/` 目录，当前自动任务不得修改。当前环境实现规格以已经冻结的 `sections/2_system_model.md` 为准（PROTECTED SYNC DEBT）。
 

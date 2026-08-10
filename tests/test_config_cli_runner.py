@@ -58,10 +58,13 @@ class ConfigTests(unittest.TestCase):
 
 class RunnerAndCliTests(unittest.TestCase):
     def test_unavailable_runner_does_not_fabricate_artifacts(self) -> None:
-        config = load_run_config(cli_overrides={"mode": "heuristic"})
+        config = load_run_config(cli_overrides={
+            "mode": "rl",
+            "method_id": "ca_gat_mappo",
+        })
         result = Runner().run(config)
         self.assertEqual(result.status, "unavailable")
-        self.assertIn("HEURISTIC SPECIFICATION BLOCKER", result.message)
+        self.assertIn("not implemented", result.message)
         for artifact in config.artifact_paths().values():
             self.assertFalse(Path(artifact).exists())
 

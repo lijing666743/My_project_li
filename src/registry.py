@@ -146,17 +146,34 @@ def random_rollout_handler(config: RunConfig) -> RunResult:
     )
 
 
-def heuristic_blocked_handler(config: RunConfig) -> RunResult:
-    """Report the Frozen Section 4 blocker without fabricating a baseline."""
+def heuristic_rollout_handler(config: RunConfig) -> RunResult:
+    """Run one real deterministic heuristic episode through the unified backend."""
 
-    from .policies.heuristic_policy import heuristic_blocker_message
+    from .policies.heuristic_policy import HeuristicPolicy
+    from .rollout import RolloutRunner
 
+    try:
+        outcome = RolloutRunner(config, HeuristicPolicy(config)).run()
+    except Exception as exc:
+        return RunResult(
+            status="failed",
+            run_id=config.run_id,
+            mode=config.mode,
+            method_id=config.method_id,
+            message=f"heuristic policy rollout failed: {exc}",
+        )
+    tasks = outcome.summary["tasks"]
     return RunResult(
-        status="unavailable",
+        status="completed",
         run_id=config.run_id,
         mode=config.mode,
         method_id=config.method_id,
-        message=heuristic_blocker_message(),
+        message=(
+            "heuristic policy rollout completed through U2UMECEnvironment: "
+            f"generated={tasks['generated']}, completed={tasks['completed']}, "
+            f"expired={tasks['expired']}, truncated={tasks['truncated']}"
+        ),
+        artifacts=outcome.artifacts,
     )
 
 
@@ -184,7 +201,7 @@ def build_default_registry() -> Registry:
         ("environment_sanity", "environment"): environment_sanity_handler,
         ("gate0", "environment"): gate0_handler,
         ("random", "random"): random_rollout_handler,
-        ("heuristic", "heuristic"): heuristic_blocked_handler,
+        ("heuristic", "heuristic"): heuristic_rollout_handler,
     }
     for mode, method_id in pairs:
         handler = implemented_handlers.get((mode, method_id), unavailable_handler)
@@ -200,7 +217,7 @@ __all__ = [
     "build_default_registry",
     "environment_sanity_handler",
     "gate0_handler",
-    "heuristic_blocked_handler",
+    "heuristic_rollout_handler",
     "random_rollout_handler",
     "unavailable_handler",
 ]

@@ -3,18 +3,18 @@
 from .base import Policy
 from .heuristic_policy import (
     HeuristicPolicy,
-    HeuristicSpecificationBlocker,
-    MISSING_HEURISTIC_DECISIONS,
-    heuristic_blocker_message,
+    HeuristicPolicyError,
+    HistoricalQualityAggregate,
+    masked_historical_quality,
 )
 from .random_policy import RandomPolicy, RandomPolicyError
 
 __all__ = [
     "HeuristicPolicy",
-    "HeuristicSpecificationBlocker",
-    "MISSING_HEURISTIC_DECISIONS",
+    "HeuristicPolicyError",
+    "HistoricalQualityAggregate",
     "Policy",
     "RandomPolicy",
     "RandomPolicyError",
-    "heuristic_blocker_message",
+    "masked_historical_quality",
 ]
