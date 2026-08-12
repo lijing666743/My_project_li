@@ -132,6 +132,14 @@
 | Dec-POMDP | $P$ | 状态转移核 | $\mathcal S\times\mathcal A\rightarrow\mathcal P(\mathcal S)$ |
 | Dec-POMDP | $r_t$ | 团队即时奖励 | 实数 |
 | Dec-POMDP | $\gamma$ | 折扣因子 | $(0,1)$ |
+| Dec-POMDP | $\Pi_{\mathrm{hard}}$ | actor 策略、动作 mask 与确定性执行器共同诱导的闭环硬可行策略集合 | 策略集合 |
+| Dec-POMDP | $J_{\mathrm{RL}}(\boldsymbol{\pi})$ | 折扣团队奖励对应的 RL 训练替代目标 | 实数 |
+| 性能指标 | $G_T,C_T,X_T,Z_T$ | episode 内生成、按时完成、过期和截断任务数 | task |
+| 性能指标 | $\mathcal C_T$ | episode 内按时完成的任务集合 | 任务集合，$\lvert\mathcal C_T\rvert=C_T$ |
+| 性能指标 | $\Lambda_{\mathrm{succ}}(\boldsymbol{\pi})$ | 期望按时成功任务吞吐量 | task/slot |
+| 性能指标 | $\eta_{\mathrm{cmp}},\eta_{\mathrm{exp}},\eta_{\mathrm{trunc}}$ | 完成、过期和截断任务比例 | $[0,1]$ 或 $\mathrm{NA}$ |
+| 性能指标 | $\overline T_{\mathrm{E2E}}$ | done 任务的平均端到端时延 | s 或 $\mathrm{NA}$ |
+| 性能指标 | $E_{\mathrm{tot}}^{\mathrm{act}}$ | episode 内实际主动通信与计算总能耗 | J |
 
 任务目的地字段统一定义为：
 
@@ -1785,7 +1793,7 @@ $\mathrm{truncated}$ 与 $\mathrm{expired}$ 的统计边界保持分离：$\math
 
 时间轴示例：时隙 $t$ 槽末任务到达，记录 $t_n^{\mathrm{arr}}=t$；时隙 $t+1$ 任务首次可 route，槽末完成绑定；时隙 $t+2$ 首次可接受传输或 CPU 服务。若在时隙 $t+2$ 槽末完成，则 $t_n^{\mathrm{cmp}}=t+2$，端到端时延为 $((t+2)-t)\Delta t=2\Delta t$。
 
-## 2.14 Dec-POMDP、信息边界与优化问题
+## 2.14 Dec-POMDP、信息边界与系统优化问题
 
 ### 2.14.1 状态、局部观测与联合动作
 
@@ -1848,9 +1856,9 @@ a_1(t),\ldots,a_N(t)
 \prod_{i\in\mathcal U}\mathcal A_i.
 $$
 
-动作 mask 和联合 hard-feasible 执行器共同把原始联合动作映射为实际可执行动作，但不改变七分支的语义。
+动作 mask 与联合硬可行执行器共同将原始联合动作映射为实际可执行动作，但不改变七分支的语义。
 
-### 2.14.2 状态转移、团队奖励与折扣目标
+### 2.14.2 状态转移与硬可行策略集合
 
 在外生任务到达、移动、信道演化和联合服务规则共同作用下，状态转移可写为：
 
@@ -1863,9 +1871,189 @@ P
 \right).
 $$
 
-转移核包含真实信道和遮挡对服务量的影响、传输与 CPU 队列更新、能量扣除、任务完成/过期结算、槽末入队、外生移动和 CSI AoI 更新。它不把 actor 的局部估计直接当作真实环境状态。
+其中，$\mathbf a_t$ 始终表示各 actor 给出的七分支联合动作提案，确定性执行器不创建新的 actor 动作空间。转移核在环境内部依次完成：
 
-为了刻画截止期和资源代价，定义活动任务的紧迫工作量。下式中的 $W(t)$ 在时隙 $t$ 的 reward 计算阶段读取，即已完成本槽 service、实际能耗计算和 completion/deadline settlement 之后、槽末新到达任务 $A_i(t)$ 生成与入队之前的 post-service/pre-next-arrival 值：
+$$
+\mathbf a_t
+\longrightarrow
+\text{确定性执行器}
+\longrightarrow
+\text{已执行通信、CPU 与资源决策}
+\longrightarrow
+\text{SINR、服务、能量、队列与生命周期更新}
+\longrightarrow
+s_{t+1}.
+$$
+
+因此，转移核包含真实信道和遮挡对服务量的影响、传输与 CPU 队列更新、能量扣除、任务完成/过期结算、槽末入队、外生移动和 CSI AoI 更新，但不把 actor 的局部估计直接当作真实环境状态，也不把执行器解析结果重新定义为 Dec-POMDP 动作。
+
+Dec-POMDP 可用元组表示为：
+
+$$
+\mathcal M
+=
+\left(
+\mathcal S,
+\{\mathcal O_i\}_{i\in\mathcal U},
+\{\mathcal A_i\}_{i\in\mathcal U},
+P,
+r,
+\gamma
+\right).
+$$
+
+联合执行必须满足 2.5--2.13 已定义的任务队列合法性、候选邻居合法性、目的地锁定、route/tx 语义、固定资源组与相邻宽度规则、离散发射功率和 CPU 频率档位、候选及实际能量可行性、每发送端至多一条目的链路、节点独占半双工、每个 CPU 每槽至多服务一个队列，以及任务生命周期和 hard-deadline 结算规则。相应的实际可行集合概括为：
+
+$$
+\mathcal A_t^{\mathrm{feas}}
+=
+\left\{
+\begin{array}{l}
+\text{由确定性执行器解析得到的通信、计算与资源决策}:\\
+\text{2.5--2.13 中的队列、邻居、目的地锁定与 route/tx 规则成立},\\
+\text{固定资源组、相邻宽度及离散功率/CPU 频率规则成立},\\
+\overline E_i^{\mathrm{act,cand}}(t;\ell^\star)\le E_i^{\mathrm{res}}(t),\ \forall i,\\
+\text{每个发送端至多服务一个目的 UAV，且节点独占半双工约束成立},\\
+\text{每个 CPU 每槽至多服务一个合法队列，任务生命周期与截止期结算合法}
+\end{array}
+\right\}.
+$$
+
+动作 mask 处理可由局部信息提前识别的非法分支；确定性执行器处理必须在联合动作提案形成后才能判断的资源冲突、半双工冲突和联合能量可行性。原始 actor 提案不必独立满足全部联合约束。由 actor 策略、动作 mask、确定性执行器和既有物理约束共同诱导的闭环硬可行策略集合定义为：
+
+$$
+\Pi_{\mathrm{hard}}
+=
+\left\{
+\boldsymbol{\pi}:
+\Pr_{\boldsymbol{\pi},P}
+\left[
+\begin{array}{c}
+\text{闭环执行在每个服务时隙 }t\in\{0,\ldots,T-1\}\text{ 均属于}\\
+\mathcal A_t^{\mathrm{feas}}
+\end{array}
+\right]
+=1
+\right\}.
+$$
+
+该定义中的“属于”针对执行器解析后的已执行通信、CPU 与资源变量，而不是要求原始联合提案 $\mathbf a_t$ 自身满足所有联合约束。能量硬约束在执行前使用当前 $p_i^{\mathrm{cand}}(t;\ell)$ 对应的 $\overline E_i^{\mathrm{act,cand}}(t;\ell)$；接受 $\ell^\star$ 后，实际能耗满足 $E_i^{\mathrm{act}}(t)\le\overline E_i^{\mathrm{act,cand}}(t;\ell^\star)$，未使用的预留能量释放。
+
+### 2.14.3 Episode 级物理性能指标
+
+令 $\mathcal C_T$ 表示 episode 内记录为 done 的按时完成任务集合。保留 $N_{\mathrm{on}}(t)$ 的既有定义，即经过时隙 $t$ 的 service 后在本槽完成且满足 hard deadline 的任务数，则 episode 内按时完成任务数为：
+
+$$
+C_T
+=
+|\mathcal C_T|
+=
+\sum_{t=0}^{T-1}N_{\mathrm{on}}(t).
+$$
+
+令 $G_T$、$X_T$ 和 $Z_T$ 分别表示 episode 内生成、expired 和 truncated 的任务数。由于固定时域在边界 $T$ 对未完成且 $t_n^{\mathrm{ddl}}\ge T$ 的任务仅作 truncated 统计标记，三类 episode 结算计数满足：
+
+$$
+G_T
+=
+C_T+X_T+Z_T.
+$$
+
+完成、过期和截断比例统一定义为：
+
+$$
+\left(
+\eta_{\mathrm{cmp}},
+\eta_{\mathrm{exp}},
+\eta_{\mathrm{trunc}}
+\right)
+=
+\begin{cases}
+\left(
+\dfrac{C_T}{G_T},
+\dfrac{X_T}{G_T},
+\dfrac{Z_T}{G_T}
+\right),
+& G_T>0,\\[4pt]
+\left(
+\mathrm{NA},
+\mathrm{NA},
+\mathrm{NA}
+\right),
+& G_T=0.
+\end{cases}
+$$
+
+当 $G_T>0$ 时，$\eta_{\mathrm{cmp}}+\eta_{\mathrm{exp}}+\eta_{\mathrm{trunc}}=1$。truncated 任务是由有限仿真时域引起的删失样本，不是物理 hard-deadline 失败；因此它不进入 $X_T$，不虚构 $t_n^{\mathrm{cmp}}$ 或 $T_n^{\mathrm{E2E}}$，也不能解释为 expired。
+
+期望按时成功任务吞吐量定义为：
+
+$$
+\Lambda_{\mathrm{succ}}(\boldsymbol{\pi})
+=
+\frac{1}{T}
+\mathbb E_{\boldsymbol{\pi},P}
+\left[C_T\right]
+=
+\frac{1}{T}
+\mathbb E_{\boldsymbol{\pi},P}
+\left[
+\sum_{t=0}^{T-1}
+N_{\mathrm{on}}(t)
+\right].
+$$
+
+$\Lambda_{\mathrm{succ}}(\boldsymbol{\pi})$ 的单位为 task/slot。由于比较方法采用相同的固定 $T$，最大化该指标等价于最大化 $\mathbb E_{\boldsymbol{\pi},P}[C_T]$。
+
+任务端到端时延继续采用 2.5 的定义 $T_n^{\mathrm{E2E}}=(t_n^{\mathrm{cmp}}-t_n^{\mathrm{arr}})\Delta t$，仅 done 任务具有合法样本。作为次要物理 KPI，平均端到端时延定义为：
+
+$$
+\overline T_{\mathrm{E2E}}
+=
+\begin{cases}
+\dfrac{1}{C_T}
+\displaystyle\sum_{n\in\mathcal C_T}
+T_n^{\mathrm{E2E}},
+& C_T>0,\\[4pt]
+\mathrm{NA},
+& C_T=0.
+\end{cases}
+$$
+
+$\overline T_{\mathrm{E2E}}$ 的期望方向为越小越好，但本节不为其另设独立的时延最小化问题。
+
+episode 内实际主动能耗定义为：
+
+$$
+E_{\mathrm{tot}}^{\mathrm{act}}
+=
+\sum_{t=0}^{T-1}
+\sum_{i\in\mathcal U}
+\left[
+E_i^{\mathrm{tx}}(t)
++
+E_i^{\mathrm{cpu}}(t)
+\right].
+$$
+
+$E_{\mathrm{tot}}^{\mathrm{act}}$ 是次要物理 KPI，期望方向为越小越好。它只包含实际 U2U 发射能耗和实际 CPU 动态计算能耗，不包含推进、悬停、飞控、姿态控制、感知或静态平台能耗；各 UAV 的剩余能量可行性仍是硬约束。本节不为该 KPI 另设独立的能量最小化问题。
+
+### 2.14.4 系统级物理优化目标
+
+在满足通信、计算、能量预算、半双工、队列、资源调度及任务截止期等硬约束的条件下，系统首要目标是提高单位时间内按时成功完成的任务数量。因此，唯一的主物理优化问题定义为：
+
+$$
+\mathrm{P}_{\mathrm{phys}}:
+\qquad
+\max_{\boldsymbol{\pi}\in\Pi_{\mathrm{hard}}}
+\Lambda_{\mathrm{succ}}(\boldsymbol{\pi}).
+$$
+
+完成比例 $\eta_{\mathrm{cmp}}$ 仍是核心评价 KPI，但不作为主物理目标。原因在于 $G_T$ 包含 episode 末因有限时域截断而未进入完整服务或尚未到达物理截止时隙的任务；直接最大化 $C_T/G_T$ 会在同一分母效应中混合仿真删失与物理 deadline 失败。固定 $T$ 下的 $\Lambda_{\mathrm{succ}}$ 则直接刻画单位时隙的期望按时完成任务数。
+
+### 2.14.5 团队即时奖励与 RL 训练替代目标
+
+为了刻画截止期和资源代价，定义活动任务的紧迫工作量。下式中的 $W(t)$ 在时隙 $t$ 的奖励计算阶段读取，即已完成本槽 service、实际能耗计算和 completion/deadline settlement 之后、槽末新到达任务 $A_i(t)$ 生成与入队之前的 post-service/pre-next-arrival 值：
 
 $$
 W(t)
@@ -1908,60 +2096,46 @@ $$
 
 其中 $W^{\mathrm{ref}}>0$ 是 workload reference，单位为 s；$N^{\mathrm{ref}}>0$ 是每槽任务数 reference，单位为 task；$E_{\mathrm{act}}^{\mathrm{ref}}=\sum_{i\in\mathcal U}E_i^0>0$ 是全体 UAV 的固定 episode 初始主动能量 reference，单位为 J。三者均在实验开始前确定，在一个 episode 内、各次 reset 之间以及 evaluation 中保持不变；它们不是当前 slot 或 episode 的 observed maximum、未来 maximum、batch statistics 或训练过程中的动态 min/max，且不随 seed 改变。后续配置只负责给出这些 fixed constants 的具体数值，不重新定义其物理含义。$w_c,w_d,w_q,w_e$ 的编码初始值为 $1.0,1.0,0.2,0.05$，仅作为调试起点，不作为已验证的最优权重。
 
-Dec-POMDP 可用元组表示为：
+该奖励与物理目标的对应关系如下：正的 $\widetilde N_{\mathrm{on}}(t)$ 支持提高按时成功任务吞吐量这一主物理目标；负的 $\widetilde N_{\mathrm{exp}}(t)$ 惩罚 hard-deadline 失败；负的 $\widetilde W(t)$ 在稀疏的完成或过期事件发生前提供剩余工作量与 deadline 紧迫性的稠密 shaping；负的 $\widetilde E^{\mathrm{act}}(t)$ 鼓励降低实际主动通信与计算能耗。$W(t)$ 仅是 RL shaping 量，不是物理时延目标、未完成工作量的独立优化目标或 E2E 时延的等价量。
+
+给定共享环境和各 actor 的局部策略集合 $\boldsymbol{\pi}$，折扣训练回报定义为：
 
 $$
-\mathcal M
-=
-\left(
-\mathcal S,
-\{\mathcal O_i\}_{i\in\mathcal U},
-\{\mathcal A_i\}_{i\in\mathcal U},
-P,
-r,
-\gamma
-\right).
-$$
-
-其中 $\gamma\in(0,1)$ 为折扣因子。给定共享环境和各 actor 的局部策略集合 $\boldsymbol{\pi}$，优化目标写为：
-
-$$
-J(\boldsymbol{\pi})
+J_{\mathrm{RL}}(\boldsymbol{\pi})
 =
 \mathbb E_{\boldsymbol{\pi},P}
 \left[
 \sum_{t=0}^{T-1}
 \gamma^t r_t
-\right],
-\qquad
-\max_{\boldsymbol{\pi}}J(\boldsymbol{\pi}).
+\right].
 $$
 
-该目标只定义受约束的团队决策问题，不推出全局最优、收敛保证或部署性能。具体学习器、策略网络和价值更新属于后续方法章节，本章不写入其更新公式。
-
-### 2.14.3 约束集合与执行边界
-
-联合决策必须满足队列存在性、固定资源组合法性、离散功率/频率档位、能量可行性、单目的链路服务、CPU 单队列服务和联合半双工约束。可以将本章的实际可行集合概括为：
+其中 $\gamma\in(0,1)$ 为折扣因子。相应的 RL 训练替代目标为：
 
 $$
-\mathcal A_t^{\mathrm{feas}}
-=
-\left\{
-\mathbf a_t:
-\begin{array}{l}
-\text{队列和候选邻居存在性约束成立},\\
-\text{固定资源组与相邻宽度约束成立},\\
-\overline E_i^{\mathrm{act,cand}}(t;\ell^\star)\le E_i^{\mathrm{res}}(t),\ \forall i,\\
-\text{每个发送端至多一条服务边},\\
-\text{半双工约束成立},\\
-\text{每个 CPU 至多一个队列}
-\end{array}
-\right\}.
+\max_{\boldsymbol{\pi}\in\Pi_{\mathrm{hard}}}
+J_{\mathrm{RL}}(\boldsymbol{\pi}).
 $$
 
-动作 mask 处理可由局部信息提前识别的非法分支；联合执行器处理必须看到联合候选动作后才能判断的半双工和联合能量冲突。两者共同保证执行结果属于 hard-feasible 集合，但不把非法动作伪装成连续资源值。
+该训练目标与 $\max_{\boldsymbol{\pi}\in\Pi_{\mathrm{hard}}}\Lambda_{\mathrm{succ}}(\boldsymbol{\pi})$ 不具有代数等价性：$\gamma<1$ 对较早出现的奖励赋予更大权重，使不同时刻的完成奖励和能耗惩罚具有不同折扣；$W(t)$ 提供稠密 shaping；$N_{\mathrm{exp}}(t)$ 提供额外的失败惩罚；固定归一化尺度和奖励权重进一步改变了各项在训练信号中的相对贡献。因此，两类目标的关系应理解为：
 
-能量硬约束在执行前使用当前 $p_i^{\mathrm{cand}}(t;\ell)$ 对应的 $\overline E_i^{\mathrm{act,cand}}(t;\ell)$；接受 $\ell^\star$ 后，实际能耗满足 $E_i^{\mathrm{act}}(t)\le\overline E_i^{\mathrm{act,cand}}(t;\ell^\star)$，未使用的预留能量释放。奖励中的能耗项仍使用实际主动能耗 $E^{\mathrm{act}}(t)$，不使用预留能量。
+$$
+\text{系统级物理目标}
+\longrightarrow
+\text{奖励 shaping 与替代构造}
+\longrightarrow
+\text{RL 优化}
+\longrightarrow
+\text{基于物理 KPI 的最终评价}.
+$$
+
+具体学习器、策略网络和价值更新属于后续方法章节，本章不写入其更新公式，也不据此声称 RL 解与主物理问题全局等价或具有全局最优性。
+
+### 2.14.6 评价指标与声明边界
+
+最终评价必须联合报告 $\Lambda_{\mathrm{succ}}$、$C_T$、$G_T$、$X_T$、$Z_T$、$\eta_{\mathrm{cmp}}$、$\eta_{\mathrm{exp}}$、$\eta_{\mathrm{trunc}}$、$\overline T_{\mathrm{E2E}}$ 和 $E_{\mathrm{tot}}^{\mathrm{act}}$。其中，$\Lambda_{\mathrm{succ}}$ 对应主物理目标；$\overline T_{\mathrm{E2E}}$ 和 $E_{\mathrm{tot}}^{\mathrm{act}}$ 是越小越好的次要物理 KPI；三类比例用于审计有限 horizon 下的任务去向。$G_T=0$ 时三类比例均为 $\mathrm{NA}$，$C_T=0$ 时平均 E2E 时延为 $\mathrm{NA}$，不得以零替代无样本结果。
+
+truncated 仅是 episode 终止时的删失统计标签，不加入任务物理状态集合，不计入 expired numerator，也不产生虚构的完成时刻、E2E 时延或额外终止奖励。当前奖励不显式优化异构 UAV 间的公平性，本节不把公平性写入 $\mathrm{P}_{\mathrm{phys}}$，也不新增公平性奖励或优化目标。上述问题定义只规定硬可行闭环决策、物理目标和 RL 替代信号，不推出全局最优、收敛保证、部署性能或未验证的公平性结论。
 
 ## 2.15 假设、局限性与实现映射
 
