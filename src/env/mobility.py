@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from ..config import BoundsConfig, EnvironmentConfig
+from .channel import BuildingPrism
 from .randomness import rng_from_run_config
 
 if TYPE_CHECKING:
@@ -142,7 +143,9 @@ class MobilityModel:
             raise MobilityError("max_placement_attempts_per_uav must be a positive integer")
         self.max_placement_attempts_per_uav = max_placement_attempts_per_uav
         self._validate_config()
+        self.buildings = tuple(BuildingPrism.from_config(item) for item in config.building_layout)
         self._state: MobilityState | None = None
+        self._trajectory: tuple[MobilityState, ...] = ()
 
     @classmethod
     def from_run_config(
@@ -164,7 +167,24 @@ class MobilityModel:
         return self._state
 
     def reset(self) -> MobilityState:
-        """Sample a finite, reproducible safe placement and initial velocity."""
+        """Generate and cache one complete building-valid mobility trajectory."""
+
+        self._state = None
+        self._trajectory = ()
+        for _ in range(DEFAULT_RESET_PLACEMENT_ATTEMPTS):
+            trajectory = self._generate_candidate_trajectory()
+            if self._trajectory_is_building_free(trajectory):
+                self._trajectory = trajectory
+                self._state = trajectory[0]
+                return self._state
+        raise MobilityError(
+            "unable to sample a building-valid complete mobility trajectory after "
+            f"{DEFAULT_RESET_PLACEMENT_ATTEMPTS} attempts; the configured building "
+            "layout may leave no feasible discrete-slot trajectory"
+        )
+
+    def _sample_initial_state(self) -> MobilityState:
+        """Sample the unchanged safe reset placement and initial velocity."""
 
         cfg = self.config
         bounds = cfg.bounds
@@ -197,15 +217,35 @@ class MobilityModel:
         horizontal_velocity = self.rng.normal(loc=mean, scale=std, size=(cfg.uav_count, 2))
         positions = np.column_stack((horizontal, np.full(cfg.uav_count, cfg.height_m)))
         velocities = np.column_stack((horizontal_velocity, np.zeros(cfg.uav_count)))
-        self._state = MobilityState(slot=0, positions_m=positions, velocities_mps=velocities)
-        return self._state
+        return MobilityState(slot=0, positions_m=positions, velocities_mps=velocities)
 
     def step(self, state: MobilityState | None = None) -> MobilityState:
-        """Advance one slot using velocity update, movement, then reflection."""
+        """Replay the next state from the accepted complete trajectory."""
 
         current = self.state if state is None else state
-        if current.positions_m.shape[0] != self.config.uav_count:
-            raise MobilityError("mobility state UAV count does not match configuration")
+        if (
+            current.slot != self.state.slot
+            or not np.array_equal(current.positions_m, self.state.positions_m)
+            or not np.array_equal(current.velocities_mps, self.state.velocities_mps)
+        ):
+            raise MobilityError("provided mobility state does not match the cached current state")
+        next_slot = current.slot + 1
+        if next_slot >= len(self._trajectory):
+            raise MobilityError("accepted mobility trajectory is exhausted")
+        self._state = self._trajectory[next_slot]
+        return self._state
+
+    def _generate_candidate_trajectory(self) -> tuple[MobilityState, ...]:
+        """Consume all mobility draws for one complete candidate trajectory."""
+
+        trajectory = [self._sample_initial_state()]
+        for _ in range(1, self.config.episode_horizon):
+            trajectory.append(self._advance_candidate(trajectory[-1]))
+        return tuple(trajectory)
+
+    def _advance_candidate(self, current: MobilityState) -> MobilityState:
+        """Apply the unchanged Gauss--Markov update and outer reflection once."""
+
         cfg = self.config
         mean = np.asarray(cfg.velocity_mean_mps, dtype=np.float64)
         std = np.asarray(cfg.velocity_std_mps, dtype=np.float64)
@@ -224,12 +264,22 @@ class MobilityModel:
         )
         positions = np.column_stack((horizontal, np.full(cfg.uav_count, cfg.height_m)))
         velocities = np.column_stack((horizontal_velocity, np.zeros(cfg.uav_count)))
-        self._state = MobilityState(
+        return MobilityState(
             slot=current.slot + 1,
             positions_m=positions,
             velocities_mps=velocities,
         )
-        return self._state
+
+    def _trajectory_is_building_free(self, trajectory: tuple[MobilityState, ...]) -> bool:
+        """Validate every discrete UAV position after the candidate is complete."""
+
+        valid = True
+        for state in trajectory:
+            for position in state.positions_m:
+                for building in self.buildings:
+                    if building.contains_point(position):
+                        valid = False
+        return valid
 
     def _validate_config(self) -> None:
         cfg = self.config
@@ -250,6 +300,12 @@ class MobilityModel:
             raise MobilityError("mobility bounds must have positive width and height")
         if cfg.uav_count <= 0:
             raise MobilityError("uav_count must be positive")
+        if (
+            isinstance(cfg.episode_horizon, bool)
+            or not isinstance(cfg.episode_horizon, int)
+            or cfg.episode_horizon <= 0
+        ):
+            raise MobilityError("episode_horizon must be a positive integer")
         if cfg.height_m <= 0 or cfg.slot_duration_s <= 0:
             raise MobilityError("height_m and slot_duration_s must be positive")
         if cfg.reset_safe_distance_m <= 0:

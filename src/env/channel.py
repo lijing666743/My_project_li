@@ -86,6 +86,18 @@ class BuildingPrism:
         if self.x_max_m <= self.x_min_m or self.y_max_m <= self.y_min_m or self.height_m <= 0:
             raise ChannelError(f"building {self.name!r} must have positive width, depth, and height")
 
+    def contains_point(self, position_m: np.ndarray) -> bool:
+        """Return whether a finite 3-D point lies in this closed prism."""
+
+        position = np.asarray(position_m, dtype=np.float64)
+        if position.shape != (3,) or not np.all(np.isfinite(position)):
+            raise ChannelError("building containment point must be a finite 3-D coordinate")
+        return bool(
+            self.x_min_m <= position[0] <= self.x_max_m
+            and self.y_min_m <= position[1] <= self.y_max_m
+            and 0.0 <= position[2] <= self.height_m
+        )
+
     def intersects_segment(self, start_m: np.ndarray, end_m: np.ndarray) -> bool:
         """Test intersection between a closed 3-D segment and this closed prism."""
 

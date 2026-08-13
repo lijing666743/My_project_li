@@ -8,7 +8,7 @@ from dataclasses import replace
 
 import numpy as np
 
-from src.config import BoundsConfig, EnvironmentConfig
+from src.config import BoundsConfig, BuildingConfig, EnvironmentConfig
 from src.env.channel import (
     BuildingPrism,
     ChannelError,
@@ -109,9 +109,76 @@ class MobilityTests(unittest.TestCase):
             positions_m=np.array([[9.0, 4.0, config.height_m]]),
             velocities_mps=np.array([[4.0, 2.0, 0.0]]),
         )
-        updated = MobilityModel(config, make_rng(42, 10)).step(state)
+        updated = MobilityModel(config, make_rng(42, 10))._advance_candidate(state)
         np.testing.assert_allclose(updated.positions_m[0], [7.0, 6.0, config.height_m])
         np.testing.assert_allclose(updated.velocities_mps[0], [-4.0, 2.0, 0.0])
+
+    def test_complete_trajectory_is_building_free_deterministic_and_replayed(self) -> None:
+        config = environment_config(
+            uav_count=3,
+            episode_horizon=25,
+            building_layout=(BuildingConfig("B", 400.0, 600.0, 400.0, 600.0, 120.0),),
+        )
+        models = (
+            MobilityModel(config, make_rng(42, 10)),
+            MobilityModel(config, make_rng(42, 10)),
+        )
+        trajectories = []
+        for model in models:
+            state = model.reset()
+            trajectory = [state]
+            rng_state_after_reset = model.rng.bit_generator.state
+            for _ in range(1, config.episode_horizon):
+                state = model.step(state)
+                trajectory.append(state)
+            self.assertEqual(model.rng.bit_generator.state, rng_state_after_reset)
+            self.assertEqual([item.slot for item in trajectory], list(range(config.episode_horizon)))
+            self.assertTrue(
+                all(
+                    not building.contains_point(position)
+                    for item in trajectory
+                    for position in item.positions_m
+                    for building in model.buildings
+                )
+            )
+            trajectories.append(trajectory)
+
+        for first, second in zip(*trajectories):
+            np.testing.assert_array_equal(first.positions_m, second.positions_m)
+            np.testing.assert_array_equal(first.velocities_mps, second.velocities_mps)
+
+    def test_reset_rejects_an_invalid_complete_candidate(self) -> None:
+        config = environment_config(
+            uav_count=1,
+            episode_horizon=2,
+            height_m=5.0,
+            building_layout=(BuildingConfig("B", 0.0, 2.0, 0.0, 2.0, 10.0),),
+        )
+        invalid = (
+            MobilityState(0, np.array([[1.0, 1.0, 5.0]]), np.zeros((1, 3))),
+            MobilityState(1, np.array([[8.0, 8.0, 5.0]]), np.zeros((1, 3))),
+        )
+        valid = (
+            MobilityState(0, np.array([[8.0, 8.0, 5.0]]), np.zeros((1, 3))),
+            MobilityState(1, np.array([[9.0, 9.0, 5.0]]), np.zeros((1, 3))),
+        )
+
+        class ScriptedMobilityModel(MobilityModel):
+            def __init__(self) -> None:
+                super().__init__(config, make_rng(42, 10))
+                self.candidates = [invalid, valid]
+                self.generated_candidates = 0
+
+            def _generate_candidate_trajectory(self) -> tuple[MobilityState, ...]:
+                candidate = self.candidates[self.generated_candidates]
+                self.generated_candidates += 1
+                return candidate
+
+        model = ScriptedMobilityModel()
+        reset_state = model.reset()
+        self.assertEqual(model.generated_candidates, 2)
+        np.testing.assert_array_equal(reset_state.positions_m, valid[0].positions_m)
+        np.testing.assert_array_equal(model.step(reset_state).positions_m, valid[1].positions_m)
 
     def test_coordinate_reflection_handles_multi_boundary_overshoot(self) -> None:
         positions, velocities = coordinate_wise_specular_reflection(
@@ -145,6 +212,14 @@ class TopologyTests(unittest.TestCase):
 
 
 class PhysicalChannelTests(unittest.TestCase):
+    def test_building_point_containment_uses_closed_finite_height_solid(self) -> None:
+        building = BuildingPrism("B", 4.0, 6.0, -1.0, 1.0, 100.0)
+        self.assertTrue(building.contains_point(np.array([5.0, 0.0, 80.0])))
+        self.assertTrue(building.contains_point(np.array([4.0, 0.0, 80.0])))
+        self.assertTrue(building.contains_point(np.array([5.0, 0.0, 100.0])))
+        self.assertFalse(building.contains_point(np.array([5.0, 0.0, 100.01])))
+        self.assertFalse(building.contains_point(np.array([6.01, 0.0, 80.0])))
+
     def test_building_intersection_uses_three_dimensional_closed_segment(self) -> None:
         building = BuildingPrism("B", 4.0, 6.0, -1.0, 1.0, 100.0)
         blocked = building_blockage_mask(
