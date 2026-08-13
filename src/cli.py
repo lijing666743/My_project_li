@@ -23,7 +23,7 @@ MENU = """U2U-MEC Experiment Launcher
 [2] Gate 0 tests
 [3] Random policy rollout
 [4] Heuristic policy rollout
-[5] Baseline experiment
+[5] Local-only baseline experiment
 [6] RL training
 [7] Evaluation
 [8] Ablation
@@ -35,7 +35,7 @@ MENU_ROUTES: dict[str, tuple[str, str]] = {
     "2": ("gate0", "environment"),
     "3": ("random", "random"),
     "4": ("heuristic", "heuristic"),
-    "5": ("baseline", "factorized_action_gat_qmix"),
+    "5": ("baseline", "local_only"),
     "6": ("rl", "ca_gat_mappo"),
     "7": ("evaluation", "ca_gat_mappo"),
     "8": ("ablation", "ca_gat_mappo"),

@@ -23,6 +23,7 @@ from src.policies.heuristic_policy import (
     HeuristicPolicy,
     masked_historical_quality,
 )
+from src.policies.local_only_policy import LocalOnlyPolicy
 from src.policies.random_policy import RandomPolicy
 from src.registry import build_default_registry
 from src.runner import Runner
@@ -84,6 +85,21 @@ def make_heuristic_config(
             "output.plots_dir": str(output_root / "plots"),
         })
     return load_run_config(cli_overrides=overrides)
+
+
+def make_local_only_config(
+    *,
+    horizon: int = 8,
+    arrivals: tuple[float, ...] = (1.0, 1.0, 1.0, 1.0),
+):
+    return load_run_config(cli_overrides={
+        "mode": "baseline",
+        "method_id": "local_only",
+        "scenario_id": "small",
+        "seed": 42,
+        "environment.episode_horizon": horizon,
+        "environment.arrival_probabilities": list(arrivals),
+    })
 
 
 def make_heuristic_observation(
@@ -878,6 +894,116 @@ class TestHeuristicPolicy(unittest.TestCase):
                 ).__name__,
                 "heuristic_rollout_handler",
             )
+
+
+class TestLocalOnlyPolicy(unittest.TestCase):
+    @staticmethod
+    def _policy(config):
+        return LocalOnlyPolicy(
+            replace(config, mode="baseline", method_id="local_only")
+        )
+
+    def test_route_and_communication_follow_local_only_masks(self) -> None:
+        config, observation = make_heuristic_observation(
+            unbound_slack=3,
+            route_remotes=(1, 2),
+            tx_candidates=(1, 2),
+        )
+        proposal = self._policy(config).act(observation)
+        self.assertEqual(proposal.route, "local")
+        self.assertEqual(proposal.tx_select, "idle")
+        self.assertEqual(proposal.resource_group, "idle")
+        self.assertEqual(proposal.resource_width, 1)
+        self.assertEqual(proposal.power_level, 0.0)
+        self.assertTrue(observation.action_masks.is_legal(proposal))
+
+        config, inactive = make_heuristic_observation(tx_candidates=(1, 2))
+        inactive_proposal = self._policy(config).act(inactive)
+        self.assertEqual(inactive_proposal.route, "idle")
+        self.assertEqual(inactive_proposal.tx_select, "idle")
+        self.assertTrue(inactive.action_masks.is_legal(inactive_proposal))
+
+    def test_cpu_serves_only_self_at_highest_legal_frequency(self) -> None:
+        config, observation = make_heuristic_observation(
+            cpu_candidates=(0, 1),
+            cpu_frequency_legal={0: (0.0, 0.25, 0.5)},
+        )
+        proposal = self._policy(config).act(observation)
+        self.assertEqual(proposal.cpu_queue, observation.uav_id)
+        self.assertEqual(proposal.cpu_frequency, 0.5)
+        self.assertTrue(observation.action_masks.is_legal(proposal))
+
+        config, zero_only = make_heuristic_observation(
+            cpu_candidates=(0, 1),
+            cpu_frequency_legal={0: (0.0,)},
+        )
+        zero_proposal = self._policy(config).act(zero_only)
+        self.assertEqual(zero_proposal.cpu_queue, zero_only.uav_id)
+        self.assertEqual(zero_proposal.cpu_frequency, 0.0)
+        self.assertTrue(zero_only.action_masks.is_legal(zero_proposal))
+
+        config, remote_only = make_heuristic_observation(cpu_candidates=(1,))
+        idle_proposal = self._policy(config).act(remote_only)
+        self.assertEqual(idle_proposal.cpu_queue, "idle")
+        self.assertEqual(idle_proposal.cpu_frequency, 0.0)
+        self.assertTrue(remote_only.action_masks.is_legal(idle_proposal))
+
+    def test_determinism_actor_boundary_and_no_rng(self) -> None:
+        config, observation = make_heuristic_observation(
+            unbound_slack=3,
+            route_remotes=(1,),
+            tx_candidates=(1,),
+            cpu_candidates=(0, 1),
+        )
+        baseline = replace(config, mode="baseline", method_id="local_only")
+        actor_only = SimpleNamespace(
+            uav_id=observation.uav_id,
+            action_masks=observation.action_masks,
+        )
+        first_policy = LocalOnlyPolicy(baseline, policy_seed=42)
+        second_policy = LocalOnlyPolicy(baseline, policy_seed=999)
+        first = first_policy.act(actor_only)
+        self.assertEqual(first, first_policy.act(actor_only))
+        self.assertEqual(first, second_policy.act(actor_only))
+        self.assertIsNone(first_policy.policy_stream_id)
+        self.assertFalse(hasattr(first_policy, "_rng"))
+        self.assertEqual(
+            tuple(inspect.signature(LocalOnlyPolicy.act).parameters),
+            ("self", "observation"),
+        )
+        self.assertTrue(observation.action_masks.is_legal(first))
+
+    def test_short_real_rollout_preserves_local_only_invariants(self) -> None:
+        config = make_local_only_config(horizon=8)
+        outcome = RolloutRunner(config, LocalOnlyPolicy(config)).run(
+            write_artifacts=False
+        )
+        self.assertEqual(len(outcome.raw_records), 8)
+        self.assertEqual(outcome.summary["episode"]["slots_executed"], 8)
+        self.assertTrue(outcome.summary["conservation"]["is_conserved"])
+        self.assertAlmostEqual(
+            outcome.summary["energy_j"]["tx"],
+            0.0,
+            delta=config.environment.energy_tolerance_j,
+        )
+        self.assertEqual(
+            outcome.summary["transmission"]["actual_attempt_count"], 0
+        )
+        self.assertEqual(
+            outcome.summary["transmission"]["outage_valid_sample_count"], 0
+        )
+        self.assertIsNone(outcome.summary["transmission"]["outage_rate"])
+        for record in outcome.raw_records:
+            for proposal in record["proposal_action"]:
+                self.assertIn(proposal["route"], {"idle", "local"})
+                self.assertEqual(proposal["tx_select"], "idle")
+                self.assertEqual(proposal["resource_group"], "idle")
+                self.assertEqual(proposal["resource_width"], 1)
+                self.assertEqual(proposal["power_level"], 0.0)
+                self.assertIn(
+                    proposal["cpu_queue"],
+                    {"idle", proposal["uav_id"]},
+                )
 
 
 if __name__ == "__main__":

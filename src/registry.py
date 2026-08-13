@@ -177,6 +177,37 @@ def heuristic_rollout_handler(config: RunConfig) -> RunResult:
     )
 
 
+def local_only_rollout_handler(config: RunConfig) -> RunResult:
+    """Run one deterministic local-only episode through the unified backend."""
+
+    from .policies.local_only_policy import LocalOnlyPolicy
+    from .rollout import RolloutRunner
+
+    try:
+        outcome = RolloutRunner(config, LocalOnlyPolicy(config)).run()
+    except Exception as exc:
+        return RunResult(
+            status="failed",
+            run_id=config.run_id,
+            mode=config.mode,
+            method_id=config.method_id,
+            message=f"local-only policy rollout failed: {exc}",
+        )
+    tasks = outcome.summary["tasks"]
+    return RunResult(
+        status="completed",
+        run_id=config.run_id,
+        mode=config.mode,
+        method_id=config.method_id,
+        message=(
+            "local-only policy rollout completed through U2UMECEnvironment: "
+            f"generated={tasks['generated']}, completed={tasks['completed']}, "
+            f"expired={tasks['expired']}, truncated={tasks['truncated']}"
+        ),
+        artifacts=outcome.artifacts,
+    )
+
+
 def build_default_registry() -> Registry:
     """Register the frozen menu surface with honest early-stage handlers."""
 
@@ -186,6 +217,7 @@ def build_default_registry() -> Registry:
         ("gate0", "environment"),
         ("random", "random"),
         ("heuristic", "heuristic"),
+        ("baseline", "local_only"),
         ("baseline", "factorized_action_gat_qmix"),
         ("rl", "ca_gat_mappo"),
         ("rl", "factorized_action_gat_qmix"),
@@ -202,6 +234,7 @@ def build_default_registry() -> Registry:
         ("gate0", "environment"): gate0_handler,
         ("random", "random"): random_rollout_handler,
         ("heuristic", "heuristic"): heuristic_rollout_handler,
+        ("baseline", "local_only"): local_only_rollout_handler,
     }
     for mode, method_id in pairs:
         handler = implemented_handlers.get((mode, method_id), unavailable_handler)
@@ -218,6 +251,7 @@ __all__ = [
     "environment_sanity_handler",
     "gate0_handler",
     "heuristic_rollout_handler",
+    "local_only_rollout_handler",
     "random_rollout_handler",
     "unavailable_handler",
 ]

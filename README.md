@@ -108,6 +108,7 @@ knowledge/project_plan/方案2.md
 - 已完成 05-Full-Environment-Integration：统一接通确定性 reset/step、槽末到达、route、执行器与物理服务、deadline settlement、因果 observation/action masks、centralized state、固定参考 reward、history、horizon truncation、metrics 以及 runner/registry/CLI environment backend；新增 28 项测试并与既有 70 项回归测试合计通过 98 项；
 - Full Gate 0 已由 G0-01 至 G0-21 的逐项可复现测试全部验证通过；environment sanity、direct CLI 与 interactive CLI 均调用同一真实环境 backend；
 - 已完成 06-Random-and-Heuristic-Rollout：RandomPolicy 与 Deadline-and-Historical-Link-Aware Lexicographic Heuristic 均通过统一 RolloutRunner、确定性 executor、direct CLI 和 interactive menu 运行；Heuristic 只使用 actor-visible 槽初信息与 action masks，并保持七分支 proposal/executed 分离；
+- 已完成 08-Local-only 基础基线实现与短程工程测试：`LocalOnlyPolicy` 已接入 baseline launcher，并通过统一 `RolloutRunner` 验证本地路由、通信 idle、本机 CPU 源、零 TX 能量与守恒；尚未开展正式 baseline 性能实验，MAPPO/QMIX training 仍暂停且未实现；
 - 全量回归测试现为 119/119 PASS，Full Gate 0 继续 PASS；small 场景、500 slots、seed=42 的 Random 与 Heuristic 单种子工程 smoke 已真实完成并保留 raw/aggregate/dashboard CSV，未生成 plot；
 - 上述 rollout 仅用于工程正确性与 sanity 对比，不是正式论文性能结果；MAPPO、QMIX 和 RL training 仍未实现；
 - 当前真实 SINR 仅在联合执行动作确定后由环境计算；

@@ -7,8 +7,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.cli import main
+from src.cli import MENU_ROUTES, main
 from src.config import ConfigError, load_run_config
+from src.registry import build_default_registry
 from src.runner import Runner
 
 
@@ -57,6 +58,78 @@ class ConfigTests(unittest.TestCase):
 
 
 class RunnerAndCliTests(unittest.TestCase):
+    def test_local_only_baseline_config_registry_and_menu(self) -> None:
+        default = load_run_config(cli_overrides={"mode": "baseline"})
+        explicit = load_run_config(cli_overrides={
+            "mode": "baseline",
+            "method_id": "local_only",
+        })
+        qmix = load_run_config(cli_overrides={
+            "mode": "baseline",
+            "method_id": "factorized_action_gat_qmix",
+        })
+        registry = build_default_registry()
+        self.assertEqual(default.method_id, "local_only")
+        self.assertEqual(explicit.method_id, "local_only")
+        self.assertEqual(MENU_ROUTES["5"], ("baseline", "local_only"))
+        self.assertEqual(
+            registry.resolve("baseline", "local_only").__name__,
+            "local_only_rollout_handler",
+        )
+        self.assertEqual(Runner().run(qmix).status, "unavailable")
+        self.assertEqual(
+            registry.resolve("random", "random").__name__,
+            "random_rollout_handler",
+        )
+        self.assertEqual(
+            registry.resolve("heuristic", "heuristic").__name__,
+            "heuristic_rollout_handler",
+        )
+
+    def test_direct_and_menu_local_only_paths_use_common_runner(self) -> None:
+        direct_output: list[str] = []
+        direct_status = main([
+            "--mode", "baseline",
+            "--method-id", "local_only",
+            "--scenario-id", "small",
+            "--seed", "42",
+            "--show-config",
+        ], output_fn=direct_output.append)
+        self.assertEqual(direct_status, 0)
+        direct_config = json.loads(direct_output[-1])
+        self.assertEqual(direct_config["mode"], "baseline")
+        self.assertEqual(direct_config["method_id"], "local_only")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "local_only.json"
+            path.write_text(json.dumps({
+                "environment": {
+                    "episode_horizon": 3,
+                    "arrival_probabilities": [1.0, 1.0, 1.0, 1.0],
+                },
+                "output": {
+                    "logs_dir": str(root / "logs"),
+                    "dashboard_logs_dir": str(root / "dashboard_logs"),
+                    "plots_dir": str(root / "plots"),
+                },
+            }), encoding="utf-8")
+            answers = iter(("5", "small", str(path), "42"))
+            interactive_output: list[str] = []
+            interactive_status = main(
+                [],
+                input_fn=lambda _prompt: next(answers),
+                output_fn=interactive_output.append,
+            )
+        self.assertEqual(interactive_status, 0)
+        self.assertTrue(any(
+            "mode=baseline, method_id=local_only" in line
+            for line in interactive_output
+        ))
+        self.assertTrue(any(
+            "status=completed" in line for line in interactive_output
+        ))
+
     def test_unavailable_runner_does_not_fabricate_artifacts(self) -> None:
         config = load_run_config(cli_overrides={
             "mode": "rl",

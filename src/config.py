@@ -42,6 +42,7 @@ SUPPORTED_METHODS = (
     "environment",
     "random",
     "heuristic",
+    "local_only",
     "ca_gat_mappo",
     "factorized_action_gat_qmix",
 )
@@ -499,8 +500,13 @@ class RunConfig:
             raise ConfigError("mode 'heuristic' requires method_id 'heuristic'")
         if self.mode == "rl" and self.method_id not in {"ca_gat_mappo", "factorized_action_gat_qmix"}:
             raise ConfigError("mode 'rl' requires a registered RL method")
-        if self.mode == "baseline" and self.method_id != "factorized_action_gat_qmix":
-            raise ConfigError("mode 'baseline' requires method_id 'factorized_action_gat_qmix'")
+        if self.mode == "baseline" and self.method_id not in {
+            "local_only",
+            "factorized_action_gat_qmix",
+        }:
+            raise ConfigError(
+                "mode 'baseline' requires a registered baseline method"
+            )
         if expected_method and self.mode in {"evaluation", "ablation", "plot"}:
             # These modes are early-stage menu entries.  Keep a single explicit
             # default while allowing a future method-specific evaluator.
@@ -684,7 +690,7 @@ def _default_method_for_mode(mode: str) -> str | None:
         "gate0": "environment",
         "random": "random",
         "heuristic": "heuristic",
-        "baseline": "factorized_action_gat_qmix",
+        "baseline": "local_only",
         "rl": "ca_gat_mappo",
         "evaluation": "ca_gat_mappo",
         "ablation": "ca_gat_mappo",
