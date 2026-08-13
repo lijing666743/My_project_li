@@ -27,6 +27,8 @@
 | 时间与空间 | $\mathbf q_i(t)$ | 三维 UAV 位置 | $\mathrm{m}^3$ |
 | 时间与空间 | $\mathbf v_i(t)$ | 三维速度 | $\mathrm{m/s}$ |
 | 时间与空间 | $H$ | 固定飞行高度 | m |
+| 时间与空间 | $\mathcal R$ | 主场景的矩形水平移动区域 | $[x_{\min},x_{\max}]\times[y_{\min},y_{\max}]$ |
+| 时间与空间 | $\mathcal R_{\mathrm{free}}(H)$ | 固定高度 $H$ 下排除有限高度建筑实体后的可行水平飞行区域 | $\mathcal R\setminus\bigcup_{b\in\mathcal B:\,H\le H_b}\mathcal P_b$ |
 | 时间与空间 | $d_{ij}(t)$ | UAV $i$ 与 $j$ 的三维距离 | m |
 | UAV 平台 | $f_i^{\max}$ | UAV $i$ 最大 CPU 频率 | cycle/s |
 | UAV 平台 | $P_i^{\max}$ | UAV $i$ 最大通信发射功率 | W |
@@ -61,8 +63,12 @@
 | 无线信道 | $F_{\mathrm{dB}}$ | 接收机噪声系数 | dB |
 | 无线信道 | $F$ | 线性 noise factor | 无量纲 |
 | 无线信道 | $P_{\mathrm{noise,RU}}$ | 单个等效资源单元的接收噪声功率 | W |
-| 无线信道 | $\mathcal B$ | 建筑物集合 | 三维柱体集合 |
+| 无线信道 | $\mathcal B$ | 建筑物集合 | 有限高度三维闭棱柱集合 |
+| 无线信道 | $\mathcal P_b$ | 建筑物 $b$ 的闭合水平足迹 | $\mathcal P_b\subseteq\mathcal R$ |
+| 无线信道 | $H_b$ | 建筑物 $b$ 的有限高度 | m |
+| 无线信道 | $\mathcal B_b$ | 建筑物 $b$ 的有限高度闭棱柱实体 | $\mathcal P_b\times[0,H_b]$ |
 | 无线信道 | $I_{ij}^{\mathrm{bld}}(t)$ | 几何遮挡指示量 | $\{0,1\}$ |
+| 无线信道 | $L_{\mathrm B}$ | 轻量几何遮挡抽象中的场景级名义额外建筑遮挡损耗参数 | dB |
 | 无线信道 | $PL_{ij}(t)$ | $i\rightarrow j$ 路径损耗 | dB |
 | 无线信道 | $\Delta s_{ij}(t)$ | 两端 UAV 在相邻时隙间的平均水平位移；episode reset 时 $\Delta s_{ij}(0)=0$ | m |
 | 无线信道 | $X_{ij}(t)$ | 相关阴影项 | dB |
@@ -98,7 +104,7 @@
 | 资源与能量 | $R$ | 等效资源单元总数 | 正整数 |
 | 资源与能量 | $G$ | 固定资源组数 | $G=5$ |
 | 资源与能量 | $\mathcal G_g$ | 第 $g$ 个固定资源组 | 等效资源单元集合 |
-| 资源与能量 | $\mathcal R$ | 等效资源单元索引集合 | $\{1,\ldots,R\}$ |
+| 资源与能量 | $\mathcal K_{\mathrm{RU}}$ | 等效资源单元索引集合 | $\{1,\ldots,R\}$ |
 | 资源与能量 | $g_i(t)$ | 资源组构造索引，满足 $g_i(t)\equiv a_i^{\mathrm{rg}}(t)$ | $\{\mathrm{idle},1,\ldots,5\}$；仅 active 时表示组索引 |
 | 资源与能量 | $w_i(t)$ | 宽度构造变量，满足 $w_i(t)\equiv a_i^{\mathrm{width}}(t)$ | $\{1,2\}$；inactive 时使用 canonical 值 $1$ |
 | 资源与能量 | $m_i^{\mathrm{width,act}}(t)$ | 宽度分支 activity mask | $\{0,1\}$ |
@@ -157,7 +163,7 @@ $$
 
 route 决策在槽末生效并使任务进入 local 或 tx 队列时，任务才完成目的地绑定；绑定后目的地字段保持不变。
 
-​      默认参数用于编码初始接口和 Gate P 校准前的可复现实验起点。它们不等同于已完成的物理层标定结果。
+​      默认参数用于编码初始接口和 Gate P 数值可行性检查前的可复现实验起点。它们不等同于已完成的物理层标定结果。
 
 | 参数 | 编码初始值 | 单位 | 状态 |
 |---|---:|---|---|
@@ -183,10 +189,11 @@ route 决策在槽末生效并使任务进入 local 或 tx 队列时，任务才
 | $\gamma_{\min}^{\mathrm{lin}}$ | $10^{-3/10}\approx0.5012$ | 线性无量纲值 | 由 dB 门限转换 |
 | $\sigma_s$ | $4$ | dB | 敏感性参数 |
 | $d_{\mathrm{corr}}$ | $50$ | m | 敏感性参数 |
+| $L_{\mathrm B}$ | $15$ | dB | 名义主设置；$\{10,15,20,30\}$ 用于宽范围敏感性分析 |
 | $R_{\mathrm{cand}}$ | $500$ | m | Gate P 待校准 |
 | $a^{\mathrm{CSI}}$ | $0$ | slot | 敏感性参数，主场景可设为 $\{0,3,5\}$ |
 
-​      “已冻结”表示本章不得改变其语义；“Gate P 待校准”表示必须通过链路预算、deadline 和能量 pilot 后再固化数值；“敏感性参数”表示在主模型不变的前提下用于机制或鲁棒性分析。
+​      “已冻结”表示本章不得改变其语义；“Gate P 待校准”在本章仅表示通过仿真链路预算、deadline 和能量 pilot 进行数值可行性检查与仿真尺度冻结，不表示现场测量、射线追踪或物理传播模型标定；“敏感性参数”表示在主模型结构不变的前提下考察结论对数值设置的依赖性，在实验结果产生前不据此声称鲁棒性。
 
 ## 2.3 UAV平台与节点功能模型
 
@@ -590,7 +597,7 @@ $$
 其中 $\alpha=0.85$ 为编码初始相关系数，$\mathbf v_i^{\mathrm{hor}}(t)=[v_i^x(t),v_i^y(t)]^{\mathrm T}$，该式对 $t\ge0$ 使用。
 
 主场景的水平移动区域冻结为轴对齐矩形
-$\mathcal A=[x_{\min},x_{\max}]\times[y_{\min},y_{\max}]$，边界只采用 coordinate-wise specular reflection。
+$\mathcal R=[x_{\min},x_{\max}]\times[y_{\min},y_{\max}]$，边界只采用 coordinate-wise specular reflection。
 令 $\widetilde v_i^q(t+1)$ 为 Gauss--Markov 速度更新得到的暂态坐标速度，并令
 $\widetilde q_i(t+1)=q_i(t)+\Delta t\,\widetilde v_i^q(t+1)$，其中 $q\in\{x,y\}$。对每个坐标分别执行：
 
@@ -623,14 +630,41 @@ $$
 
 位置更新式对 $t\ge0$ 使用已定义的 $\mathbf p_i(t)$；需要引用上一时隙位置的位移量从 $t=1$ 开始定义，初始时刻不通过负时隙历史反推移动状态。
 
+为保证外生移动与 2.8.1 节有限高度建筑几何的一致性，定义固定飞行高度 $H$ 下的可行水平飞行区域为：
+
+$$
+\mathcal R_{\mathrm{free}}(H)
+=
+\mathcal R
+\setminus
+\bigcup_{\substack{b\in\mathcal B\\H\le H_b}}
+\mathcal P_b.
+$$
+
+所有用于通信与服务评价的离散时隙位置必须满足：
+
+$$
+\begin{aligned}
+\mathbf p_i(t)&\in\mathcal R_{\mathrm{free}}(H),
+&&\forall i\in\mathcal U,\ t\in\{0,\ldots,T-1\},\\
+\mathbf q_i(t)&\notin\mathcal B_b,
+&&\forall i\in\mathcal U,\ b\in\mathcal B,\ t\in\{0,\ldots,T-1\}.
+\end{aligned}
+$$
+
+其中，$\mathcal P_b$、$H_b$ 和 $\mathcal B_b=\mathcal P_b\times[0,H_b]$ 分别表示建筑物 $b$ 的闭合水平足迹、有限高度和三维闭实体。当 $H\le H_b$ 时，$\mathbf p_i(t)$ 不得位于 $\mathcal P_b$ 内部或边界上；由于屋顶属于闭实体，$H=H_b$ 仍执行该排除。当 $H>H_b$ 时，UAV 可以从该建筑物上方飞越。因此，建筑物不被解释为无限竖直禁飞柱。
+
 最小安全距离是 reset 可行性约束而不是运行期 collision controller。固定参数满足
-$d_{\min}^{\mathrm{safe}}>0$；reset 按 UAV ID 升序依次采用 deterministic-seed rejection sampling，当前采样位置必须位于 $\mathcal A$ 内且满足：
+$d_{\min}^{\mathrm{safe}}>0$；reset 按 UAV ID 升序依次采用 deterministic-seed rejection sampling，当前采样位置必须位于 $\mathcal R_{\mathrm{free}}(H)$ 内且满足：
 $$
 \left\|\mathbf p_i(0)-\mathbf p_j(0)\right\|_2
 \ge d_{\min}^{\mathrm{safe}},\qquad\forall i\ne j.
 $$
-候选位置不合法时只重新采样当前 UAV，直到得到合法位置；固定 master seed 和配置必须产生相同的初始位置序列。episode 运行期间不新增 collision projection、clamp、random reset 或独立的最小距离控制器。若研究区域不是轴对齐矩形，本章不替换为另一套边界规则。
-上述移动不属于动作空间，所有算法共享同一外生轨迹和轨迹随机数。
+初始候选位置不合法时只重新采样当前 UAV，直到得到合法位置。完整外生候选轨迹按照上述 Gauss--Markov 递推和矩形外边界规则在场景生成阶段生成，或从预生成轨迹集中载入；用于一个 episode 的完整离散位置序列必须统一满足建筑排除条件。无效候选轨迹按固定 master seed 和稳定候选顺序整体舍弃，接受后的轨迹及其标识在比较算法之间固定复用，从而保持确定性复现。该接受过程使轨迹集合成为经建筑几何条件化的 Gauss--Markov 候选集合，不应表述为完全无约束的 Gauss--Markov 轨迹分布。
+
+episode 运行期间不新增位置 projection、clamp、random reset、在线避障控制器、RL 动作约束、奖励惩罚或策略相关的轨迹修改。若研究区域不是轴对齐矩形，本章不替换为另一套外边界规则。上述建筑排除条件只保证 $t=0,\ldots,T-1$ 的离散服务时隙位置合法；本模型未检验 $\mathbf q_i(t)$ 与 $\mathbf q_i(t+1)$ 之间的连续飞行线段，因而不宣称连续时间轨迹已满足建筑碰撞规避。
+
+上述移动不属于动作空间，所有算法共享同一有效外生轨迹和轨迹随机数。
 
 
 ### 2.7.2 新任务候选邻居与服务边
@@ -654,7 +688,7 @@ $$
 
 ### 2.8.1 建筑物几何遮挡
 
-建筑物表示为带高度的二维多边形柱体。令 $\mathcal B_b$ 为第 $b$ 个建筑物的三维实体，$\zeta\in[0,1]$ 为线段参数，则 UAV $i$ 到 UAV $j$ 的传播线段为：
+令 $\mathcal P_b\subseteq\mathcal R$ 为第 $b$ 个建筑物的闭合水平足迹，$H_b>0$ 为其有限高度，并将建筑物表示为三维闭棱柱实体 $\mathcal B_b=\mathcal P_b\times[0,H_b]$。令 $\zeta\in[0,1]$ 为线段参数，则 UAV $i$ 到 UAV $j$ 的传播线段为：
 
 $$
 \boldsymbol{\ell}_{ij}(\zeta,t)
@@ -698,22 +732,32 @@ $$
 $$
 L_{\mathrm{bld}}(t)
 =
-L_{\mathrm{B}} I_{ij}^{\mathrm{bld}}(t).
+L_{\mathrm B} I_{ij}^{\mathrm{bld}}(t).
 $$
 
-主模型的编码初始值为 LoS 时附加损耗为 0 dB、发生遮挡时 $L_{\mathrm{B}}=15$ dB，并将 10、20、30 dB 作为敏感性参数。含相关阴影的总路径损耗为：
+当 $I_{ij}^{\mathrm{bld}}(t)=0$ 时，$L_{\mathrm{bld}}(t)=0$。$L_{\mathrm B}\ge0$ 是轻量几何遮挡抽象中的场景级名义额外建筑遮挡损耗参数，用于聚合表征相对于自由空间基准、在建筑物阻断直达几何时由未显式重建的绕射、反射、散射及可用替代传播路径所产生的大尺度平均额外衰减。该参数不表示建筑入楼损耗、墙体穿透损耗或材料常数，也不是标准的 3.5 GHz 建筑损耗、普适室外遮挡损耗、本项目实测值或本项目射线追踪标定值。
+
+主模型取 $L_{\mathrm B}=15\,\mathrm{dB}$ 作为名义建模基准，并采用：
+
+$$
+L_{\mathrm B}\in\{10,15,20,30\}\,\mathrm{dB}
+$$
+
+进行刻意设置的宽范围敏感性分析。该集合不是文献认证的轻度、中度或重度遮挡离散分类；其用途是在假定的额外遮挡严重程度变化时，检验物理 KPI、算法增益和算法相对排序是否保持稳定。在完成相应实验前，不据此声称敏感性鲁棒性。含相关阴影的总路径损耗为：
 
 $$
 PL_{ij}(t)
 =
 PL_{\mathrm{FS}}\left(d_{ij}(t),f_c\right)
 +
-L_{\mathrm{bld}}(t)
+L_{\mathrm B}I_{ij}^{\mathrm{bld}}(t)
 +
 X_{ij}(t).
 $$
 
-该式只提供轻量链路评价所需的大尺度项，不等同于实测路径损耗或实时射线追踪输出。
+在上述分解中，$X_{ij}(t)$ 是 dB 域零均值随机残差，其统计均值不再包含由同一 $I_{ij}^{\mathrm{bld}}(t)$ 表示的建筑遮挡惩罚。该额外遮挡项仅叠加在自由空间基准上，不与已在 NLoS 均值中包含遮挡相关额外损耗的经验路径损耗模型无条件叠加。特别地，若未来采用状态条件化的 $PL_{\mathrm{3GPP}}^{\mathrm{NLoS}}$ 或其他 NLoS 均值模型，则在没有单独标定独立残差项时不得再加入 $L_{\mathrm B}I_{ij}^{\mathrm{bld}}(t)$，否则可能对同一遮挡机制重复计损。
+
+该式只提供轻量链路评价所需的大尺度项，不等同于实测路径损耗或实时射线追踪输出。$L_{\mathrm B}=15\,\mathrm{dB}$ 在获得场景匹配的外部测量或射线追踪标定前始终保持名义参数身份，不应归因于 3GPP 或 ITU 推荐。
 
 ### 2.8.3 空间相关阴影
 
@@ -783,7 +827,7 @@ g_{ij,r}(t)=
 \sqrt{\frac{K_{\mathrm{lin}}}{K_{\mathrm{lin}}+1}}
 +\sqrt{\frac{1}{K_{\mathrm{lin}}+1}}\,z_{ij,r}(t).
 $$
-LoS deterministic component 使用单位相位 $1$；当前系统只使用 $|h_{ij,r}(t)|^2$，不额外引入未冻结的 LoS 相位模型。两种状态均满足 $\mathbb E[|g_{ij,r}(t)|^2]=1$。当 $I_{ij}^{\mathrm{bld}}(t)=0$ 时使用 Rician；当 $I_{ij}^{\mathrm{bld}}(t)=1$ 时使用 Rayleigh 特例。
+LoS deterministic component 使用单位相位 $1$；当前系统只使用 $|h_{ij,r}(t)|^2$，不额外引入未冻结的 LoS 相位模型。两种状态均满足 $\mathbb E[|g_{ij,r}(t)|^2]=1$。当 $I_{ij}^{\mathrm{bld}}(t)=0$ 时使用 Rician；当 $I_{ij}^{\mathrm{bld}}(t)=1$ 时使用 Rayleigh 特例。因此，该归一化状态切换只改变小尺度衰落的统计形态，不重复增加由 $L_{\mathrm B}I_{ij}^{\mathrm{bld}}(t)$ 表示的大尺度平均损耗。
 $$
 |h_{ij,r}(t)|^2=G_tG_r10^{-PL_{ij}(t)/10}|g_{ij,r}(t)|^2.
 $$
@@ -1107,7 +1151,7 @@ $$
 \mathcal S_i^{\mathrm{exec}}(t)
 =
 \left\{
- r\in\mathcal R:
+ r\in\mathcal K_{\mathrm{RU}}:
  \sum_{j\in\mathcal U,\ j\ne i}x_{ij,r}(t)>0
 \right\}.
 $$
@@ -1117,7 +1161,7 @@ $$
 $$
 \mathcal S_i^{\mathrm{exec}}(t)
 =
-\left\{r\in\mathcal R:x_{ij,r}(t)=1\right\}.
+\left\{r\in\mathcal K_{\mathrm{RU}}:x_{ij,r}(t)=1\right\}.
 $$
 
 若发送 UAV $i$ 没有任何被接受的发送链路，则 $\mathcal S_i^{\mathrm{exec}}(t)=\varnothing$；此时 $\mathcal S_i^{\mathrm{prop}}(t)$ 仍可能非空。对满足 $y_{ij}(t)=1$ 的唯一实际接受链路，有：
@@ -2141,21 +2185,21 @@ truncated 仅是 episode 终止时的删失统计标签，不加入任务物理�
 
 ### 2.15.1 主要建模假设
 
-1. UAV 高度固定，水平移动由外生 Gauss-Markov 过程产生，所有算法使用相同移动轨迹。
+1. UAV 高度固定，水平移动由外生 Gauss-Markov 过程产生；完整离散位置序列在场景生成阶段通过有限高度建筑排除检查后固定，所有算法使用相同的有效外生轨迹。
 2. 任务输入不可拆分到多个目的 UAV，不允许多跳转发；目的地在 route 决策生效并进入 local 或 tx 队列时锁定。
 3. 传输和 CPU 服务跨时隙持续，槽末入队的任务下一时隙才可服务。
 4. 计算模块与无线模块可以并行，但无线模块满足联合半双工。
 5. 主通信资源由五个固定资源组组成，资源组宽度只取一个或两个相邻组，功率和 CPU 频率只取离散档位。
-6. 建筑物以三维柱体表示，遮挡通过线段与建筑物的几何相交判定。
+6. 建筑物以有限高度三维闭棱柱表示；UAV 的离散服务时隙位置位于建筑实体之外，链路遮挡通过闭线段与建筑物的几何相交判定。
 7. 轻量信道模型仅服务于趋势评价；真实信道用于环境转移，actor 使用陈旧期望链路信道估计、历史干扰摘要、历史干扰链路质量代理量、相应 AoI 和可用性 mask。
 8. episode reset 直接初始化 $\mathbf p_i(0)$、$\mathbf v_i(0)$、$X_{ij}(0)$ 和 $h_{ij,r}(0)$，并以 $\Delta s_{ij}(0)=0$ 作为初始位移约定；不生成或访问负时隙历史，CSI 不可用时使用缺省值与 mask。
-9. 初始能量、参考速率、deadline 和路径损耗参数在 Gate P pilot 后校准。
+9. 初始能量、参考速率和 deadline 在 Gate P pilot 中进行非退化性校准；路径损耗相关参数在 Gate P 中只进行仿真链路预算与数值可行性检查。在获得场景匹配的外部测量或射线追踪标定前，$L_{\mathrm B}=15\,\mathrm{dB}$ 仅为名义建模基准。
 10. 主动能耗只包含按实际传输活跃时间和 CPU 动态活跃时间统计的无线发射与 CPU 动态能耗，不包含推进和其他飞行器功耗；预留能量只用于执行前的硬可行性检查，不作为实际能耗指标。
 11. 结果回传暂不建模，远程 CPU 完成即视为任务计算完成。
 
 ### 2.15.2 局限性和声明边界
 
-本模型适合研究动态异构、单跳 U2U-MEC、离散资源编排和截止期队列之间的耦合机制，但不应被解释为完整 UAV 通信系统的数字孪生。固定高度和外生移动排除了轨迹控制与飞行动力学影响；轻量物理层不提供实测信道或实时射线追踪级别的真实性保证；未建模结果回传、完整协议栈、HARQ、MIMO、RIS、DAG 任务和多跳路由；第三 UAV 软遮挡及高保真传播回放只能作为后续扩展。性能结论必须限定在已实现的环境、参数校准范围、测试场景和统计协议内。
+本模型适合研究动态异构、单跳 U2U-MEC、离散资源编排和截止期队列之间的耦合机制，但不应被解释为完整 UAV 通信系统的数字孪生。固定高度和外生移动排除了轨迹控制与飞行动力学影响；建筑排除条件只保证离散服务时隙位置合法，不证明相邻时隙间的连续飞行线段已避开建筑；轻量物理层不提供实测信道或实时射线追踪级别的真实性保证；未建模结果回传、完整协议栈、HARQ、MIMO、RIS、DAG 任务和多跳路由；第三 UAV 软遮挡及高保真传播回放只能作为后续扩展。性能结论必须限定在已实现的环境、参数校准范围、测试场景和统计协议内。
 
 本章的公式定义服务接口、约束和评价量，不证明任务完成率的理论最优边界，不证明策略对未测试规模或未测试分布的泛化，也不把经验趋势写成定理。任何数值、曲线、显著性或算法优越性结论都必须留给真实程序运行后的结果章节。
 
@@ -2303,7 +2347,7 @@ P1-04 计划测试还应覆盖以下物理层可执行性边界（仅新增测�
 | 离散能量降档 | $1.0\rightarrow0.5\rightarrow0.25\rightarrow0$ | src/env/energy.py，src/agents/action_mask.py | 档位闭集测试，Gate 0 |
 | 联合半双工 | 同一 UAV 不得同时发送和接收 | src/env/half_duplex_resolver.py | 冲突解析测试，Gate 0 |
 | 信息权限 | actor 只使用 $o_i(t)$，禁止读取真实遮挡、当前真实信道/SINR/干扰、当前联合动作结果、未来位置、真实 $\lambda_i$ 和完整私有队列 | src/agents/observation.py | 信息泄漏、历史量时序、缺省值与 mask、AoI 更新测试，Gate 0 |
-| Gate P 参数校准 | 链路预算、deadline 与能量处于非退化区间 | configs/ 与 experiments/（待建） | Gate P pilot |
+| Gate P 数值可行性检查 | 仿真链路预算、deadline 与能量处于非退化区间；不构成外部传播标定 | configs/ 与 experiments/（待建） | Gate P pilot |
 | Gate 0 环境正确 | 任务、bit、cycle、energy 守恒；route/tx 分离；槽因果正确 | tests/（待建） | Gate 0 |
 
 ### 2.15.4 本章与后续章节的关系
@@ -2311,6 +2355,3 @@ P1-04 计划测试还应覆盖以下物理层可执行性边界（仅新增测�
 本章是系统对象、符号、状态机、队列、物理层评价、动作接口和信息权限的唯一主源。后续方法章节只能在这些接口上说明策略网络、训练流程、集中训练和分散执行方式，不得重新定义任务状态、route/tx_select 语义、固定资源组、半双工、离散降档或 actor 信息边界。实验协议章节只能使用本章的参数状态、Gate P/Gate 0 和评价口径组织校准、训练、测试、统计与复现，不得通过实验设置改变系统规则。
 
 在编码实现前，必须先以不调用学习器的完整 episode 验证任务、bit、cycle 和能量守恒、零非法状态转移、槽边界、outage 统计、离散降档和联合半双工；只有 Gate 0 通过后，才可将本章定义的环境接口连接到后续策略和价值模块。
-
-
-
