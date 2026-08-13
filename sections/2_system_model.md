@@ -6,7 +6,7 @@
 
 ​      系统时间被离散为长度为 $\Delta t$ 的时隙，时隙 $t$ 对应连续时间区间 $[t\Delta t,(t+1)\Delta t)$。槽初表示该区间开始的边界，槽内只对槽初已经存在的队列执行传输和计算服务，槽末表示本槽服务完成后的边界并承载到达、绑定、转队和完成等事件。新任务在时隙 $t_n^{\mathrm{arr}}$ 的槽末生成并到达，记录其到达事件所属时隙索引 $t_n^{\mathrm{arr}}$，因此在 $t_n^{\mathrm{arr}}+1$ 的槽初才首次进入 actor 可见的未绑定队列并允许 route；本槽 route 决策在槽末绑定目的地，任务从下一时隙起才可接受传输或 CPU 服务。传输完成任务同样在槽末转入 CPU 队列，并在下一时隙首次计算。该安排保留传输中断、排队等待、CPU 竞争和截止期违约的端到端因果关系。任务结果回传暂不单独建模，因此远程计算完成表示任务服务过程结束；若后续研究需要刻画结果数据回传，可在主模型通过附加的反向服务队列扩展，但不改变本章的单跳输入卸载接口。
 
-​      本章的主模型包括 UAV 状态、任务生命周期、EDF 队列、外生移动、轻量 U2U 物理层评价、固定资源组、跨时隙传输和计算服务、主动通信及 CPU 能耗、七分支离散动作、联合半双工解析和 Dec-POMDP 信息边界。第三 UAV 软遮挡、高保真传播回放、UAV 数量 OOD 和离散硬件类型属于主实验通过后再考虑的可选扩展；连续资源动作同样不进入主模型。它们不改变主模型中任务不可多目的地拆分、单跳、固定高度、固定资源组和槽边界等冻结规则。
+​      本章的主模型包括 UAV 状态、任务生命周期、EDF 队列、外生移动、轻量 U2U 物理层评价、固定资源组、跨时隙传输和计算服务、主动通信及 CPU 能耗、七分支离散动作、半双工与节点独占无线调度的联合解析和 Dec-POMDP 信息边界。第三 UAV 软遮挡、高保真传播回放、UAV 数量 OOD 和离散硬件类型属于主实验通过后再考虑的可选扩展；连续资源动作同样不进入主模型。它们不改变主模型中任务不可多目的地拆分、单跳、固定高度、固定资源组和槽边界等冻结规则。
 
 ​      本章刻意限定建模声明边界。该模型不是完整飞控系统，不包含六自由度飞行动力学、旋翼推力、姿态控制或飞控回路；不是完整通信协议栈，不包含包级重传、HARQ、随机接入和控制信令细节；不是实测信道、NS-3 包级联动或实时射线追踪系统。无线部分属于 modeled physical-layer evaluation：它用几何遮挡、路径损耗、相关阴影、槽级衰落、不完美 CSI 和同频干扰生成可解释的链路评价量，用于比较卸载和资源编排行为，而不宣称替代实测或高保真物理层仿真。
 
@@ -260,9 +260,9 @@ $$
 
 ### 2.3.3 UAV节点角色与并行服务能力
 
-同一架 UAV 的角色由当前任务和队列状态动态决定，而不是由固定类型标签预先决定。它可以同时承担任务源节点、U2U 发送节点、U2U 接收节点、本地计算节点和远程协同计算节点。CPU 模块与无线模块允许并行工作，因此一架 UAV 可以在同一时隙执行 CPU 服务并参与一条无线传输链路。
+同一架 UAV 的角色由当前任务和队列状态动态决定，而不是由固定类型标签预先决定。它可以同时承担任务源节点、U2U 发送节点、U2U 接收节点、本地计算节点和远程协同计算节点。CPU 模块与无线模块允许并行工作，因此一架 UAV 可以在同一时隙执行 CPU 服务，并作为发送端或接收端参与一条无线传输链路；两类服务仅通过既有的联合主动能量可行性约束发生耦合。
 
-无线部分采用半双工约束。同一 UAV 在同一时隙不能同时发送和接收；联合执行器负责在所有 UAV 的候选传输边之间解析冲突。每个发送 UAV 每槽至多服务一个目的传输链路，每个计算 UAV 每槽至多选择一个 CPU 队列。一个链路服务可以按照 EDF 顺序连续扣除同一传输队列中的多个小任务，但不能在同一槽切换到另一个目的链路。
+无线收发机采用半双工模式，即同一 UAV 在同一时隙不得同时发送和接收。在此基础上，主模型另行采用节点独占（node-exclusive）的一链路 MAC 调度抽象：每架 UAV 每个时隙至多关联一条最终接受的 U2U 无线服务边。该节点独占规则是附加的建模假设，并非半双工定义本身的数学推论。下文将半双工模式与节点独占无线调度的组合简称为“联合半双工规则”。每个计算 UAV 每槽至多选择一个 CPU 队列。一个链路服务可以按照 EDF 顺序连续扣除同一传输队列中的多个小任务，但不能在同一槽切换到另一个目的链路。
 
 ### 2.3.4 UAV动态节点状态
 
@@ -895,7 +895,7 @@ m_{ij,r}^{I,\mathrm{meas}}(t)
 \mathbb I[Q_{ij}^{\mathrm{bit}}(t)>0].
 $$
 其中 $x_{ij,r}(t)=1$ 表示 RU 被最终 executed action 占用；接收端摘要使用既有符号
-$m_{j,r}^{I,\mathrm{meas}}(t)=\max_{i\ne j}m_{ij,r}^{I,\mathrm{meas}}(t)$，半双工规则保证同一接收端不会形成冲突测量。在槽 $t$ 的最终执行结果和真实信道已知后，历史摘要按以下下一槽递推更新：
+$m_{j,r}^{I,\mathrm{meas}}(t)=\max_{i\ne j}m_{ij,r}^{I,\mathrm{meas}}(t)$，节点独占无线调度规则保证同一接收端至多对应一条最终接受的入边。在槽 $t$ 的最终执行结果和真实信道已知后，历史摘要按以下下一槽递推更新：
 
 $$
 \widehat I_{j,r}^{\mathrm{hist}}(t+1)
@@ -1088,7 +1088,7 @@ $$
 这里 $\Phi_P(\rho)=\rho P_i^{\max}$ 只是已有功率动作分支到物理量的映射。$p_i^{\mathrm{prop}}(t)$ 是 actor 的动作提案，不是最终实际发射功率；executor 可以拒绝该提案，或沿既有离散降档序列检查更低功率。因而资源宽度仍只表示一个组或两个相邻组，功率分支也不会产生离散集合之外的连续值。
 
 
-若 actor 选择了通信 tx proposal 但 $p_i^{\mathrm{prop}}(t)=0$，则该 proposal 在进入冲突解析和资源执行语义前预先 canonicalize 为 communication idle，并从候选通信边中排除。它不占用 half-duplex、不占用执行资源、不产生能量预留、干扰、实际 transmission attempt 或 outage 样本；power 0 档位本身保留，且不增加新的 idle 类别。形式上，其最终通信结果必须满足：
+若 actor 选择了通信 tx proposal 但 $p_i^{\mathrm{prop}}(t)=0$，则该 proposal 在进入冲突解析和资源执行语义前预先 canonicalize 为 communication idle，并从候选通信边中排除。它不占用半双工与节点独占无线调度中的无线端点、不占用执行资源、不产生能量预留、干扰、实际 transmission attempt 或 outage 样本；power 0 档位本身保留，且不增加新的 idle 类别。形式上，其最终通信结果必须满足：
 
 $$
 p_i^{\mathrm{prop}}(t)=0
@@ -1112,7 +1112,7 @@ $$
 其中候选序列从 actor 提出的绝对离散等级开始并保持降序；若 proposed 等级为 $0.5$，候选序列为 $0.5,0.25,0$，而不是再次将 $p_i^{\mathrm{prop}}$ 乘以一个比例。这样 candidate 只表示 executor 的临时检查值，不重构既有功率档位。
 
 
-若通信候选已经通过前序 deterministic arbitration，但 energy feasibility search 将其 candidate power 降至 $0$，则最终执行结果同样 canonicalize 为 communication idle。该处理在本槽不触发 backtracking 或 re-arbitration；前序 half-duplex 扫描中已经被拒绝的低优先级 proposal 不因该降档而复活。
+若通信候选已经通过前序 deterministic arbitration，但 energy feasibility search 将其 candidate power 降至 $0$，则最终执行结果同样 canonicalize 为 communication idle。该处理在本槽不触发 backtracking 或 re-arbitration；前序节点独占无线扫描中已经被拒绝的低优先级 proposal 不因该降档而复活。
 
 $$
 p_i^{\mathrm{cand}}(t;\ell^\star)=0
@@ -1121,7 +1121,7 @@ p_i^{\mathrm{cand}}(t;\ell^\star)=0
 \text{communication idle}.
 $$
 
-半双工扫描得到的接受结果在功率降档完成前只属于 executor 内部的暂定结果；下述 $y_{ij}(t)$、$x_{ij,r}(t)$、$\mathcal S_i^{\mathrm{exec}}(t)$ 和 $p_i^{\mathrm{exec}}(t)$ 均指完成该 canonicalization 后的最终执行结果。
+节点独占无线扫描得到的接受结果在功率降档完成前只属于 executor 内部的暂定结果；下述 $y_{ij}(t)$、$x_{ij,r}(t)$、$\mathcal S_i^{\mathrm{exec}}(t)$ 和 $p_i^{\mathrm{exec}}(t)$ 均指完成该 canonicalization 后的最终执行结果。
 
 在当前模型中，联合执行器对已选择的固定资源组内部资源单元不做部分删除、增加或重新分配；对提案链路只决定是否接受。于是链路 $i\rightarrow j$ 的最终实际资源占用指示为：
 
@@ -1219,7 +1219,7 @@ $$
 
 当分母为零时链路未获得资源，约定所有 $p_{ij,r}(t)=0$，且不计算该链路的有效服务。
 
-在接收噪声功率为 $N_0B_{\mathrm{RU}}F$ 时，资源单元级 SINR 定义如下。这里的 $x_{ij,r}(t)$、$p_{ij,r}(t)$ 和 $y_{ij}(t)$ 是联合执行器处理后的实际接受结果：只有在所有 UAV 生成动作提案、执行器完成半双工、能量等硬约束处理，且实际接受变量、资源占用、功率和当前真实信道均确定后，环境才计算当前真实 SINR；该量不进入槽初 actor 的局部观测。
+在接收噪声功率为 $N_0B_{\mathrm{RU}}F$ 时，资源单元级 SINR 定义如下。这里的 $x_{ij,r}(t)$、$p_{ij,r}(t)$ 和 $y_{ij}(t)$ 是联合执行器处理后的实际接受结果：只有在所有 UAV 生成动作提案、执行器完成半双工与节点独占无线调度、能量等硬约束处理，且实际接受变量、资源占用、功率和当前真实信道均确定后，环境才计算当前真实 SINR；该量不进入槽初 actor 的局部观测。
 
 $$
 \mathrm{SINR}_{ij,r}(t)
@@ -1234,7 +1234,7 @@ x_{kl,r}(t)p_{kl,r}(t)|h_{kj,r}(t)|^2
 }.
 $$
 
-其中 $N_0$ 是噪声谱密度，$B_{\mathrm{RU}}$ 是单个等效资源单元带宽，$F$ 是由噪声系数换算得到的线性因子。分母中的求和仅包含同一资源单元上被联合执行器接受的其他传输边。该真实 SINR 始终是线性无量纲比值，不是 dB 值；它仅用于环境状态转移、有效速率、实际服务量、outage 以及集中训练期允许使用的真实全局状态。
+其中 $N_0$ 是噪声谱密度，$B_{\mathrm{RU}}$ 是单个等效资源单元带宽，$F$ 是由噪声系数换算得到的线性因子。分母中的求和仅包含同一资源单元上被联合执行器接受的其他传输边。节点独占无线调度只排除共享端点的边，并不建立全局正交资源或无干扰通信；端点不相交的并发链路若执行 RU 集合重叠，仍按上式进入相应接收端的 SINR 干扰求和项。该真实 SINR 始终是线性无量纲比值，不是 dB 值；它仅用于环境状态转移、有效速率、实际服务量、outage 以及集中训练期允许使用的真实全局状态。
 为使槽末测量与上述真实 SINR 的干扰项完全一致，若当前槽存在已被联合执行器接受的接收边 $i\rightarrow j$，则在执行结果已确定后定义：
 
 $$
@@ -1244,7 +1244,7 @@ I_{ij,r}^{\mathrm{meas}}(t)
 x_{kl,r}(t)p_{kl,r}(t)\left|h_{kj,r}(t)\right|^2.
 $$
 
-该式直接复用真实 SINR 分母中的 interference term；由于半双工约束，接收 UAV $j$ 至多对应一条当前已接受的入边，因此历史摘要仍以接收端形式记作 $I_{j,r}^{\mathrm{meas}}(t)\equiv I_{ij,r}^{\mathrm{meas}}(t)$。计算前提是联合执行器已经确定 $y$、$x$、$p^{\mathrm{exec}}$ 和 $p_{ij,r}$；求和只包含最终 executed 的 $x_{kl,r}(t)$ 和 $p_{kl,r}(t)$，不包含 proposed power、candidate power、被拒绝的传输或没有执行资源的链路。式中没有 $N_0B_{\mathrm{RU}}F$，所以该测量是 interference-only，不是 interference-plus-noise；热噪声只在构造 $\widehat Z_{j,r}^{\mathrm{hist}}(t)$ 时加入一次。
+该式直接复用真实 SINR 分母中的 interference term；由于节点独占无线调度约束，接收 UAV $j$ 至多对应一条当前已接受的入边，因此历史摘要仍以接收端形式记作 $I_{j,r}^{\mathrm{meas}}(t)\equiv I_{ij,r}^{\mathrm{meas}}(t)$。计算前提是联合执行器已经确定 $y$、$x$、$p^{\mathrm{exec}}$ 和 $p_{ij,r}$；求和只包含最终 executed 的 $x_{kl,r}(t)$ 和 $p_{kl,r}(t)$，不包含 proposed power、candidate power、被拒绝的传输或没有执行资源的链路。式中没有 $N_0B_{\mathrm{RU}}F$，所以该测量是 interference-only，不是 interference-plus-noise；热噪声只在构造 $\widehat Z_{j,r}^{\mathrm{hist}}(t)$ 时加入一次。
 
 设 $\gamma_{\min}^{\mathrm{dB}}$ 为 dB 表示的最小可用 SINR 阈值，并定义对应的线性阈值为：
 
@@ -1303,7 +1303,7 @@ $$
 \mathbb 1\left[Q_{ij}^{\mathrm{bit}}(t)>0\right].
 $$
 
-其中 $y_{ij}(t)$、$p_i^{\mathrm{exec}}(t)$ 和 $x_{ij,r}(t)$ 均指联合执行器处理后的实际接受、最终实际功率和实际资源占用结果。只有 $\chi_{ij}^{\mathrm{att}}(t)=1$ 才生成一个实际传输尝试样本；同一发送 UAV 每槽至多生成一个此类样本。actor 主动选择 idle、执行器拒绝或因半双工冲突退化为 idle、能量降档至零功率、实际资源占用为空或传输队列为空时，$\chi_{ij}^{\mathrm{att}}(t)=0$，这些情况不属于无线 outage。
+其中 $y_{ij}(t)$、$p_i^{\mathrm{exec}}(t)$ 和 $x_{ij,r}(t)$ 均指联合执行器处理后的实际接受、最终实际功率和实际资源占用结果。只有 $\chi_{ij}^{\mathrm{att}}(t)=1$ 才生成一个实际传输尝试样本；同一发送 UAV 每槽至多生成一个此类样本。actor 主动选择 idle、执行器拒绝或因半双工与节点独占无线冲突退化为 idle、能量降档至零功率、实际资源占用为空或传输队列为空时，$\chi_{ij}^{\mathrm{att}}(t)=0$，这些情况不属于无线 outage。
 
 对单次实际传输尝试，沿用当前真实 SINR、有效速率和既有无线 outage 判定条件：
 
@@ -1560,7 +1560,7 @@ E_j^{\mathrm{cpu}}(t)
 \kappa_j f_j^2(t)c_j^{\mathrm{cpu}}(t).
 $$
 
-当 $f_j(t)=0$ 或 CPU queue 为 idle 时，$c_j^{\mathrm{cpu}}(t)=0$、$\tau_j^{\mathrm{cpu}}(t)=0$ 且 $E_j^{\mathrm{cpu}}(t)=0$。在半双工候选集合确定后、真实有效速率、最终发射功率和实际服务结果形成前，联合执行器仍不能知道通信实际活跃时间，因此对候选动作使用基于 candidate power 的保守能量预留上界。该阶段读取槽初已绑定队列、$\mathcal S_i^{\mathrm{prop}}(t)$ 和当前正在检查的 $p_i^{\mathrm{cand}}(t;\ell)$；不读取当前真实 SINR、有效速率、实际服务或实际活跃时间，预留仍按提案资源集合和候选功率计算：
+当 $f_j(t)=0$ 或 CPU queue 为 idle 时，$c_j^{\mathrm{cpu}}(t)=0$、$\tau_j^{\mathrm{cpu}}(t)=0$ 且 $E_j^{\mathrm{cpu}}(t)=0$。在节点独占无线仲裁形成候选接受集合后、真实有效速率、最终发射功率和实际服务结果形成前，联合执行器仍不能知道通信实际活跃时间，因此对候选动作使用基于 candidate power 的保守能量预留上界。该阶段读取槽初已绑定队列、$\mathcal S_i^{\mathrm{prop}}(t)$ 和当前正在检查的 $p_i^{\mathrm{cand}}(t;\ell)$；不读取当前真实 SINR、有效速率、实际服务或实际活跃时间，预留仍按提案资源集合和候选功率计算：
 
 $$
 \overline E_i^{\mathrm{tx,cand}}(t;\ell)
@@ -1579,7 +1579,7 @@ p_i^{\mathrm{cand}}(t;\ell)\Delta t,
 \end{cases}
 $$
 
-上式中的 $p_i^{\mathrm{cand}}(t;\ell)$ 仅表示 executor 当前正在检查的候选功率档位，而不是对最终接受结果的预判；预留条件不以 $y_{ij}(t)=1$、$|\mathcal S_i^{\mathrm{exec}}(t)|>0$ 或 $\sum_r x_{ij,r}(t)>0$ 为前提。每个候选档位都单独计算该临时预留；候选发送若在半双工或能量等硬约束阶段被拒绝，或最终降档为通信 idle，则候选预留释放且 $E_i^{\mathrm{tx}}(t)=0$。若候选被接受，未实际消耗的预留在槽末释放，剩余能量只按实际主动能耗扣除。
+上式中的 $p_i^{\mathrm{cand}}(t;\ell)$ 仅表示 executor 当前正在检查的候选功率档位，而不是对最终接受结果的预判；预留条件不以 $y_{ij}(t)=1$、$|\mathcal S_i^{\mathrm{exec}}(t)|>0$ 或 $\sum_r x_{ij,r}(t)>0$ 为前提。每个候选档位都单独计算该临时预留；候选发送若在半双工与节点独占无线调度或能量等硬约束阶段被拒绝，或最终降档为通信 idle，则候选预留释放且 $E_i^{\mathrm{tx}}(t)=0$。若候选被接受，未实际消耗的预留在槽末释放，剩余能量只按实际主动能耗扣除。
 
 CPU 预留可以根据槽初已知的队首任务和频率确定：
 
@@ -1619,7 +1619,7 @@ E_i^{\mathrm{res}}(t).
 $$
 
 
-在半双工仲裁形成接受集合后、真实服务开始前，联合执行器使用上述候选预留上界检查离散降档组合的硬可行性；真实服务完成后，实际主动能耗和剩余能量更新为：
+在节点独占无线仲裁形成接受集合后、真实服务开始前，联合执行器使用上述候选预留上界检查离散降档组合的硬可行性；真实服务完成后，实际主动能耗和剩余能量更新为：
 
 $$
 E_i^{\mathrm{act}}(t)
@@ -1678,7 +1678,7 @@ $$
 - 第五组不能与宽度 2 组合；
 - 没有本地或远程 CPU 队列时，CPU queue 和 CPU frequency 固定为 idle；
 - 按预留能量上界明显超过剩余能量的离散档位提前 mask；
-- 联合半双工冲突不由单个 actor 的本地 mask 假定解决，而由联合执行器解析。
+- 半双工与节点独占无线冲突不由单个 actor 的本地 mask 假定解决，而由联合执行器解析。
 
 为明确联合解析的硬约束，令 $y_{ij}(t)\in\{0,1\}$ 表示传输边 $i\rightarrow j$ 是否被接受，令 $u_{jk}(t)\in\{0,1\}$ 表示 UAV $j$ 是否选择来源为 $k$ 的 CPU 队列，其中 $k=j$ 表示本地队列。则每个发送 UAV 和每个计算 UAV 分别满足：
 
@@ -1688,18 +1688,20 @@ $$
 \sum_{k\in\mathcal U}u_{ik}(t)\le1.
 $$
 
-半双工约束要求任意 UAV 不得同时作为发送端和接收端：
+为同时实施半双工收发模式和节点独占无线调度，最终接受边满足：
 
 $$
 \sum_{j\ne i}y_{ij}(t)
 +
 \sum_{k\ne i}y_{ki}(t)
-\le1,
+\le 1,
 \qquad
 \forall i\in\mathcal U.
 $$
 
-CPU 与无线通信模块被视为并行资源，因此半双工约束不限制 CPU 和无线动作之间的并行性。联合执行器先收集所有合法、非 idle 且 $p_i^{\mathrm{prop}}(t)>0$ 的候选通信边；raw zero-power proposal 已在此前 canonicalize 为 idle。对每条候选边 $i\rightarrow j$，令 $n_{ij}^{\star}$ 为 $Q_{i\rightarrow j}^{\mathrm{tx}}(t)$ 的 EDF 队首任务，并令 $\widehat\Gamma_{ij}^{\mathrm{hist}}(t)$ 为 2.8.5 在该候选边的 $\mathcal S_i^{\mathrm{prop}}(t)$ 上定义的唯一 scalar historical quality。executor 不改用 per-RU 任意选择、$\mathcal S_i^{\mathrm{exec}}(t)$、当前真实 SINR 或随机 fallback。
+该不等式比普通半双工约束更强：它同时禁止同一 UAV 出现两条出边、两条入边以及一条入边与一条出边。忽略方向后，每个时隙的最终接受无线边集构成一个 matching；此处不要求该 matching 为 induced matching、maximal matching 或 maximum matching。若 $\{i,j\}\cap\{k,l\}=\varnothing$，则边 $i\rightarrow j$ 与 $k\rightarrow l$ 可在同一时隙执行，因此该模型不是全局 TDMA、全局正交调度或全系统单链路调度。
+
+CPU 与无线通信模块被视为并行资源，因此上述节点独占无线约束仅作用于无线边，不禁止同一 UAV 在发送或接收时执行 CPU 服务；二者只通过既有联合主动能量可行性约束耦合。联合执行器先收集所有合法、非 idle 且 $p_i^{\mathrm{prop}}(t)>0$ 的候选通信边；raw zero-power proposal 已在此前 canonicalize 为 idle。对每条候选边 $i\rightarrow j$，令 $n_{ij}^{\star}$ 为 $Q_{i\rightarrow j}^{\mathrm{tx}}(t)$ 的 EDF 队首任务，并令 $\widehat\Gamma_{ij}^{\mathrm{hist}}(t)$ 为 2.8.5 在该候选边的 $\mathcal S_i^{\mathrm{prop}}(t)$ 上定义的唯一 scalar historical quality。executor 不改用 per-RU 任意选择、$\mathcal S_i^{\mathrm{exec}}(t)$、当前真实 SINR 或随机 fallback。
 
 候选通信边的唯一仲裁键冻结为：
 
@@ -1714,7 +1716,7 @@ j
 \right).
 $$
 
-所有候选边按上述键作升序字典序排序：slack 越小越优先，历史链路质量代理量越大越优先，随后按发送 UAV ID $i$、接收 UAV ID $j$ 升序 tie-break。排序完成后从空的接受集合开始逐项扫描；若加入当前候选会违反已有发送端至多一条链路约束或既有半双工约束，则拒绝该候选，否则接受该候选。被拒绝链路满足 $y_{ij}(t)=0$、$\mathcal S_i^{\mathrm{exec}}(t)=\varnothing$ 和 $p_i^{\mathrm{exec}}(t)=0$，且不生成 outage 样本。
+所有候选边按上述键作升序字典序排序：slack 越小越优先，历史链路质量代理量越大越优先，随后按发送 UAV ID $i$、接收 UAV ID $j$ 升序 tie-break。排序完成后从空的接受集合开始逐项扫描。一条边被接受后同时占用其发送端和接收端；后续与已接受边共享任一端点的候选被拒绝，端点不相交的候选仍可被接受。该仲裁不依据 RU 是否重叠来排除端点不相交的边；其 RU 重叠影响由既有 SINR 干扰模型处理。被拒绝链路满足 $y_{ij}(t)=0$、$\mathcal S_i^{\mathrm{exec}}(t)=\varnothing$ 和 $p_i^{\mathrm{exec}}(t)=0$，且不生成 outage 样本。该确定性过程不承诺接受集为 induced matching、maximal matching 或 maximum matching，也不承诺任何匹配最优性。
 
 CPU queue 分支仍由 actor 提出，执行器不新增全局 CPU 调度触发机制；每个 UAV 只执行当前已选的一个有效 CPU 队列及其 EDF 队首任务。若实现内部确需在多个有效 CPU 候选之间比较，则使用 $(\operatorname{slack}_{n^{\star}}(t),n^{\star},j)$ 的升序字典序，其中 $n^{\star}$ 是固定任务 ID、$j$ 是计算 UAV ID；这只是把既有 EDF、固定任务 ID 和 UAV ID tie-break 写明，不改变 CPU 队列语义。
 
@@ -1727,7 +1729,7 @@ $$
 (\text{最终执行动作}).
 $$
 
-该映射不得依赖 Python set/dict 的偶然遍历顺序、未声明的列表顺序、随机 tie-break 或实现者自行选择的升降序；完成半双工扫描后才进入上述能量降档顺序。若后续 energy downgrade 使 candidate power 降至 $0$，只执行上述 final canonicalization，不在本槽 backtrack 或 re-arbitrate。
+该映射不得依赖 Python set/dict 的偶然遍历顺序、未声明的列表顺序、随机 tie-break 或实现者自行选择的升降序；完成节点独占无线扫描后才进入上述能量降档顺序。若后续 energy downgrade 使 candidate power 降至 $0$，只执行上述 final canonicalization，不在本槽 backtrack 或 re-arbitrate。
 
 ## 2.13 时隙事件顺序
 
@@ -1773,9 +1775,9 @@ episode-level bookkeeping 在 reset 时初始化为物理上合法的空状态�
 
 1. 先固定 slot $t$ 的 mobility 与 large-scale state（位置、距离、路径损耗、LoS/NLoS 和 shadowing）；随后按固定 $(i,j,r)$ 字典序为全部有向链路/RU 生成 $h_{ij,r}(t)$ 和完整 $\epsilon_{ij,r}^{\mathrm{CSI}}(t)$ tensor，再依据 stale index 和 availability mask 构造 actor 可见的陈旧 CSI 与历史观测。actor 读取 slot-start state、已有任务、四类队列、候选邻居、历史干扰摘要、延迟消息、历史到达率和对应 masks；历史到达率按 2.4 节仅使用 $A_i(0),\ldots,A_i(t-1)$，$t=0$ 使用固定缺省值和无效 mask，且 actor 不读取本步骤生成的当前真实 $h(t)$。
 2. actor 根据槽初局部观测生成七分支动作提案。
-3. 对通信 tx proposal 执行 raw zero-power canonicalization：若 $p_i^{\mathrm{prop}}(t)=0$，该 proposal 作为 communication idle 排除，不进入 half-duplex、资源、能量、干扰或实际 attempt 语义。
+3. 对通信 tx proposal 执行 raw zero-power canonicalization：若 $p_i^{\mathrm{prop}}(t)=0$，该 proposal 作为 communication idle 排除，不进入半双工与节点独占无线仲裁、资源、能量、干扰或实际 attempt 语义。
 4. 对一个未绑定 EDF 任务执行 route 决策；从槽初已有的非空传输队列中执行 tx_select；解析固定资源组、资源宽度和功率动作，形成 $\mathcal S_i^{\mathrm{prop}}(t)$、$p_i^{\mathrm{prop}}(t)$，并选择一个槽初 CPU 队列和 CPU 频率档位。route 只在槽末 binding，不产生本槽下一阶段 service。
-5. 在 $\mathcal S_i^{\mathrm{prop}}(t)$ 形成后，仅由 executor 根据 per-RU historical-quality proxy 及其 valid mask 计算 executor-only scalar $\widehat\Gamma_{ij}^{\mathrm{hist}}(t)$；该 scalar 不回写或修改本槽 actor observation。随后，对剩余合法且非 idle 的通信候选按既有 $\Pi_{ij}^{\mathrm{tx}}(t)$ 升序字典序执行 deterministic executor 和 half-duplex 扫描；该步骤形成暂定接受结果，不改变既有仲裁键、字典序或发送/接收约束。
+5. 在 $\mathcal S_i^{\mathrm{prop}}(t)$ 形成后，仅由 executor 根据 per-RU historical-quality proxy 及其 valid mask 计算 executor-only scalar $\widehat\Gamma_{ij}^{\mathrm{hist}}(t)$；该 scalar 不回写或修改本槽 actor observation。随后，对剩余合法且非 idle 的通信候选按既有 $\Pi_{ij}^{\mathrm{tx}}(t)$ 升序字典序执行 deterministic executor 和节点独占无线扫描；该步骤形成暂定接受结果，不改变既有仲裁键、字典序或端点占用约束。
 6. 对暂定接受通信候选沿既有 $1.0\rightarrow0.5\rightarrow0.25\rightarrow0$ candidate power 顺序进行 power-first energy downgrade；只有通信功率降至 $0$ 且联合能量仍不可行时，才按既有顺序执行 CPU frequency downgrade，并选择最高可行档位。
 7. 若 raw proposal 或 candidate downgrade 的最终执行功率为 $0$，执行 final zero-power canonicalization；本槽不进行 backtracking 或 re-arbitration，不复活前序已拒绝的低优先级 proposal。
 8. 形成最终 $y_{ij}(t)$、$x_{ij,r}(t)$、$\mathcal S_i^{\mathrm{exec}}(t)$、$p_i^{\mathrm{exec}}(t)$ 和 $f_i(t)$；其中 $p_i^{\mathrm{exec}}(t)=0$ 时最终通信变量必须全部为 idle/zero。
@@ -1946,7 +1948,7 @@ r,
 \right).
 $$
 
-联合执行必须满足 2.5--2.13 已定义的任务队列合法性、候选邻居合法性、目的地锁定、route/tx 语义、固定资源组与相邻宽度规则、离散发射功率和 CPU 频率档位、候选及实际能量可行性、每发送端至多一条目的链路、节点独占半双工、每个 CPU 每槽至多服务一个队列，以及任务生命周期和 hard-deadline 结算规则。相应的实际可行集合概括为：
+联合执行必须满足 2.5--2.13 已定义的任务队列合法性、候选邻居合法性、目的地锁定、route/tx 语义、固定资源组与相邻宽度规则、离散发射功率和 CPU 频率档位、候选及实际能量可行性、半双工收发模式与节点独占无线调度、每个 CPU 每槽至多服务一个队列，以及任务生命周期和 hard-deadline 结算规则。相应的实际可行集合概括为：
 
 $$
 \mathcal A_t^{\mathrm{feas}}
@@ -1957,13 +1959,13 @@ $$
 \text{2.5--2.13 中的队列、邻居、目的地锁定与 route/tx 规则成立},\\
 \text{固定资源组、相邻宽度及离散功率/CPU 频率规则成立},\\
 \overline E_i^{\mathrm{act,cand}}(t;\ell^\star)\le E_i^{\mathrm{res}}(t),\ \forall i,\\
-\text{每个发送端至多服务一个目的 UAV，且节点独占半双工约束成立},\\
+\text{半双工收发模式与节点独占无线调度约束成立},\\
 \text{每个 CPU 每槽至多服务一个合法队列，任务生命周期与截止期结算合法}
 \end{array}
 \right\}.
 $$
 
-动作 mask 处理可由局部信息提前识别的非法分支；确定性执行器处理必须在联合动作提案形成后才能判断的资源冲突、半双工冲突和联合能量可行性。原始 actor 提案不必独立满足全部联合约束。由 actor 策略、动作 mask、确定性执行器和既有物理约束共同诱导的闭环硬可行策略集合定义为：
+动作 mask 处理可由局部信息提前识别的非法分支；确定性执行器处理必须在联合动作提案形成后才能判断的资源冲突、半双工与节点独占无线冲突和联合能量可行性。原始 actor 提案不必独立满足全部联合约束。由 actor 策略、动作 mask、确定性执行器和既有物理约束共同诱导的闭环硬可行策略集合定义为：
 
 $$
 \Pi_{\mathrm{hard}}
@@ -2084,7 +2086,7 @@ $E_{\mathrm{tot}}^{\mathrm{act}}$ 是次要物理 KPI，期望方向为越小越
 
 ### 2.14.4 系统级物理优化目标
 
-在满足通信、计算、能量预算、半双工、队列、资源调度及任务截止期等硬约束的条件下，系统首要目标是提高单位时间内按时成功完成的任务数量。因此，唯一的主物理优化问题定义为：
+在满足通信、计算、能量预算、半双工与节点独占无线调度、队列、资源调度及任务截止期等硬约束的条件下，系统首要目标是提高单位时间内按时成功完成的任务数量。因此，唯一的主物理优化问题定义为：
 
 $$
 \mathrm{P}_{\mathrm{phys}}:
@@ -2188,7 +2190,7 @@ truncated 仅是 episode 终止时的删失统计标签，不加入任务物理�
 1. UAV 高度固定，水平移动由外生 Gauss-Markov 过程产生；完整离散位置序列在场景生成阶段通过有限高度建筑排除检查后固定，所有算法使用相同的有效外生轨迹。
 2. 任务输入不可拆分到多个目的 UAV，不允许多跳转发；目的地在 route 决策生效并进入 local 或 tx 队列时锁定。
 3. 传输和 CPU 服务跨时隙持续，槽末入队的任务下一时隙才可服务。
-4. 计算模块与无线模块可以并行，但无线模块满足联合半双工。
+4. 计算模块与无线模块可以并行；无线收发机采用半双工模式，并附加节点独占的一链路 MAC 调度抽象。
 5. 主通信资源由五个固定资源组组成，资源组宽度只取一个或两个相邻组，功率和 CPU 频率只取离散档位。
 6. 建筑物以有限高度三维闭棱柱表示；UAV 的离散服务时隙位置位于建筑实体之外，链路遮挡通过闭线段与建筑物的几何相交判定。
 7. 轻量信道模型仅服务于趋势评价；真实信道用于环境转移，actor 使用陈旧期望链路信道估计、历史干扰摘要、历史干扰链路质量代理量、相应 AoI 和可用性 mask。
@@ -2199,7 +2201,7 @@ truncated 仅是 episode 终止时的删失统计标签，不加入任务物理�
 
 ### 2.15.2 局限性和声明边界
 
-本模型适合研究动态异构、单跳 U2U-MEC、离散资源编排和截止期队列之间的耦合机制，但不应被解释为完整 UAV 通信系统的数字孪生。固定高度和外生移动排除了轨迹控制与飞行动力学影响；建筑排除条件只保证离散服务时隙位置合法，不证明相邻时隙间的连续飞行线段已避开建筑；轻量物理层不提供实测信道或实时射线追踪级别的真实性保证；未建模结果回传、完整协议栈、HARQ、MIMO、RIS、DAG 任务和多跳路由；第三 UAV 软遮挡及高保真传播回放只能作为后续扩展。性能结论必须限定在已实现的环境、参数校准范围、测试场景和统计协议内。
+本模型适合研究动态异构、单跳 U2U-MEC、离散资源编排和截止期队列之间的耦合机制，但不应被解释为完整 UAV 通信系统的数字孪生。主模型不冻结单无线电或单 RF 链架构，也不据此推导节点独占约束。固定高度和外生移动排除了轨迹控制与飞行动力学影响；建筑排除条件只保证离散服务时隙位置合法，不证明相邻时隙间的连续飞行线段已避开建筑；轻量物理层不提供实测信道或实时射线追踪级别的真实性保证；未建模结果回传、完整协议栈、HARQ、MIMO、RIS、DAG 任务和多跳路由；第三 UAV 软遮挡及高保真传播回放只能作为后续扩展。性能结论必须限定在已实现的环境、参数校准范围、测试场景和统计协议内。
 
 本章的公式定义服务接口、约束和评价量，不证明任务完成率的理论最优边界，不证明策略对未测试规模或未测试分布的泛化，也不把经验趋势写成定理。任何数值、曲线、显著性或算法优越性结论都必须留给真实程序运行后的结果章节。
 
@@ -2235,7 +2237,7 @@ outage 口径的计划测试至少包括：
 - 固定槽初状态、联合动作提案和环境状态重复执行两次时，最终 $y_{ij}(t)$、$x_{ij,r}(t)$、$p_i^{\mathrm{exec}}(t)$、CPU 频率和拒绝结果必须完全一致；
 - 具有不同 slack 的候选边按较小 slack 优先，slack 相同则按较大历史链路质量代理量优先，再按发送和接收 UAV ID 升序；
 - slack、历史链路质量代理量和发送 UAV ID 均相同的候选比较时，接收 UAV ID 升序必须给出唯一顺序，且不得调用随机 tie-break；
-- 半双工扫描按固定顺序接受不冲突候选；与已接受边违反既有半双工约束的候选必须被拒绝，并验证拒绝边的 $y_{ij}(t)=0$、空执行资源集、零执行功率和 NA outage；
+- 节点独占无线扫描按固定顺序接受不冲突候选；共享任一端点的候选必须被拒绝，端点不相交的候选允许并发，并验证拒绝边的 $y_{ij}(t)=0$、空执行资源集、零执行功率和 NA outage；若已接受的端点不相交边执行 RU 重叠，则验证其进入相应 SINR 干扰项；
 - 对同一联合动作，候选输入改用 set/dict 或不同未声明列表顺序时，排序后的 executor 输出必须不变；
 - 当前 actor CPU 频率下存在可行 candidate power 时，必须选择最高可行通信档位且 CPU 频率保持不变；
 - 只有通信 candidate power 已降至 $0$ 且联合能量仍不可行时，才允许按既有 CPU 频率档位降档；每次都选择最高可行 CPU 频率；
@@ -2285,7 +2287,7 @@ outage 口径的计划测试至少包括：
 6. reset 后验证 task-ID counter 从 $0$ 开始，并在固定 seed 下按 UAV ID 升序及 generator 稳定顺序分配可复现 ID。
 7. reset 后验证 completed/expired/truncated count、actual attempt count、outage numerator/denominator、energy accumulator 和 latency accumulator/sample list 的初值；无样本 ratio/average 为 $\mathrm{NA}$。
 8. 验证 $\mathrm{actor}(0)$ 前所有 state/history/mask 均为合法数值或明确 $\mathrm{NA}$ 加 mask，且不读取 negative index。
-9. 验证 raw $p_i^{\mathrm{prop}}(t)=0$ 的通信 proposal 不占 half-duplex、执行资源或能量预留，也不产生 interference、$I^{\mathrm{meas}}$ 或 actual attempt。
+9. 验证 raw $p_i^{\mathrm{prop}}(t)=0$ 的通信 proposal 不占用半双工或节点独占无线端点、执行资源或能量预留，也不产生 interference、$I^{\mathrm{meas}}$ 或 actual attempt。
 10. 验证 candidate downgrade 到 $p_i^{\mathrm{exec}}(t)=0$ 后最终满足 $y_{ij}(t)=0$、$x_{ij,r}(t)=0$ 和 $\mathcal S_i^{\mathrm{exec}}(t)=\varnothing$。
 11. 验证 candidate downgrade 到 $0$ 后不 backtrack/re-arbitrate，不复活前序已拒绝 proposal；既有 executor priority key 和最高可行档位顺序保持不变。
 12. 固定槽初状态、联合动作提案和环境输入重复执行时，executor 与 task settlement 的最终输出完全确定，且 zero-power 不产生 outage 样本。
@@ -2345,13 +2347,13 @@ P1-04 计划测试还应覆盖以下物理层可执行性边界（仅新增测�
 | 能量守恒 | $\overline E_i^{\mathrm{act,cand}}(t;\ell^\star)\le E_i^{\mathrm{res}}(t)$；$E_i^{\mathrm{res}}(t+1)=E_i^{\mathrm{res}}(t)-E_i^{\mathrm{act}}(t)$ | src/env/energy.py | candidate 预留硬约束、executed 实际能耗守恒与非负测试，Gate 0 |
 | 实际服务与能耗 | $\tau_{ij}^{\mathrm{tx}}$、$\tau_i^{\mathrm{cpu}}$；提前完成后按实际活跃时间扣除，executed power 的 outage 尝试按整槽计 | src/env/energy.py，src/env/queues.py | 提前完成能耗、executed-power outage 整槽发射尝试、实际能耗不超过 candidate 预留、剩余能量按实际能耗更新，均为计划测试，Gate 0 |
 | 离散能量降档 | $1.0\rightarrow0.5\rightarrow0.25\rightarrow0$ | src/env/energy.py，src/agents/action_mask.py | 档位闭集测试，Gate 0 |
-| 联合半双工 | 同一 UAV 不得同时发送和接收 | src/env/half_duplex_resolver.py | 冲突解析测试，Gate 0 |
+| 联合半双工（半双工 + 节点独占无线调度） | 同一 UAV 不得同时发送和接收，且每个时隙至多关联一条最终接受无线边；端点不相交的边可并发 | src/env/half_duplex_resolver.py | 共享端点冲突、端点不相交并发与 RU 重叠干扰测试，Gate 0 |
 | 信息权限 | actor 只使用 $o_i(t)$，禁止读取真实遮挡、当前真实信道/SINR/干扰、当前联合动作结果、未来位置、真实 $\lambda_i$ 和完整私有队列 | src/agents/observation.py | 信息泄漏、历史量时序、缺省值与 mask、AoI 更新测试，Gate 0 |
 | Gate P 数值可行性检查 | 仿真链路预算、deadline 与能量处于非退化区间；不构成外部传播标定 | configs/ 与 experiments/（待建） | Gate P pilot |
 | Gate 0 环境正确 | 任务、bit、cycle、energy 守恒；route/tx 分离；槽因果正确 | tests/（待建） | Gate 0 |
 
 ### 2.15.4 本章与后续章节的关系
 
-本章是系统对象、符号、状态机、队列、物理层评价、动作接口和信息权限的唯一主源。后续方法章节只能在这些接口上说明策略网络、训练流程、集中训练和分散执行方式，不得重新定义任务状态、route/tx_select 语义、固定资源组、半双工、离散降档或 actor 信息边界。实验协议章节只能使用本章的参数状态、Gate P/Gate 0 和评价口径组织校准、训练、测试、统计与复现，不得通过实验设置改变系统规则。
+本章是系统对象、符号、状态机、队列、物理层评价、动作接口和信息权限的唯一主源。后续方法章节只能在这些接口上说明策略网络、训练流程、集中训练和分散执行方式，不得重新定义任务状态、route/tx_select 语义、固定资源组、半双工与节点独占无线调度、离散降档或 actor 信息边界。实验协议章节只能使用本章的参数状态、Gate P/Gate 0 和评价口径组织校准、训练、测试、统计与复现，不得通过实验设置改变系统规则。
 
-在编码实现前，必须先以不调用学习器的完整 episode 验证任务、bit、cycle 和能量守恒、零非法状态转移、槽边界、outage 统计、离散降档和联合半双工；只有 Gate 0 通过后，才可将本章定义的环境接口连接到后续策略和价值模块。
+在编码实现前，必须先以不调用学习器的完整 episode 验证任务、bit、cycle 和能量守恒、零非法状态转移、槽边界、outage 统计、离散降档和联合半双工规则（半双工 + 节点独占无线调度）；只有 Gate 0 通过后，才可将本章定义的环境接口连接到后续策略和价值模块。
