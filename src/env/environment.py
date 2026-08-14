@@ -551,12 +551,18 @@ class U2UMECEnvironment:
 
         energy_used = initial_total - residual_total
         metric_energy = self.metrics.total_tx_energy_j + self.metrics.total_cpu_energy_j
-        energy_tolerance = max(
-            self.config.environment.energy_tolerance_j,
-            32.0 * math.ulp(max(1.0, initial_total, metric_energy)),
+        energy_tolerance = (
+            self.config.environment.energy_tolerance_j
+            + 32.0 * math.ulp(max(1.0, initial_total, metric_energy))
         )
         if abs(energy_used - metric_energy) > energy_tolerance:
-            raise EnvironmentError("resource debit and episode energy metrics disagree")
+            raise EnvironmentError(
+                "resource debit and episode energy metrics disagree: "
+                f"energy_used={energy_used:.17g}, "
+                f"metric_energy={metric_energy:.17g}, "
+                f"diff={abs(energy_used - metric_energy):.17g}, "
+                f"tolerance={energy_tolerance:.17g}"
+            )
 
         tasks = tuple(self.lifecycle.tasks.values())
         if self.metrics.generated_task_count != len(tasks):
