@@ -33,6 +33,15 @@ class MAPPONetworkError(ValueError):
 
 
 ACTION_BRANCH_ORDER = tuple(BRANCH_ORDER)
+ACTION_BRANCH_DEPENDENCIES: Mapping[str, tuple[str, ...]] = {
+    "route": (),
+    "tx_select": (),
+    "resource_group": ("tx_select",),
+    "resource_width": ("tx_select", "resource_group"),
+    "power_level": ("tx_select", "resource_group", "resource_width"),
+    "cpu_queue": (),
+    "cpu_frequency": ("cpu_queue",),
+}
 _ACTIVE_TASK_STATUSES = ("unbound", "local", "tx", "cpu")
 _QUEUE_KINDS = ("unbound", "local", "tx", "cpu")
 
@@ -1003,6 +1012,63 @@ class CAGATMAPPOActor(nn.Module):
             device=parameter.device if device is None else device,
             dtype=parameter.dtype if dtype is None else dtype,
         )
+
+    def branch_logits(
+        self,
+        branch: str,
+        recurrent_features: Tensor,
+        action_indices: Mapping[str, Tensor],
+    ) -> Tensor:
+        """Return one head's logits under the frozen predecessor dependencies."""
+
+        if branch not in ACTION_BRANCH_DEPENDENCIES:
+            raise MAPPONetworkError(f"unknown action branch {branch!r}")
+        if recurrent_features.ndim != 4:
+            raise MAPPONetworkError(
+                "recurrent_features must be [batch,time,agent,hidden]"
+            )
+        batch, time, agents, hidden = recurrent_features.shape
+        if agents != self.spec.uav_count or hidden != self.spec.gru_hidden_dimension:
+            raise MAPPONetworkError("recurrent_features differ from the actor spec")
+        if (
+            not recurrent_features.is_floating_point()
+            or not torch.isfinite(recurrent_features).all()
+        ):
+            raise MAPPONetworkError("recurrent_features must be finite floating tensors")
+
+        context_parts = [recurrent_features]
+        for dependency in ACTION_BRANCH_DEPENDENCIES[branch]:
+            if dependency not in action_indices:
+                raise MAPPONetworkError(
+                    f"{branch} requires the selected {dependency} indices"
+                )
+            indices = action_indices[dependency]
+            if tuple(indices.shape) != (batch, time, agents) or indices.dtype != torch.long:
+                raise MAPPONetworkError(
+                    f"{dependency} indices must be long [batch,time,agent]"
+                )
+            if indices.device != recurrent_features.device:
+                raise MAPPONetworkError(
+                    f"{dependency} indices and recurrent features must share a device"
+                )
+            dimension = self.spec.action_dimensions[dependency]
+            if torch.any(indices < 0) or torch.any(indices >= dimension):
+                raise MAPPONetworkError(f"{dependency} index lies outside its domain")
+            context_parts.append(self.branch_embeddings[dependency](indices))
+
+        context = (
+            context_parts[0]
+            if len(context_parts) == 1
+            else torch.cat(context_parts, dim=-1)
+        )
+        logits = self.action_heads[branch](context)
+        expected = (batch, time, agents, self.spec.action_dimensions[branch])
+        if tuple(logits.shape) != expected:
+            raise MAPPONetworkError(f"{branch} logits have an invalid shape")
+        if not torch.isfinite(logits).all():
+            raise MAPPONetworkError(f"{branch} logits contain NaN or Inf")
+        return logits
+
     def forward(
         self,
         batch: ActorTensorBatch,
@@ -1070,33 +1136,8 @@ class CAGATMAPPOActor(nn.Module):
             )
         recurrent = torch.stack(outputs, dim=1)
 
-        tx_embedding = self.branch_embeddings["tx_select"](
-            batch.action_indices["tx_select"]
-        )
-        group_embedding = self.branch_embeddings["resource_group"](
-            batch.action_indices["resource_group"]
-        )
-        width_embedding = self.branch_embeddings["resource_width"](
-            batch.action_indices["resource_width"]
-        )
-        cpu_embedding = self.branch_embeddings["cpu_queue"](
-            batch.action_indices["cpu_queue"]
-        )
-        contexts = {
-            "route": recurrent,
-            "tx_select": recurrent,
-            "resource_group": torch.cat([recurrent, tx_embedding], dim=-1),
-            "resource_width": torch.cat(
-                [recurrent, tx_embedding, group_embedding], dim=-1
-            ),
-            "power_level": torch.cat(
-                [recurrent, tx_embedding, group_embedding, width_embedding], dim=-1
-            ),
-            "cpu_queue": recurrent,
-            "cpu_frequency": torch.cat([recurrent, cpu_embedding], dim=-1),
-        }
         logits = {
-            branch: self.action_heads[branch](contexts[branch])
+            branch: self.branch_logits(branch, recurrent, batch.action_indices)
             for branch in ACTION_BRANCH_ORDER
         }
         for branch in ACTION_BRANCH_ORDER:
@@ -1143,6 +1184,7 @@ CentralizedCritic = MAPPOCentralizedCritic
 
 
 __all__ = [
+    "ACTION_BRANCH_DEPENDENCIES",
     "ACTION_BRANCH_ORDER",
     "ActorNetworkOutput",
     "ActorObservationTensorizer",

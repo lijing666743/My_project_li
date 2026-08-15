@@ -1,6 +1,7 @@
 """模型模块。"""
 
 from .ca_gat_mappo import (
+    ACTION_BRANCH_DEPENDENCIES,
     ACTION_BRANCH_ORDER,
     ActorNetworkOutput,
     ActorObservationTensorizer,
@@ -16,12 +17,21 @@ from .ca_gat_mappo import (
     stack_actor_time,
     stack_centralized_time,
 )
+from .ca_gat_mappo_actions import (
+    ActionDistributionError,
+    CAGATMAPPOActionDistribution,
+    SequentialActionDistributionOutput,
+    SequentialActionMaskBatch,
+)
 
 __all__ = [
+    "ACTION_BRANCH_DEPENDENCIES",
     "ACTION_BRANCH_ORDER",
+    "ActionDistributionError",
     "ActorNetworkOutput",
     "ActorObservationTensorizer",
     "ActorTensorBatch",
+    "CAGATMAPPOActionDistribution",
     "CAGATMAPPOActor",
     "CAGATv2Layer",
     "CentralizedCritic",
@@ -30,6 +40,8 @@ __all__ = [
     "MAPPONetworkError",
     "MAPPOCentralizedCritic",
     "MAPPOTensorSpec",
+    "SequentialActionDistributionOutput",
+    "SequentialActionMaskBatch",
     "stack_actor_time",
     "stack_centralized_time",
 ]
