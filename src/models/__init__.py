@@ -23,6 +23,12 @@ from .ca_gat_mappo_actions import (
     SequentialActionDistributionOutput,
     SequentialActionMaskBatch,
 )
+from .ca_gat_mappo_rollout import (
+    CAGATMAPPORolloutBuffer,
+    CAGATMAPPORolloutChunk,
+    CAGATMAPPORolloutTransition,
+    RolloutStorageError,
+)
 
 __all__ = [
     "ACTION_BRANCH_DEPENDENCIES",
@@ -33,6 +39,9 @@ __all__ = [
     "ActorTensorBatch",
     "CAGATMAPPOActionDistribution",
     "CAGATMAPPOActor",
+    "CAGATMAPPORolloutBuffer",
+    "CAGATMAPPORolloutChunk",
+    "CAGATMAPPORolloutTransition",
     "CAGATv2Layer",
     "CentralizedCritic",
     "CentralizedStateTensorBatch",
@@ -40,6 +49,7 @@ __all__ = [
     "MAPPONetworkError",
     "MAPPOCentralizedCritic",
     "MAPPOTensorSpec",
+    "RolloutStorageError",
     "SequentialActionDistributionOutput",
     "SequentialActionMaskBatch",
     "stack_actor_time",
