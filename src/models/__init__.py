@@ -42,6 +42,17 @@ from .ca_gat_mappo_update import (
     build_recurrent_ppo_minibatch,
     compute_configured_batched_ppo_objective_and_loss,
 )
+from .ca_gat_mappo_trainer import (
+    CAGATMAPPOLossDiagnostics,
+    CAGATMAPPOEpisodeDiagnostics,
+    CAGATMAPPORewardDiagnostics,
+    CAGATMAPPOTrainer,
+    CAGATMAPPOTrainerError,
+    CAGATMAPPOTrainingResult,
+    CAGATMAPPOUpdateDiagnostics,
+    ScalarTrainingDiagnostics,
+    build_training_episode_config,
+)
 
 __all__ = [
     "ACTION_BRANCH_DEPENDENCIES",
@@ -55,6 +66,13 @@ __all__ = [
     "CAGATMAPPOActor",
     "CAGATMAPPOOptimizerBundle",
     "CAGATMAPPORecurrentPPOUpdater",
+    "CAGATMAPPOLossDiagnostics",
+    "CAGATMAPPOEpisodeDiagnostics",
+    "CAGATMAPPORewardDiagnostics",
+    "CAGATMAPPOTrainer",
+    "CAGATMAPPOTrainerError",
+    "CAGATMAPPOTrainingResult",
+    "CAGATMAPPOUpdateDiagnostics",
     "CAGATMAPPORolloutBuffer",
     "CAGATMAPPORolloutChunk",
     "CAGATMAPPORolloutTransition",
@@ -73,8 +91,10 @@ __all__ = [
     "RolloutStorageError",
     "SequentialActionDistributionOutput",
     "SequentialActionMaskBatch",
+    "ScalarTrainingDiagnostics",
     "build_ca_gat_mappo_optimizers",
     "build_recurrent_ppo_minibatch",
+    "build_training_episode_config",
     "compute_configured_batched_ppo_objective_and_loss",
     "stack_actor_time",
     "stack_centralized_time",
