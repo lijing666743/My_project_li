@@ -321,6 +321,12 @@ class MAPPOConfig:
     actor_learning_rate: float = 3.0e-4
     critic_learning_rate: float = 3.0e-4
     optimizer: str = "Adam"
+    optimizer_topology: str = "separate_actor_critic"
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.999
+    adam_eps: float = 1.0e-8
+    weight_decay: float = 0.0
+    zero_grad_set_to_none: bool = True
     gamma: float = 0.99
     gae_lambda: float = 0.95
     ppo_clip_epsilon: float = 0.20
@@ -331,10 +337,31 @@ class MAPPOConfig:
     sequence_minibatch_size: int = 8
     update_epochs: int = 4
     gradient_clip_norm: float = 0.5
+    gradient_clip_scope: str = "separate_actor_critic_global_norm"
+    require_full_rollout: bool = True
+    chunk_shuffle: bool = False
+    timestep_shuffle: bool = False
+    allow_incomplete_minibatch: bool = False
+    sequence_padding: bool = False
+    padded_actor_forward: bool = False
+    advantage_normalization: bool = False
+    value_clipping: bool = False
+    target_kl_enabled: bool = False
+    kl_early_stopping: bool = False
+    learning_rate_schedule_enabled: bool = False
+    entropy_coefficient_schedule_enabled: bool = False
+    gradient_accumulation: bool = False
+    mixed_precision: bool = False
     max_training_episodes: int = 1000
     max_training_environment_steps: int = 500000
     evaluation_interval_steps: int = 50000
     checkpoint_interval_steps: int = 50000
+
+    @property
+    def recurrent_chunk_count(self) -> int:
+        """Return the deterministic number of chunks in one full rollout."""
+
+        return self.rollout_length_slots // self.recurrent_chunk_length_slots
 
 
 @dataclass(frozen=True)
@@ -617,6 +644,88 @@ class RunConfig:
             raise ConfigError("action.power_levels must be (0.0, 0.25, 0.5, 1.0)")
         if tuple(self.action.cpu_frequency_levels) != (0.0, 0.25, 0.5, 1.0):
             raise ConfigError("action.cpu_frequency_levels must be (0.0, 0.25, 0.5, 1.0)")
+        mappo = self.training.mappo
+        if mappo.optimizer != "Adam":
+            raise ConfigError("training.mappo.optimizer must be 'Adam'")
+        if mappo.optimizer_topology != "separate_actor_critic":
+            raise ConfigError(
+                "training.mappo.optimizer_topology must be 'separate_actor_critic'"
+            )
+        for name, value in (
+            ("actor_learning_rate", mappo.actor_learning_rate),
+            ("critic_learning_rate", mappo.critic_learning_rate),
+            ("adam_eps", mappo.adam_eps),
+            ("gradient_clip_norm", mappo.gradient_clip_norm),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or value <= 0.0
+            ):
+                raise ConfigError(f"training.mappo.{name} must be finite and positive")
+        for name, value in (
+            ("adam_beta1", mappo.adam_beta1),
+            ("adam_beta2", mappo.adam_beta2),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or not 0.0 < value < 1.0
+            ):
+                raise ConfigError(f"training.mappo.{name} must lie in (0, 1)")
+        if mappo.weight_decay != 0.0:
+            raise ConfigError("training.mappo.weight_decay must remain 0.0")
+        for name, value in (
+            ("rollout_length_slots", mappo.rollout_length_slots),
+            ("recurrent_chunk_length_slots", mappo.recurrent_chunk_length_slots),
+            ("sequence_minibatch_size", mappo.sequence_minibatch_size),
+            ("update_epochs", mappo.update_epochs),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ConfigError(f"training.mappo.{name} must be a positive integer")
+        if mappo.rollout_length_slots % mappo.recurrent_chunk_length_slots != 0:
+            raise ConfigError(
+                "training.mappo.rollout_length_slots must be divisible by "
+                "recurrent_chunk_length_slots"
+            )
+        if mappo.recurrent_chunk_count != mappo.sequence_minibatch_size:
+            raise ConfigError(
+                "one recurrent PPO minibatch must contain every chunk from the rollout"
+            )
+        if not mappo.zero_grad_set_to_none:
+            raise ConfigError("training.mappo.zero_grad_set_to_none must remain true")
+        if mappo.gradient_clip_scope != "separate_actor_critic_global_norm":
+            raise ConfigError(
+                "training.mappo.gradient_clip_scope must be "
+                "'separate_actor_critic_global_norm'"
+            )
+        if not mappo.require_full_rollout:
+            raise ConfigError("training.mappo.require_full_rollout must remain true")
+        disabled_mechanisms = {
+            "chunk_shuffle": mappo.chunk_shuffle,
+            "timestep_shuffle": mappo.timestep_shuffle,
+            "allow_incomplete_minibatch": mappo.allow_incomplete_minibatch,
+            "sequence_padding": mappo.sequence_padding,
+            "padded_actor_forward": mappo.padded_actor_forward,
+            "advantage_normalization": mappo.advantage_normalization,
+            "value_clipping": mappo.value_clipping,
+            "target_kl_enabled": mappo.target_kl_enabled,
+            "kl_early_stopping": mappo.kl_early_stopping,
+            "learning_rate_schedule_enabled": mappo.learning_rate_schedule_enabled,
+            "entropy_coefficient_schedule_enabled": (
+                mappo.entropy_coefficient_schedule_enabled
+            ),
+            "gradient_accumulation": mappo.gradient_accumulation,
+            "mixed_precision": mappo.mixed_precision,
+        }
+        enabled = sorted(name for name, value in disabled_mechanisms.items() if value)
+        if enabled:
+            raise ConfigError(
+                "the frozen MAPPO contract requires these mechanisms to remain disabled: "
+                + ", ".join(enabled)
+            )
         if self.evaluation.update_network:
             raise ConfigError("evaluation.update_network must remain false")
 

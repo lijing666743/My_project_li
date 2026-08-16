@@ -515,6 +515,10 @@ CLI 不得复制 environment backend、registry、runner 或指标逻辑。inter
 | actor learning rate | 3.0e-4 |
 | critic learning rate | 3.0e-4 |
 | optimizer | Adam |
+| optimizer topology | separate `actor_optimizer` and `critic_optimizer` |
+| Adam betas | $(0.9,0.999)$ |
+| Adam epsilon | $1.0\times10^{-8}$ |
+| optimizer weight decay | 0.0 |
 | $\gamma$ | 0.99 |
 | GAE $\lambda$ | 0.95 |
 | PPO clip $\epsilon$ | 0.20 |
@@ -525,6 +529,9 @@ CLI 不得复制 environment backend、registry、runner 或指标逻辑。inter
 | sequence minibatch size | 8 contiguous chunks |
 | PPO update epochs | 4 |
 | gradient clipping | global norm 0.5 |
+| gradient clipping scope | actor and critic parameter sets clipped separately |
+| advantage normalization | False; use raw GAE advantage |
+| value clipping | False |
 | max training episodes | 1000 |
 | max training environment steps | 500000 |
 | budget stop rule | first reached among the two max budgets |
@@ -534,6 +541,59 @@ CLI 不得复制 environment backend、registry、runner 或指标逻辑。inter
 训练使用 Section 3 的 active-branch joint log-prob、active-branch entropy、post-service/post-settlement reward 和 contiguous recurrent minibatch。固定 horizon no-bootstrap contract 必须保持：$t=T-1$、terminated 和 truncated 的 $b_t^{\mathrm{boot}}=0$；不得创建虚构 $s_T$。本文固定 NO BURN-IN；chunk initial hidden 唯一来自 rollout buffer 对应位置保存的 `hidden_in`，不得重新估计或重建。
 
 MAPPO actor 输出 proposal，环境执行器输出 executed action；PPO ratio 只使用 proposal 的 masked categorical log-prob，不使用 executed summary、当前 SINR 或 post-action outcome。
+
+### 4.11.1 Optimizer、backward 与 gradient clipping contract
+
+主方法固定使用两个相互独立的 Adam optimizer：`actor_optimizer` 只持有 actor parameter set，`critic_optimizer` 只持有 critic parameter set；不得建立包含两套参数的联合 optimizer。两者当前 learning rate 均为 $3.0\times10^{-4}$，但继续使用独立的 config 字段。两套 Adam 均显式使用 `betas=(0.9,0.999)`、`eps=1.0e-8` 和 `weight_decay=0.0`，不得依赖 PyTorch 隐式默认值形成实验契约。
+
+每个 recurrent PPO minibatch 的唯一更新顺序为：
+
+1. `actor_optimizer.zero_grad(set_to_none=True)`；
+2. `critic_optimizer.zero_grad(set_to_none=True)`；
+3. 在同一个 training device 上执行 recurrent actor forward 和 centralized critic forward；
+4. 按 Section 3 已冻结公式计算 PPO total loss；
+5. 对该 `total_loss` 执行一次 `backward()`；
+6. 仅对 actor parameter set 计算并执行 global grad-norm clipping，阈值为 0.5；
+7. 仅对 critic parameter set 独立计算并执行 global grad-norm clipping，阈值为 0.5；
+8. 执行 `actor_optimizer.step()`；
+9. 执行 `critic_optimizer.step()`。
+
+actor 和 critic 的 grad norm 必须分别计算；不得把两套参数拼成一个联合 global norm，也不得使用 value clipping 代替 gradient clipping。
+
+### 4.11.2 Full-rollout chunk 与 minibatch contract
+
+主实验的 update API 只接受已经 finalized 且恰含 256 个真实 transition 的完整 rollout。长度不是 256 时必须 fail fast；不得静默 drop、padding 或补齐。Trainer 最终停止时如何处理 partial rollout 留给后续 Trainer Gate 单独冻结，本节不作隐式决定。
+
+每个完整 rollout 按存储时间顺序确定性切分为八个互不重叠的连续 chunk：
+
+```text
+chunk 0: [0, 31]
+chunk 1: [32, 63]
+chunk 2: [64, 95]
+chunk 3: [96, 127]
+chunk 4: [128, 159]
+chunk 5: [160, 191]
+chunk 6: [192, 223]
+chunk 7: [224, 255]
+```
+
+每个 PPO update epoch 将全部八个 32-slot chunk 一次性组成唯一一个 recurrent minibatch。因此主实验固定为 **NO SHUFFLE**：不执行 chunk shuffle，也不执行 timestep shuffle；不存在 incomplete minibatch。固定 256/32/8 结构也使主实验采用 **NO PADDING**，不实现 chunk padding、sequence padding 或 padded actor forward。每个 epoch 仍按真实时间顺序对每个 chunk 前向计算，chunk initial hidden 唯一取对应 `hidden_in[t_start]`，并保持 **NO BURN-IN**。
+
+一个 32-slot chunk 内允许存在 episode boundary。boundary 前后位置都是真实有效 PPO sample，不得因 recurrent dependency 被截断而从 loss 中删除。boundary 只负责在 GRU forward 中截断前一 episode 的 recurrent dependency；边界后的新 episode 使用 buffer 已保存的 zero `hidden_in`。
+
+### 4.11.3 Advantage、额外机制与 device contract
+
+主实验固定 `advantage_normalization=False`，直接使用当前 raw GAE advantage；不得 mean-center、std-normalize 或 whiten。value objective 继续严格使用
+
+$$
+\frac{1}{2}\operatorname{mean}\left[(V-\widehat R)^2\right],
+$$
+
+且 `value_clipping=False`。当前主实验明确不使用 target KL、KL early stopping、learning-rate schedule、entropy-coefficient schedule、optimizer weight decay、gradient accumulation 或 AMP/mixed precision；实现不得把这些机制作为隐藏默认值加入。
+
+Rollout snapshot 继续保存为 detached CPU tensors。update 侧要求 actor 与 critic 已位于同一个 training device，并从模型参数确定目标 device；每个完整 recurrent minibatch 在 update 前同步传输到该 device，不使用 pinned memory 或 non-blocking transfer。两套 optimizer state 分别与对应模型参数位于同一 device。CPU 或 CUDA 的最终选择属于后续 Trainer/CLI runtime setting；update 模块不得自行执行 CUDA auto fallback、device guessing 或 silent CPU fallback。
+
+由于每个 rollout 恰有八个 chunk、每个 epoch 使用全部八个 chunk 且没有 shuffle，Recurrent PPO minibatch/update 本身不新增随机采样过程，也不得新增 optimizer/minibatch shuffle RNG stream。环境随机流与现有 policy sampling stream 的 ownership 保持第 4.5.1 节定义不变。
 
 ## 4.12 Factorized-Action GAT-QMIX numerical training contract
 
