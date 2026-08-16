@@ -27,6 +27,7 @@ from typing import Any, Mapping, Sequence, TypeVar, get_args, get_origin, get_ty
 
 CONFIG_VERSION = "section4.v1"
 DEFAULT_SEED = 42
+MAPPO_INITIAL_POLICY_VERSION = 0
 SUPPORTED_MODES = (
     "environment_sanity",
     "gate0",
@@ -352,6 +353,10 @@ class MAPPOConfig:
     entropy_coefficient_schedule_enabled: bool = False
     gradient_accumulation: bool = False
     mixed_precision: bool = False
+    training_device: str = "cuda"
+    carry_hidden_across_update_boundary: bool = True
+    policy_sampling_reset_each_episode: bool = False
+    discard_final_partial_rollout: bool = True
     max_training_episodes: int = 1000
     max_training_environment_steps: int = 500000
     evaluation_interval_steps: int = 50000
@@ -362,6 +367,12 @@ class MAPPOConfig:
         """Return the deterministic number of chunks in one full rollout."""
 
         return self.rollout_length_slots // self.recurrent_chunk_length_slots
+
+    @property
+    def max_environment_transitions(self) -> int:
+        """Expose the canonical environment-step budget without duplicating it."""
+
+        return self.max_training_environment_steps
 
 
 @dataclass(frozen=True)
@@ -390,6 +401,16 @@ class TrainingConfig:
     mappo: MAPPOConfig = field(default_factory=MAPPOConfig)
     qmix: QMIXConfig = field(default_factory=QMIXConfig)
     formal_rl_enabled: bool = False
+
+
+@dataclass(frozen=True)
+class MAPPOTrainingAccounting:
+    """Pure accounting geometry for the frozen finite training budget."""
+
+    collected_environment_transitions: int
+    optimized_transitions: int
+    unused_final_tail_transitions: int
+    ppo_update_count: int
 
 
 @dataclass(frozen=True)
@@ -703,6 +724,33 @@ class RunConfig:
             )
         if not mappo.require_full_rollout:
             raise ConfigError("training.mappo.require_full_rollout must remain true")
+        if mappo.training_device not in {"cpu", "cuda"}:
+            raise ConfigError("training.mappo.training_device must be 'cpu' or 'cuda'")
+        frozen_lifecycle_flags = {
+            "carry_hidden_across_update_boundary": (
+                mappo.carry_hidden_across_update_boundary,
+                True,
+            ),
+            "policy_sampling_reset_each_episode": (
+                mappo.policy_sampling_reset_each_episode,
+                False,
+            ),
+            "discard_final_partial_rollout": (
+                mappo.discard_final_partial_rollout,
+                True,
+            ),
+        }
+        for name, (actual, expected) in frozen_lifecycle_flags.items():
+            if actual is not expected:
+                raise ConfigError(f"training.mappo.{name} must remain {expected}")
+        for name, value in (
+            ("max_training_episodes", mappo.max_training_episodes),
+            ("max_training_environment_steps", mappo.max_training_environment_steps),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ConfigError(f"training.mappo.{name} must be a positive integer")
+        if not isinstance(self.training.formal_rl_enabled, bool):
+            raise ConfigError("training.formal_rl_enabled must be boolean")
         disabled_mechanisms = {
             "chunk_shuffle": mappo.chunk_shuffle,
             "timestep_shuffle": mappo.timestep_shuffle,
@@ -728,6 +776,57 @@ class RunConfig:
             )
         if self.evaluation.update_network:
             raise ConfigError("evaluation.update_network must remain false")
+
+
+def compute_mappo_training_accounting(config: RunConfig) -> MAPPOTrainingAccounting:
+    """Compute collection and optimization counts without running an environment."""
+
+    if not isinstance(config, RunConfig):
+        raise TypeError("config must be a RunConfig")
+    config.validate()
+    mappo = config.training.mappo
+    episode_budget = mappo.max_training_episodes * config.environment.episode_horizon
+    collected = min(episode_budget, mappo.max_environment_transitions)
+    update_count, unused_tail = divmod(collected, mappo.rollout_length_slots)
+    optimized = update_count * mappo.rollout_length_slots
+    return MAPPOTrainingAccounting(
+        collected_environment_transitions=collected,
+        optimized_transitions=optimized,
+        unused_final_tail_transitions=unused_tail,
+        ppo_update_count=update_count,
+    )
+
+
+def validate_mappo_training_device(
+    config: RunConfig,
+    *,
+    cuda_available: bool,
+) -> str:
+    """Validate the explicit runtime device without selecting a fallback."""
+
+    if not isinstance(config, RunConfig):
+        raise TypeError("config must be a RunConfig")
+    if not isinstance(cuda_available, bool):
+        raise TypeError("cuda_available must be boolean")
+    config.validate()
+    device = config.training.mappo.training_device
+    if device == "cuda" and not cuda_available:
+        raise ConfigError(
+            "training_device='cuda' requires CUDA; silent CPU fallback is forbidden"
+        )
+    return device
+
+
+def require_formal_rl_enabled(config: RunConfig) -> None:
+    """Fail before real training work when the explicit execution gate is closed."""
+
+    if not isinstance(config, RunConfig):
+        raise TypeError("config must be a RunConfig")
+    config.validate()
+    if not config.training.formal_rl_enabled:
+        raise ConfigError(
+            "formal RL training is disabled before environment reset, collection, or update"
+        )
 
 
 SCENARIO_DEFAULTS: dict[str, dict[str, Any]] = {
@@ -1163,6 +1262,8 @@ __all__ = [
     "EnvironmentConfig",
     "EvaluationConfig",
     "MAPPOConfig",
+    "MAPPOTrainingAccounting",
+    "MAPPO_INITIAL_POLICY_VERSION",
     "OutputConfig",
     "QMIXConfig",
     "RunConfig",
@@ -1170,6 +1271,9 @@ __all__ = [
     "SUPPORTED_MODES",
     "SUPPORTED_SCENARIOS",
     "TrainingConfig",
+    "compute_mappo_training_accounting",
+    "require_formal_rl_enabled",
+    "validate_mappo_training_device",
     "load_run_config",
     "write_config_snapshot",
 ]

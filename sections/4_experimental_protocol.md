@@ -562,7 +562,7 @@ actor 和 critic 的 grad norm 必须分别计算；不得把两套参数拼成�
 
 ### 4.11.2 Full-rollout chunk 与 minibatch contract
 
-主实验的 update API 只接受已经 finalized 且恰含 256 个真实 transition 的完整 rollout。长度不是 256 时必须 fail fast；不得静默 drop、padding 或补齐。Trainer 最终停止时如何处理 partial rollout 留给后续 Trainer Gate 单独冻结，本节不作隐式决定。
+主实验的 update API 只接受已经 finalized 且恰含 256 个真实 transition 的完整 rollout。长度不是 256 时必须 fail fast；不得静默 drop、padding 或补齐。Trainer 最终停止时的 partial rollout 按第 4.11.4 节唯一处理，不得隐式决定。
 
 每个完整 rollout 按存储时间顺序确定性切分为八个互不重叠的连续 chunk：
 
@@ -591,9 +591,54 @@ $$
 
 且 `value_clipping=False`。当前主实验明确不使用 target KL、KL early stopping、learning-rate schedule、entropy-coefficient schedule、optimizer weight decay、gradient accumulation 或 AMP/mixed precision；实现不得把这些机制作为隐藏默认值加入。
 
-Rollout snapshot 继续保存为 detached CPU tensors。update 侧要求 actor 与 critic 已位于同一个 training device，并从模型参数确定目标 device；每个完整 recurrent minibatch 在 update 前同步传输到该 device，不使用 pinned memory 或 non-blocking transfer。两套 optimizer state 分别与对应模型参数位于同一 device。CPU 或 CUDA 的最终选择属于后续 Trainer/CLI runtime setting；update 模块不得自行执行 CUDA auto fallback、device guessing 或 silent CPU fallback。
+Rollout snapshot 继续保存为 detached CPU tensors。update 侧要求 actor 与 critic 已位于同一个 training device，并从模型参数确定目标 device；每个完整 recurrent minibatch 在 update 前同步传输到该 device，不使用 pinned memory 或 non-blocking transfer。两套 optimizer state 分别与对应模型参数位于同一 device。CPU 或 CUDA 的 runtime 选择按第 4.11.4 节执行；update 模块不得自行执行 CUDA auto fallback、device guessing 或 silent CPU fallback。
 
 由于每个 rollout 恰有八个 chunk、每个 epoch 使用全部八个 chunk 且没有 shuffle，Recurrent PPO minibatch/update 本身不新增随机采样过程，也不得新增 optimizer/minibatch shuffle RNG stream。环境随机流与现有 policy sampling stream 的 ownership 保持第 4.5.1 节定义不变。
+
+### 4.11.4 Trainer / Rollout Lifecycle Contract
+
+本节冻结后续 production Trainer 必须遵守的生命周期；本节本身不实现 Trainer、rollout collector、checkpoint、RL CLI、smoke training、formal training 或 evaluation。
+
+**Episode boundary 与 rollout boundary。** 环境 episode 固定为 500 个真实 service slot，PPO rollout 固定为 256 个真实 transition，即 `500 != 256`。两种 boundary 严格独立：rollout 可以在 episode 中间结束并触发 PPO update，也可以跨越真实 episode boundary；rollout boundary 不得伪造 `terminated` 或 `truncated`。从空 buffer 开始的前两个 rollout 几何唯一为：
+
+```text
+rollout 0 = episode0[0:256]
+rollout 1 = episode0[256:500] + episode1[0:12]
+```
+
+因此 rollout 0 收集 episode 0 的 slot 0 至 255；完成其 PPO update 后，同一 episode 继续收集 slot 256 至 499。随后执行完整 environment reset，episode 1 从 slot 0 和 zero GRU hidden 开始，slot 0 至 11 与前述 244 条 transition 共同组成 rollout 1。episode boundary 后 buffer 继续累计，并正确保存 `episode_start`、`terminated`、`truncated` 和 boundary flags；GAE 不跨 boundary 递归，boundary transition 固定 no-bootstrap。
+
+**Mid-episode post-update hidden。** 唯一规则为 `CARRY COLLECTOR HIDDEN`。若 PPO update boundary 位于 episode 中间，update 前最后一次 collection actor forward 产生的 `hidden_out` 作为下一真实 slot 的 detached numerical recurrent state 保存；PPO update 不修改该保存值。update 成功后使用更新后的 actor 参数、保存的 collector hidden 和下一真实 slot observation 继续 forward。不得重算历史 hidden、不得 burn-in、不得因 PPO update 清零 hidden；只有真实 episode boundary 才将 hidden reset 为全零。换言之，`policy-update boundary IS NOT recurrent-reset boundary`，且下一 rollout 首条 transition 的 `hidden_in` 必须等于 collection 时实际使用的保存值。机器可读配置固定 `carry_hidden_across_update_boundary=True`。
+
+**Policy sampling RNG。** `torch_policy_sampling` stream 110 在一个完整 training run 开始时只初始化一次。它跨 PPO rollout boundary、PPO update 和 episode reset 连续使用同一个 generator state；每个 episode 禁止调用 `reset_sampling_generators()`、重新 seed 或为同一 run 重建 policy generator。只有全新 training run 才依据 training master seed 初始化该 stream。机器可读配置固定 `policy_sampling_reset_each_episode=False`。该规则不消费也不改变 environment streams 10/20/30/40/50/60。
+
+**Training episode environment seed。** 对 training master seed $s$ 和从 0 开始的 episode index $e$，唯一派生规则为：
+
+```text
+episode_seed(e) = int(SeedSequence([s, e]).generate_state(1, dtype=uint64)[0])
+```
+
+同一 $s$ 必须产生可复现的完整 episode-seed sequence，不同 $e$ 必须得到不同 seed。派生过程不得使用 Python `hash()`、wall-clock time、全局 NumPy RNG 或 policy stream 110。每个 training episode 的 environment instance/reset 使用对应 `episode_seed(e)`，随后环境内部仍按 `[episode_seed(e), environment_stream_id]` 派生既有 streams；stream IDs 10/20/30/40/50/60 不变。actor、critic 和 policy sampling distribution 仍归属 training master seed，不能用 episode seed 重新初始化。当前 environment API 不增加 reset 参数；后续 Trainer 的最小适配是为每个 episode 构造只覆盖 environment seed 的 episode-local `RunConfig`/environment instance，同时保留 master config 作为 training run 与 policy RNG 的唯一来源。
+
+上述 training-only 派生不得改变 local-only、random 或 heuristic baseline 的现有 seed contract，也不得改变 evaluation seed 集合 `{1042,1043,1044,1045,1046}`、train seed 集合 `{42,43,44,45,46}` 或同 seed 下跨方法共享 environment realization 的公平性语义。
+
+**On-policy policy-version barrier。** Trainer 的 `policy_version` 从 0 开始。一个 256-transition rollout 的所有 transition 必须由同一 actor parameter version 和同一 critic parameter version 收集。collection 开始后，必须依次完成 transition 255、合法 rollout-tail `bootstrap_value` snapshot 和 buffer finalize，之后才允许任何 `optimizer.step()`。`old_joint_log_prob`、`old_value` 和 `bootstrap_value` 均来自该 rollout 的 collection-time version。一次 PPO update 全部成功后执行一次 `policy_version += 1`；失败或未完成的 update 不得增加 version，下一 rollout 使用新 version。version 只属于 Trainer/buffer metadata 与审计，不进入 actor observation，也不影响物理环境。
+
+**Final partial rollout 与 accounting。** 正式停止条件仍为 `max_training_episodes=1000` 与 `max_training_environment_steps=500000` 中先达到者。当前 500-slot episode 下二者在第 1000 个 episode 末同时达到，并且：
+
+```text
+500000 = 1953 * 256 + 32
+collected_environment_transitions = 500000
+optimized_transitions = 499968
+unused_final_tail_transitions = 32
+ppo_update_count = 1953
+```
+
+最后 32 条 transition 的唯一规则为 `DISCARD FROM OPTIMIZATION ONLY`：完整执行第 1000 个 episode 到真实 horizon，将这些 transition 计入 runtime/training accounting，然后显式 clear/discard optimizer-unused tail。该 tail 不 finalize 为 PPO rollout、不计算 partial GAE/PPO update、不 padding、不复制、不补采超过 500000 的 transition，也不得提前结束第 1000 个 episode。它们是已采集训练轨迹，只是未进入 optimization。机器可读配置固定 `discard_final_partial_rollout=True`。
+
+**Runtime training device。** 唯一配置字段为 `training.mappo.training_device`，允许值只有 `cpu` 和 `cuda`，禁止 `auto`。CA-GAT-MAPPO formal/main 配置固定 `training_device="cuda"`；启动前若 CUDA 不可用必须 fail fast，禁止 silent CPU fallback。显式 test-only `training_device="cpu"` 使用 CPU。actor 与 critic 必须显式移动到同一 device；rollout snapshot 仍在 CPU，update 沿用同步 CPU-to-model-device transfer。继续禁止 AMP、mixed precision、pinned memory 和 non-blocking transfer。
+
+**Execution gate 与 reward。** `training.formal_rl_enabled` 是真实 environment-driven RL training gate，当前默认保持 `formal_rl_enabled=False`。未来 Trainer 必须在 environment reset、environment step、rollout collection 或 optimizer update 任一动作发生前检查该 gate；关闭时立即 fail fast，不得先执行部分训练。Smoke Training Gate 只能通过 test-only/explicit config 开启。Trainer reward 的唯一来源是 `StepResult.reward`，不得重算；`StepResult.info["reward"]` 仅用于记录 total reward、`completion_component`、`expiration_penalty`、`workload_penalty`、`energy_penalty` 和已有 normalized terms，不新增公式或调整权重。
 
 ## 4.12 Factorized-Action GAT-QMIX numerical training contract
 
