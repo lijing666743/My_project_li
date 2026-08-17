@@ -28,6 +28,131 @@ from typing import Any, Mapping, Sequence, TypeVar, get_args, get_origin, get_ty
 CONFIG_VERSION = "section4.v1"
 DEFAULT_SEED = 42
 MAPPO_INITIAL_POLICY_VERSION = 0
+CHECKPOINT_SCHEMA_VERSION = 1
+CHECKPOINT_KIND_PERIODIC_RESUME = "PERIODIC_RESUME"
+CHECKPOINT_KIND_FINAL_COMPLETED = "FINAL_COMPLETED"
+CHECKPOINT_V1_RESUME_BOUNDARY = "EPISODE_BOUNDARY"
+CHECKPOINT_V1_EXACTNESS = "SAME_RUNTIME_STATE_EXACT"
+CHECKPOINT_V1_KINDS = (
+    CHECKPOINT_KIND_PERIODIC_RESUME,
+    CHECKPOINT_KIND_FINAL_COMPLETED,
+)
+CHECKPOINT_V1_TOP_LEVEL_FIELDS = (
+    "schema_version",
+    "checkpoint_kind",
+    "method_id",
+    "git_commit",
+    "config_hash",
+    "config_snapshot",
+    "runtime_provenance",
+    "training_state",
+    "model_state",
+    "optimizer_state",
+    "policy_rng_state",
+    "active_rollout_state",
+    "diagnostics_state",
+)
+CHECKPOINT_V1_RUNTIME_PROVENANCE_FIELDS = (
+    "python_version",
+    "torch_version",
+    "cuda_runtime_version",
+    "device_type",
+    "device_name",
+    "dtype",
+)
+CHECKPOINT_V1_TRAINING_STATE_FIELDS = (
+    "policy_version",
+    "started_episodes",
+    "completed_episodes",
+    "next_episode_index",
+    "collected_environment_transitions",
+    "optimized_transitions",
+    "ppo_update_count",
+    "unused_final_tail_transitions",
+    "training_complete",
+    "active_rollout_length",
+    "active_rollout_policy_version",
+)
+CHECKPOINT_V1_MODEL_STATE_FIELDS = ("actor", "critic")
+CHECKPOINT_V1_OPTIMIZER_STATE_FIELDS = ("actor_adam", "critic_adam")
+CHECKPOINT_V1_POLICY_RNG_STATE_FIELDS = (
+    "generator_state",
+    "device_type",
+)
+CHECKPOINT_V1_ACTIVE_ROLLOUT_FIELDS = (
+    "rollout_length",
+    "rollout_policy_version",
+    "ordered_transitions",
+)
+CHECKPOINT_V1_TRANSITION_FIELDS = (
+    "slot",
+    "episode_start",
+    "self_features",
+    "neighbor_public_features",
+    "edge_features",
+    "neighbor_mask",
+    "action_mask_contracts",
+    "branch_masks",
+    "proposal_actions",
+    "action_indices",
+    "active_branch_indicators",
+    "old_branch_log_probs",
+    "old_joint_log_prob",
+    "hidden_in",
+    "centralized_state",
+    "old_value",
+    "reward",
+    "terminated",
+    "truncated",
+    "episode_boundary",
+    "bootstrap_allowed",
+    "bootstrap_value",
+    "executed_action_summary",
+    "rejection_or_downgrade_summary",
+)
+CHECKPOINT_V1_DIAGNOSTICS_STATE_FIELDS = (
+    "reward_accumulators",
+    "episode_history",
+    "ppo_update_history",
+)
+CHECKPOINT_V1_ALLOWED_PAYLOAD_VALUE_KINDS = (
+    "python_scalar",
+    "string",
+    "bool",
+    "list",
+    "tuple",
+    "dict",
+    "detached_cpu_tensor",
+)
+CHECKPOINT_V1_SAFE_BOUNDARY_ORDER = (
+    "terminal_environment_step_complete",
+    "terminal_settlement_and_reward_complete",
+    "terminal_transition_appended",
+    "episode_accounting_updated",
+    "due_full_rollout_ppo_update_completed",
+    "training_stop_checked",
+    "periodic_checkpoint_due_checked",
+    "periodic_resume_snapshot_saved",
+    "next_episode_reset",
+)
+EVALUATION_SNAPSHOT_V1_REQUIRED_FIELDS = (
+    "snapshot_schema_version",
+    "snapshot_kind",
+    "method_id",
+    "config_hash",
+    "provenance",
+    "actor_architecture_config",
+    "action_domain_config",
+    "actor_state",
+)
+EVALUATION_SNAPSHOT_V1_EXCLUDED_FIELDS = (
+    "critic_state",
+    "optimizer_state",
+    "policy_rng_state",
+    "active_rollout_state",
+    "training_state",
+    "diagnostics_state",
+)
 SUPPORTED_MODES = (
     "environment_sanity",
     "gate0",
@@ -361,6 +486,7 @@ class MAPPOConfig:
     max_training_environment_steps: int = 500000
     evaluation_interval_steps: int = 50000
     checkpoint_interval_steps: int = 50000
+    checkpoint_schema_version: int = CHECKPOINT_SCHEMA_VERSION
 
     @property
     def recurrent_chunk_count(self) -> int:
@@ -519,6 +645,7 @@ class RunConfig:
         """Return contract paths without creating files or directories."""
 
         run_dir = Path(self.output.logs_dir) / self.run_id
+        checkpoint_directory = run_dir / "checkpoints"
         return {
             "config_snapshot": str(run_dir / self.output.snapshot_filename),
             "raw_metrics": str(run_dir / self.output.raw_metrics_filename),
@@ -526,6 +653,8 @@ class RunConfig:
             "dashboard_csv": str(Path(self.output.dashboard_logs_dir) / f"{self.run_id}_metrics.csv"),
             "figure_input": str(Path(self.output.plots_dir) / f"{self.run_id}_figure_input.csv"),
             "dashboard_png": str(Path(self.output.plots_dir) / f"{self.run_id}_dashboard.png"),
+            "checkpoint_directory": str(checkpoint_directory),
+            "final_checkpoint": str(checkpoint_directory / "final.pt"),
         }
 
     def validate(self) -> None:
@@ -726,6 +855,35 @@ class RunConfig:
             raise ConfigError("training.mappo.require_full_rollout must remain true")
         if mappo.training_device not in {"cpu", "cuda"}:
             raise ConfigError("training.mappo.training_device must be 'cpu' or 'cuda'")
+        if (
+            isinstance(mappo.checkpoint_schema_version, bool)
+            or not isinstance(mappo.checkpoint_schema_version, int)
+            or mappo.checkpoint_schema_version != CHECKPOINT_SCHEMA_VERSION
+        ):
+            raise ConfigError(
+                "training.mappo.checkpoint_schema_version must remain "
+                f"{CHECKPOINT_SCHEMA_VERSION}"
+            )
+        checkpoint_interval = mappo.checkpoint_interval_steps
+        if (
+            isinstance(checkpoint_interval, bool)
+            or not isinstance(checkpoint_interval, int)
+            or checkpoint_interval <= 0
+        ):
+            raise ConfigError(
+                "training.mappo.checkpoint_interval_steps must be a positive integer"
+            )
+        if self.mode == "rl" and self.method_id == "ca_gat_mappo":
+            if checkpoint_interval % env.episode_horizon != 0:
+                raise ConfigError(
+                    "CA-GAT-MAPPO Checkpoint V1 requires checkpoint_interval_steps "
+                    "to be divisible by environment.episode_horizon"
+                )
+            if checkpoint_interval >= mappo.max_environment_transitions:
+                raise ConfigError(
+                    "CA-GAT-MAPPO Checkpoint V1 requires checkpoint_interval_steps "
+                    "to be less than max_training_environment_steps"
+                )
         frozen_lifecycle_flags = {
             "carry_hidden_across_update_boundary": (
                 mappo.carry_hidden_across_update_boundary,
@@ -795,6 +953,140 @@ def compute_mappo_training_accounting(config: RunConfig) -> MAPPOTrainingAccount
         unused_final_tail_transitions=unused_tail,
         ppo_update_count=update_count,
     )
+
+
+def validate_mappo_checkpoint_contract(config: RunConfig) -> None:
+    """Validate the pure Checkpoint V1 geometry without reading or writing files."""
+
+    if not isinstance(config, RunConfig):
+        raise TypeError("config must be a RunConfig")
+    config.validate()
+    mappo = config.training.mappo
+    interval = mappo.checkpoint_interval_steps
+    if interval % config.environment.episode_horizon != 0:
+        raise ConfigError(
+            "Checkpoint V1 periodic interval must be episode-boundary aligned"
+        )
+    if interval >= mappo.max_environment_transitions:
+        raise ConfigError(
+            "Checkpoint V1 periodic interval must be less than the training budget"
+        )
+
+
+def compute_mappo_periodic_checkpoint_steps(config: RunConfig) -> tuple[int, ...]:
+    """Return all immutable periodic-resume boundaries before final completion."""
+
+    validate_mappo_checkpoint_contract(config)
+    mappo = config.training.mappo
+    return tuple(
+        range(
+            mappo.checkpoint_interval_steps,
+            mappo.max_environment_transitions,
+            mappo.checkpoint_interval_steps,
+        )
+    )
+
+
+def mappo_checkpoint_kind_at(
+    config: RunConfig,
+    collected_environment_transitions: int,
+) -> str | None:
+    """Classify one collection count as periodic, final, or not a checkpoint."""
+
+    validate_mappo_checkpoint_contract(config)
+    if (
+        isinstance(collected_environment_transitions, bool)
+        or not isinstance(collected_environment_transitions, int)
+        or collected_environment_transitions < 0
+        or collected_environment_transitions
+        > config.training.mappo.max_environment_transitions
+    ):
+        raise ConfigError(
+            "collected_environment_transitions must lie within the training budget"
+        )
+    mappo = config.training.mappo
+    if collected_environment_transitions == mappo.max_environment_transitions:
+        return CHECKPOINT_KIND_FINAL_COMPLETED
+    if (
+        collected_environment_transitions > 0
+        and collected_environment_transitions % mappo.checkpoint_interval_steps == 0
+    ):
+        return CHECKPOINT_KIND_PERIODIC_RESUME
+    return None
+
+
+def compute_mappo_checkpoint_active_rollout_length(
+    config: RunConfig,
+    collected_environment_transitions: int,
+) -> int:
+    """Return the saved active-rollout length at a valid Checkpoint V1 boundary."""
+
+    kind = mappo_checkpoint_kind_at(config, collected_environment_transitions)
+    if kind is None:
+        raise ConfigError("transition count is not a Checkpoint V1 boundary")
+    if kind == CHECKPOINT_KIND_FINAL_COMPLETED:
+        return 0
+    return (
+        collected_environment_transitions
+        % config.training.mappo.rollout_length_slots
+    )
+
+
+def mappo_periodic_checkpoint_path(
+    config: RunConfig,
+    collected_environment_transitions: int,
+) -> str:
+    """Return one periodic path without creating or inspecting filesystem state."""
+
+    kind = mappo_checkpoint_kind_at(config, collected_environment_transitions)
+    if kind != CHECKPOINT_KIND_PERIODIC_RESUME:
+        raise ConfigError("periodic checkpoint paths require PERIODIC_RESUME boundaries")
+    directory = Path(config.artifact_paths()["checkpoint_directory"])
+    return str(directory / f"step_{collected_environment_transitions}.pt")
+
+
+def mappo_final_checkpoint_path(config: RunConfig) -> str:
+    """Return the canonical final path without creating or inspecting it."""
+
+    validate_mappo_checkpoint_contract(config)
+    return config.artifact_paths()["final_checkpoint"]
+
+
+def validate_mappo_checkpoint_resume_compatibility(
+    config: RunConfig,
+    *,
+    schema_version: int,
+    checkpoint_kind: str,
+    method_id: str,
+    git_commit: str,
+    config_hash: str,
+    training_device: str,
+    cuda_available: bool,
+) -> None:
+    """Apply the fail-fast V1 metadata checks without loading checkpoint bytes."""
+
+    validate_mappo_checkpoint_contract(config)
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != CHECKPOINT_SCHEMA_VERSION
+    ):
+        raise ConfigError("checkpoint schema version mismatch")
+    if checkpoint_kind == CHECKPOINT_KIND_FINAL_COMPLETED:
+        raise ConfigError("training already complete")
+    if checkpoint_kind != CHECKPOINT_KIND_PERIODIC_RESUME:
+        raise ConfigError("checkpoint kind is not resumable")
+    if config.mode != "rl":
+        raise ConfigError("checkpoint resume requires mode='rl'")
+    if config.method_id != "ca_gat_mappo" or method_id != config.method_id:
+        raise ConfigError("checkpoint method_id mismatch")
+    if git_commit != config.git_commit:
+        raise ConfigError("checkpoint git_commit mismatch")
+    if config_hash != config.config_hash:
+        raise ConfigError("checkpoint canonical config_hash mismatch")
+    if training_device != config.training.mappo.training_device:
+        raise ConfigError("checkpoint training device mismatch")
+    validate_mappo_training_device(config, cuda_available=cuda_available)
 
 
 def validate_mappo_training_device(
@@ -1257,9 +1549,28 @@ def _jsonable(value: Any, *, exclude: set[str] | None = None) -> Any:
 
 __all__ = [
     "ActionConfig",
+    "CHECKPOINT_KIND_FINAL_COMPLETED",
+    "CHECKPOINT_KIND_PERIODIC_RESUME",
+    "CHECKPOINT_SCHEMA_VERSION",
+    "CHECKPOINT_V1_ACTIVE_ROLLOUT_FIELDS",
+    "CHECKPOINT_V1_ALLOWED_PAYLOAD_VALUE_KINDS",
+    "CHECKPOINT_V1_DIAGNOSTICS_STATE_FIELDS",
+    "CHECKPOINT_V1_EXACTNESS",
+    "CHECKPOINT_V1_KINDS",
+    "CHECKPOINT_V1_MODEL_STATE_FIELDS",
+    "CHECKPOINT_V1_OPTIMIZER_STATE_FIELDS",
+    "CHECKPOINT_V1_POLICY_RNG_STATE_FIELDS",
+    "CHECKPOINT_V1_RESUME_BOUNDARY",
+    "CHECKPOINT_V1_RUNTIME_PROVENANCE_FIELDS",
+    "CHECKPOINT_V1_SAFE_BOUNDARY_ORDER",
+    "CHECKPOINT_V1_TOP_LEVEL_FIELDS",
+    "CHECKPOINT_V1_TRAINING_STATE_FIELDS",
+    "CHECKPOINT_V1_TRANSITION_FIELDS",
     "ConfigError",
     "DEFAULT_SEED",
     "EnvironmentConfig",
+    "EVALUATION_SNAPSHOT_V1_EXCLUDED_FIELDS",
+    "EVALUATION_SNAPSHOT_V1_REQUIRED_FIELDS",
     "EvaluationConfig",
     "MAPPOConfig",
     "MAPPOTrainingAccounting",
@@ -1271,6 +1582,13 @@ __all__ = [
     "SUPPORTED_MODES",
     "SUPPORTED_SCENARIOS",
     "TrainingConfig",
+    "compute_mappo_checkpoint_active_rollout_length",
+    "compute_mappo_periodic_checkpoint_steps",
+    "mappo_checkpoint_kind_at",
+    "mappo_final_checkpoint_path",
+    "mappo_periodic_checkpoint_path",
+    "validate_mappo_checkpoint_contract",
+    "validate_mappo_checkpoint_resume_compatibility",
     "compute_mappo_training_accounting",
     "require_formal_rl_enabled",
     "validate_mappo_training_device",

@@ -640,6 +640,119 @@ ppo_update_count = 1953
 
 **Execution gate 与 reward。** `training.formal_rl_enabled` 是真实 environment-driven RL training gate，当前默认保持 `formal_rl_enabled=False`。未来 Trainer 必须在 environment reset、environment step、rollout collection 或 optimizer update 任一动作发生前检查该 gate；关闭时立即 fail fast，不得先执行部分训练。Smoke Training Gate 只能通过 test-only/explicit config 开启。Trainer reward 的唯一来源是 `StepResult.reward`，不得重算；`StepResult.info["reward"]` 仅用于记录 total reward、`completion_component`、`expiration_penalty`、`workload_penalty`、`energy_penalty` 和已有 normalized terms，不新增公式或调整权重。
 
+### 4.11.5 Checkpoint / Exact-Resume Contract V1
+
+本节只冻结后续 Checkpoint Gate 的协议、机器可读配置、纯路径/校验接口与 contract tests；本节不实现 `torch.save`、`torch.load`、checkpoint manager、Trainer resume、二进制 writer、RL CLI、smoke training、formal training 或 evaluation。
+
+**能力边界与唯一安全点。** Checkpoint V1 只支持 **EPISODE-BOUNDARY EXACT RESUME**，其 exactness 定义为 **SAME-RUNTIME STATE-EXACT RESUME**。V1 不支持 arbitrary-slot resume、mid-episode checkpoint、mid-rollout-update checkpoint、environment-state serialization、cross-device automatic migration、cross-config resume 或 cross-method resume。checkpoint-safe boundary 唯一是完成全部 terminal settlement 的真实 episode boundary；若 checkpoint interval 不是 episode horizon 的整数倍，V1 必须 fail fast，不得退化为 arbitrary-slot checkpoint。
+
+机器可读字段复用 `training.mappo.checkpoint_interval_steps=50000`，其单位明确为 collected environment transitions，不重复创建第二个 interval 字段；新增独立 `training.mappo.checkpoint_schema_version=1`。Checkpoint V1 配置必须满足：
+
+```text
+checkpoint_interval_steps > 0
+checkpoint_interval_steps % environment.episode_horizon == 0
+checkpoint_interval_steps < max_training_environment_steps
+```
+
+正式配置固定 `50000 % 500 == 0`，因此所有 periodic checkpoint 都位于真实 episode boundary。Checkpoint V1 的纯 validation/schedule/path helper 同样执行这三项检查；真实 `mode="rl"`、`method_id="ca_gat_mappo"` 配置在通用 config validation 阶段即 fail fast。短预算、非 RL 的 test-only config 不代表 checkpoint-capable run，只有显式调用 Checkpoint V1 helper 后才受完整 checkpoint geometry 检查。
+
+**唯一 safe-boundary 顺序。** 后续 Trainer 的 checkpoint hook 只能按以下顺序执行：
+
+1. terminal/final service-slot environment step 完成；
+2. terminal settlement 与 reward 完成；
+3. terminal transition append 到 active rollout；
+4. episode counters、reward diagnostics 与 completed-episode accounting 更新；
+5. 若该 terminal transition 使 active rollout length 恰为 256，则按 terminal no-fake-bootstrap contract finalize rollout，计算 GAE，完成 recurrent PPO update，更新 optimized-transition counter 与 PPO-update counter，执行一次 `policy_version += 1`，并创建新的空 active rollout；
+6. 检查 formal training stop condition；
+7. 检查 periodic checkpoint due step；
+8. 若训练尚未完成且 checkpoint due，保存 `PERIODIC_RESUME` snapshot；
+9. 只有 snapshot 完成后才允许 reset 下一 episode。
+
+因此 snapshot 必须同时满足 previous episode fully settled、any due full-rollout PPO update completed 和 next episode reset NOT YET executed。checkpoint 中禁止出现“active rollout 已满 256 但对应 PPO update 尚未执行”的 pending full rollout。
+
+**周期、partial rollout 与 accounting。** Periodic resume schedule 由 `range(checkpoint_interval_steps, max_training_environment_steps, checkpoint_interval_steps)` 计算，正式边界为 50,000、100,000、150,000、200,000、250,000、300,000、350,000、400,000 和 450,000。500,000 是 completion boundary，由 `FINAL_COMPLETED` 取代 periodic resume，不生成 `step_500000.pt`。
+
+每个 periodic checkpoint 必须保存 active partial rollout。其长度由
+
+```text
+active_rollout_length = collected_environment_transitions % rollout_length_slots
+```
+
+计算；在正式九个 periodic boundary 上依次为 80、160、240、64、144、224、48、128、208。运行逻辑不得把该列表硬编码为第二个 schedule。partial rollout 必须按原时间顺序保存全部已采集 transition，至少保留当前 rollout snapshot 已有的 actor observation、graph、`ActionMasks`、proposal action、branch masks、active indicators、old branch/joint log-prob、`hidden_in`、centralized state、old value、reward、terminated/truncated/boundary flags、bootstrap metadata、executed-action summary、rejection/downgrade summary，以及 updater 当前需要的全部字段；只保存 length 或 reward 不满足 exact resume，也不得从 environment 重建历史 transition。
+
+V1 payload 是 plain structured state，由 Python scalar、string、bool、list/tuple/dict 和 detached CPU `torch.Tensor` 组成；禁止 pickle 整个 Trainer object，也禁止把 mutable rollout-buffer object 作为唯一长期 schema。active rollout state 必须显式包含 `rollout_length`、`rollout_policy_version` 和 `ordered_transitions`。每个 tensor 保持 dtype、shape、ordering 和 CPU snapshot；恢复后必须能构造逻辑等价的 active rollout buffer。
+
+**Policy RNG、environment RNG 与 recurrent hidden。** Policy stream 110 的 exact resume 必须保存 `torch.Generator.get_state()` 和 generator device type。恢复时在同一显式 device type 创建 generator，再调用 `set_state(saved_state)`；只保存 master seed 不足以 exact resume，禁止从 master seed 重新初始化 policy generator。Updater 继续不得消费该 generator。
+
+Checkpoint V1 位于真实 episode boundary，因此 environment internal state 与 environment RNG state 均 **NOT SAVED**。恢复使用 `training_master_seed + next_episode_index + derive_training_episode_seed()` 创建下一 episode-local environment；既有 environment streams 10/20/30/40/50/60 不变，不能与 policy stream 110 混用。在线 collector hidden 也 **NOT SAVED**，因为下一 episode 的唯一合法值是 exact zero；但 partial rollout 中每条历史 transition 的 `hidden_in` 必须完整保留。
+
+**Model、optimizer、policy version 与 Trainer state。** `PERIODIC_RESUME` 必须保存 actor state_dict、critic state_dict、actor Adam state_dict 和 critic Adam state_dict。还必须保存当前 `policy_version` 与 active rollout 的 `rollout_policy_version`；若 active rollout 非空且二者不相等，必须 fail fast。
+
+Trainer state 至少包含 `policy_version`、`started_episodes`、`completed_episodes`、`next_episode_index`、`collected_environment_transitions`、`optimized_transitions`、`ppo_update_count`、`unused_final_tail_transitions`、`training_complete`、`active_rollout_length` 和 `active_rollout_policy_version`。恢复后不得重复计数已经完成的 episode。
+
+**Diagnostics state。** 为保持 uninterrupted 与 resumed run 的最终报告口径一致，V1 采用 **SAVE FULL EXISTING DIAGNOSTIC HISTORY**。reward state 保存每个现有 accumulator 的 count 与 sum/total，包括 total reward、completion component、expiration penalty、workload penalty、energy penalty 和已有 normalized reward diagnostics；episode diagnostics 保存完整 ordered history；PPO diagnostics 保存完整 ordered update/epoch history或当前正式 result 依赖的完整内部表示。本阶段不得另行设计压缩统计口径。
+
+**独立 schema 与 exactness。** Checkpoint schema 独立固定为 `checkpoint_schema_version=1`，不得复用 `section4.v1`。顶层逻辑字段至少为：
+
+```text
+schema_version
+checkpoint_kind
+method_id
+git_commit
+config_hash
+config_snapshot
+runtime_provenance
+training_state
+model_state
+optimizer_state
+policy_rng_state
+active_rollout_state
+diagnostics_state
+```
+
+resume kind 只有显式不同的 `PERIODIC_RESUME` 与 `FINAL_COMPLETED`；evaluation snapshot 不是该 resume-kind 集合成员。
+
+SAME-RUNTIME STATE-EXACT RESUME 要求 same method、same git commit、same canonical config hash、same explicit training device type、same model dtype、same checkpoint schema、same actor/critic state、same Adam state、same policy generator state、same trainer counters、same diagnostics 和 same active partial rollout。恢复后的下一 episode seed、下一 stochastic policy proposal、rollout composition 与 policy-version progression 必须沿保存状态继续。V1 不宣称不同 Python、PyTorch、CUDA、GPU 型号或 code commit 之间 bitwise identical。
+
+runtime provenance 至少记录 Python version、PyTorch version、CUDA runtime version（若适用）、device type、device name（若适用）和 dtype。checkpoint 层不自动开启或改变 `torch` deterministic algorithms、cuDNN deterministic settings 或既有数值执行策略。CPU exact-resume test 后续应验证 uninterrupted 与 resumed 的 state/trajectory equality；CUDA test 至少验证 state round-trip、RNG round-trip、device contract 与合法 continuation。
+
+**Config、method 与 git compatibility。** V1 使用现有 canonical JSON SHA-256 `config_hash`，保存完整 `config_snapshot` 与 `config_hash`，resume 时要求 **FULL CANONICAL CONFIG HASH EQUALITY**。V1 不设 runtime-field allowlist；output directory、artifact root、科学参数、训练超参数、device 或 seed 的任何改变都属于新 run，而非同一 exact-resume run。未来 portability 必须使用新 schema/version 单独设计。
+
+checkpoint metadata 固定 `method_id="ca_gat_mappo"`，并保存现有 `RunConfig.git_commit` provenance；method 与 git commit 必须逐字完全匹配，禁止 silent code-version resume。本轮复用项目已有 provenance provider，不新增 shell 查询。schema、kind、method、git、config hash 或 device 任一不匹配均 fail fast。
+
+**Device / map-location V1。** V1 禁止 cross-device resume，只允许 explicit CPU→CPU 或 CUDA→CUDA。CUDA checkpoint 只能在当前 config 同为 `training_device="cuda"` 且 CUDA available 时恢复；CPU checkpoint 只能恢复到 explicit CPU。禁止 CUDA→CPU、CPU→CUDA、`auto` 和 silent fallback。未来 loader 可内部使用显式 `map_location`，但目标 device 必须与 checkpoint metadata 和当前 config 完全一致；两套 Adam state 中的 tensor 加载后必须验证位于对应模型的显式 device。
+
+**Atomic save、path 与 retention。** 未来 checkpoint binary writer 的唯一原子保存顺序为：same-directory temporary file → binary serialization → `flush` → `os.fsync(file)` → close → `os.replace(temp, final)`。temp 与 final 必须位于同一目录/filesystem；replace 前旧 final 不受损，失败不得留下半写 final，temp 只做 best-effort cleanup。不得直接覆盖写 final，也不得把 Windows 上未保证的 directory metadata fsync 宣称为额外 durability。
+
+路径复用现有 artifact root：
+
+```text
+logs/<run_id>/checkpoints/step_<k>.pt
+```
+
+其中 `k=collected_environment_transitions`；final canonical path 为 `logs/<run_id>/checkpoints/final.pt`。periodic checkpoint immutable；同名文件已存在时 fail fast，不自动 overwrite，保留全部 periodic checkpoints，不实现 latest symlink/copy，不自动删除旧 checkpoint。未来 resume entry 必须让用户显式指定一个 checkpoint 文件；损坏或不兼容时 fail fast，不自动 fallback 到上一文件。
+
+**FINAL_COMPLETED。** 正式训练到 `collected_environment_transitions=500000` 后，先按第 4.11.4 节 clear/discard 最后 32 个 optimizer-unused transition，再形成：
+
+```text
+collected_environment_transitions = 500000
+optimized_transitions = 499968
+unused_final_tail_transitions = 32
+ppo_update_count = 1953
+training_complete = True
+active_rollout_length = 0
+```
+
+随后创建 `FINAL_COMPLETED` 的 `final.pt`；若已存在则 fail fast，不覆盖。final 保存 actor、critic、optimizer、trainer counters、diagnostics、provenance 与 config，但不得被 continue-training exact-resume API 当作同一个 500,000-budget run 的 periodic checkpoint。若 loader 收到 `FINAL_COMPLETED`，必须拒绝并报告 `training already complete`。从 final model 开始新预算属于新 experiment，不是 exact resume。
+
+**Evaluation snapshot 身份。** Evaluation snapshot 与 training checkpoint 严格区分。最低字段只有独立 snapshot schema/kind、actor state_dict、actor/network architecture config、action-domain/config、`method_id`、config hash 与 provenance；默认不包含 critic、optimizer、policy RNG、partial rollout、Trainer counters 或 training diagnostics。Evaluation 使用 frozen masked argmax，不消费 training policy RNG。本轮只冻结身份与字段边界，不实现 evaluation snapshot writer/loader，也不冻结其最终 filename/path。
+
+**显式 resume entry。** 后续 Checkpoint Gate 必须提供唯一显式的 RESUME FROM PERIODIC CHECKPOINT 入口，顺序为：load `PERIODIC_RESUME` → validate schema/method/git/config/device → reconstruct actor/critic → restore both Adam states → restore policy generator state → restore Trainer counters → restore diagnostics → restore active partial rollout → assert next episode has NOT been reset → derive next episode seed from `next_episode_index` → set online actor hidden to zero → create next episode environment → continue filling saved partial rollout。恢复时禁止 clear partial rollout、reset policy RNG、把 `policy_version` 设回 0 或重跑已完成 episode；resume 不得隐藏为 Trainer constructor 的模糊副作用。
+
+当前 Trainer 仍是 one-shot。未来 Checkpoint Gate 只允许最小状态化改造以加入 safe-boundary periodic save hook、pause-at-safe-boundary 和显式 resume state injection；不得借 checkpoint 支持 arbitrary-slot pause，不得改变现有训练数学定义。
+
+
+
 ## 4.12 Factorized-Action GAT-QMIX numerical training contract
 
 以下数值同样是 IMPLEMENTATION DEFAULT — Section 4，并保持 Factorized-Action GAT-QMIX 而非 flat joint-action QMIX：
