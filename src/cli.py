@@ -42,6 +42,33 @@ MENU_ROUTES: dict[str, tuple[str, str]] = {
     "9": ("plot", "environment"),
 }
 
+RL_PROFILES: dict[str, dict[str, Any]] = {
+    "rl-smoke": {
+        "mode": "rl",
+        "method_id": "ca_gat_mappo",
+        "training.formal_rl_enabled": True,
+        "training.mappo.training_device": "cpu",
+        "environment.episode_horizon": 32,
+        "training.mappo.max_training_episodes": 8,
+        "training.mappo.max_training_environment_steps": 256,
+        "training.mappo.evaluation_interval_steps": 256,
+        "training.mappo.checkpoint_interval_steps": 128,
+    },
+    "rl-formal": {
+        "mode": "rl",
+        "method_id": "ca_gat_mappo",
+        "training.formal_rl_enabled": True,
+        "training.mappo.training_device": "cuda",
+    },
+}
+
+RL_PROFILE_ALIASES = {
+    "smoke": "rl-smoke",
+    "formal": "rl-formal",
+    "rl-smoke": "rl-smoke",
+    "rl-formal": "rl-formal",
+}
+
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="U2U-MEC experiment launcher")
@@ -49,6 +76,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--method-id", help="registered method identifier")
     parser.add_argument("--scenario-id", choices=SUPPORTED_SCENARIOS, help="small, medium, or large")
     parser.add_argument("--config", help="JSON or YAML configuration file")
+    parser.add_argument(
+        "--profile",
+        choices=tuple(RL_PROFILE_ALIASES),
+        help="RL launch profile: rl-smoke (CPU diagnostics) or rl-formal (CUDA)",
+    )
     parser.add_argument("--seed", type=int, help=f"master seed (default: {DEFAULT_SEED})")
     parser.add_argument(
         "--set",
@@ -67,7 +99,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def build_run_config_from_args(args: argparse.Namespace):
-    cli_overrides: dict[str, Any] = {}
+    profile = getattr(args, "profile", None)
+    cli_overrides = _rl_profile_overrides(profile) if profile else {}
     for name in ("mode", "method_id", "scenario_id", "seed"):
         value = getattr(args, name, None)
         if value is not None:
@@ -117,6 +150,17 @@ def interactive_main(
         return 0
 
     mode, method_id = MENU_ROUTES[choice]
+    profile_overrides: dict[str, Any] = {}
+    if mode == "rl":
+        profile = _prompt_choice(
+            input_fn,
+            output_fn,
+            "RL profile [smoke/formal] "
+            "(default: smoke, source: conservative-default): ",
+            ("smoke", "formal"),
+            "smoke",
+        )
+        profile_overrides = _rl_profile_overrides(profile)
     scenario_id = _prompt_choice(
         input_fn,
         output_fn,
@@ -135,6 +179,7 @@ def interactive_main(
             minimum=0,
         )
         interactive_overrides = {
+            **profile_overrides,
             "mode": mode,
             "method_id": method_id,
             "scenario_id": scenario_id,
@@ -152,11 +197,41 @@ def _dispatch(config, *, output_fn: Callable[[str], None]) -> int:
         f"Resolved RunConfig: mode={config.mode}, method_id={config.method_id}, "
         f"scenario_id={config.scenario_id}, seed={config.seed}, run_id={config.run_id}"
     )
+    if config.mode == "rl":
+        requested_device = config.training.mappo.training_device
+        cuda_available = _cuda_available()
+        resolved_device = (
+            requested_device
+            if requested_device == "cpu" or cuda_available
+            else "unavailable"
+        )
+        output_fn(
+            "Runtime device provenance: "
+            f"requested={requested_device}, resolved={resolved_device}, "
+            f"cuda_available={str(cuda_available).lower()}, "
+            f"cuda_runtime_version={config.reproducibility.cuda_version}"
+        )
     result = Runner().run(config)
     output_fn(f"status={result.status}: {result.message}")
     if result.artifacts:
         output_fn("artifacts=" + ", ".join(result.artifacts))
-    return 0 if result.status in {"completed", "unavailable"} else 1
+    return 0 if result.status == "completed" else 1
+
+
+def _rl_profile_overrides(profile: str) -> dict[str, Any]:
+    try:
+        canonical = RL_PROFILE_ALIASES[profile]
+    except KeyError as exc:
+        raise ConfigError(f"unknown RL profile: {profile!r}") from exc
+    return dict(RL_PROFILES[canonical])
+
+
+def _cuda_available() -> bool:
+    try:
+        import torch
+    except (ImportError, OSError):
+        return False
+    return bool(torch.cuda.is_available())
 
 
 def _prompt_choice(
@@ -222,6 +297,8 @@ def _parse_cli_value(raw: str) -> Any:
 
 __all__ = [
     "MENU",
+    "MENU_ROUTES",
+    "RL_PROFILES",
     "build_arg_parser",
     "build_run_config_from_args",
     "interactive_main",

@@ -218,13 +218,20 @@ def _detected_runtime_versions() -> dict[str, str]:
                 tree = ast.parse(version_file.read_text(encoding="utf-8"))
                 assignments: dict[str, Any] = {}
                 for node in tree.body:
-                    if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                    if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                        target = node.targets[0]
+                        value_node = node.value
+                    elif isinstance(node, ast.AnnAssign):
+                        target = node.target
+                        value_node = node.value
+                    else:
                         continue
-                    target = node.targets[0]
                     if not isinstance(target, ast.Name):
                         continue
+                    if value_node is None:
+                        continue
                     try:
-                        assignments[target.id] = ast.literal_eval(node.value)
+                        assignments[target.id] = ast.literal_eval(value_node)
                     except (ValueError, TypeError):
                         continue
                 if isinstance(assignments.get("__version__"), str):

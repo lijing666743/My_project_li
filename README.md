@@ -121,13 +121,18 @@ knowledge/project_plan/方案2.md
 - Section 2 系统模型、Section 3 方法接口和 Section 4 实验协议共同构成后续实现的冻结基线；
 - 最终项目方案已经冻结；
 - 项目状态文档正在与冻结章节同步；
-- 完整 environment backend 与 Random/Heuristic rollout pipeline 已实现；MAPPO、QMIX、RL training、绘图和正式论文实验结果仍未实现；
-- 当前仅有 single-seed engineering smoke 产物，没有正式论文实验结果。
+- 完整 environment backend 与 Random/Heuristic rollout pipeline 已实现；CA-GAT-MAPPO 的 GAT/MAPPO、Rollout、GAE、PPO Objective/Update 和 Production Trainer 已实现；QMIX、正式论文绘图和正式论文实验结果仍未完成；
+- CA-GAT-MAPPO RL CLI Gate 已修复：交互菜单与直连 CLI 均经 registry 路由到真实 `CAGATMAPPOTrainer.train()` handler；`unavailable` 与 `failed` 状态返回非零退出码；
+- 已新增 `rl-smoke`（CPU、256 transitions、1 个完整 rollout）与 `rl-formal`（CUDA、冻结正式预算）profile，并修复带类型注解的 PyTorch CUDA provenance 解析；
+- CA-GAT-MAPPO Smoke Training Gate 已真实通过：CPU、seed=42、256 transitions、8 episodes、1 个完整 rollout、1 次 PPO update，CLI 退出码为 0；
+- 已新增 Trainer 外围训练诊断 writer，不修改 environment、reward 公式、PPO 算法或 Trainer 核心生命周期；真实运行已生成 config snapshot、raw JSONL、aggregate JSON、dashboard CSV 和 reward/loss dashboard PNG；
+- 本次真实 smoke 的均值为 reward=-0.0615874、actor_loss=0.876723、critic_loss=0.599072、entropy=0.843768；数值均有限，reward 公式恒等式与 PPO update accounting 均通过；
+- Smoke Training Gate 状态为 `pass`，但 RL signal gate 为 `insufficient-horizon`：仅有 8 episodes / 4 个 PPO epoch 诊断点，且 completion component 为 0、penalty 主导；该产物只验证训练链路、日志和绘图，不证明收敛、稳定性、性能或优越性；
 
 ## 下一步
 
 1. 人工复核 Implementation 06 的 Heuristic 规则一致性、单种子工程 smoke 指标与真实 raw/aggregate/dashboard CSV；
-2. 人工确认基线流程后再规划 MAPPO/QMIX 与 RL training；在正式多 seed 评估前不作性能、稳定性或优越性结论。
+2. 当前不得自动启动 `rl-formal` 或 500000 transitions 训练；在正式多 seed 评估与对应证据门通过前，不作收敛、性能、稳定性或优越性结论。
 
 - `knowledge/project_plan/方案2.md` 仍包含尚未同步的旧系统模型语义，因为该文件位于 AGENTS.md 定义的 protected `knowledge/` 目录，当前自动任务不得修改。当前环境实现规格以已经冻结的 `sections/2_system_model.md` 为准（PROTECTED SYNC DEBT）。
 

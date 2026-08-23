@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock, patch
 
 from src.cli import MENU_ROUTES, main
-from src.config import ConfigError, load_run_config
+from src.config import ConfigError, _detected_runtime_versions, load_run_config
 from src.registry import build_default_registry
 from src.runner import Runner
 
@@ -56,6 +59,27 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 load_run_config(path)
 
+    def test_cuda_provenance_parses_annotated_torch_version_assignments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            package_root = Path(directory) / "torch"
+            package_root.mkdir()
+            package_init = package_root / "__init__.py"
+            package_init.write_text("", encoding="utf-8")
+            (package_root / "version.py").write_text(
+                "__version__: str = '2.8.0+cu128'\n"
+                "cuda: str | None = '12.8'\n",
+                encoding="utf-8",
+            )
+            fake_spec = SimpleNamespace(origin=str(package_init))
+            _detected_runtime_versions.cache_clear()
+            try:
+                with patch("src.config.importlib.util.find_spec", return_value=fake_spec):
+                    versions = _detected_runtime_versions()
+            finally:
+                _detected_runtime_versions.cache_clear()
+        self.assertEqual(versions["torch"], "2.8.0+cu128")
+        self.assertEqual(versions["cuda"], "12.8")
+
 
 class RunnerAndCliTests(unittest.TestCase):
     def test_local_only_baseline_config_registry_and_menu(self) -> None:
@@ -84,6 +108,10 @@ class RunnerAndCliTests(unittest.TestCase):
         self.assertEqual(
             registry.resolve("heuristic", "heuristic").__name__,
             "heuristic_rollout_handler",
+        )
+        self.assertEqual(
+            registry.resolve("rl", "ca_gat_mappo").__name__,
+            "ca_gat_mappo_training_handler",
         )
 
     def test_direct_and_menu_local_only_paths_use_common_runner(self) -> None:
@@ -133,13 +161,116 @@ class RunnerAndCliTests(unittest.TestCase):
     def test_unavailable_runner_does_not_fabricate_artifacts(self) -> None:
         config = load_run_config(cli_overrides={
             "mode": "rl",
-            "method_id": "ca_gat_mappo",
+            "method_id": "factorized_action_gat_qmix",
         })
         result = Runner().run(config)
         self.assertEqual(result.status, "unavailable")
         self.assertIn("not implemented", result.message)
         for artifact in config.artifact_paths().values():
             self.assertFalse(Path(artifact).exists())
+
+        output: list[str] = []
+        status = main(
+            ["--mode", "rl", "--method-id", "factorized_action_gat_qmix"],
+            output_fn=output.append,
+        )
+        self.assertEqual(status, 1)
+        self.assertTrue(any("status=unavailable" in line for line in output))
+
+    def test_rl_smoke_and_formal_profiles_resolve_frozen_devices_and_budgets(self) -> None:
+        smoke_output: list[str] = []
+        self.assertEqual(
+            main(["--profile", "rl-smoke", "--show-config"], output_fn=smoke_output.append),
+            0,
+        )
+        smoke = json.loads(smoke_output[-1])
+        self.assertEqual((smoke["mode"], smoke["method_id"]), ("rl", "ca_gat_mappo"))
+        self.assertTrue(smoke["training"]["formal_rl_enabled"])
+        self.assertEqual(smoke["training"]["mappo"]["training_device"], "cpu")
+        self.assertEqual(smoke["training"]["mappo"]["max_training_environment_steps"], 256)
+        self.assertEqual(smoke["training"]["mappo"]["rollout_length_slots"], 256)
+
+        formal_output: list[str] = []
+        self.assertEqual(
+            main(["--profile", "rl-formal", "--show-config"], output_fn=formal_output.append),
+            0,
+        )
+        formal = json.loads(formal_output[-1])
+        self.assertTrue(formal["training"]["formal_rl_enabled"])
+        self.assertEqual(formal["training"]["mappo"]["training_device"], "cuda")
+        self.assertEqual(formal["training"]["mappo"]["max_training_environment_steps"], 500000)
+
+    def test_rl_menu_reaches_real_trainer_train_without_starting_training_in_gate(self) -> None:
+        training_result = SimpleNamespace(
+            total_environment_transitions=256,
+            completed_episode_count=8,
+            ppo_update_count=1,
+        )
+        answers = iter(("6", "smoke", "small", "", "42"))
+        output: list[str] = []
+        models_package = ModuleType("src.models")
+        models_package.__path__ = []
+        trainer_module = ModuleType("src.models.ca_gat_mappo_trainer")
+        trainer_type = Mock()
+        trainer_type.return_value.train.return_value = training_result
+        trainer_module.CAGATMAPPOTrainer = trainer_type
+        artifacts_module = ModuleType("src.training_artifacts")
+        artifact_writer = Mock(
+            return_value=SimpleNamespace(
+                artifacts=(),
+                smoke_gate_status="pass",
+                signal_gate_status="insufficient-horizon",
+                reward_mean=-0.1,
+                actor_loss=-0.2,
+                critic_loss=0.3,
+                entropy=0.4,
+            )
+        )
+        artifacts_module.write_cagat_mappo_training_artifacts = artifact_writer
+        with patch.dict(
+            sys.modules,
+            {
+                "src.models": models_package,
+                "src.models.ca_gat_mappo_trainer": trainer_module,
+                "src.training_artifacts": artifacts_module,
+            },
+        ):
+            status = main(
+                [],
+                input_fn=lambda _prompt: next(answers),
+                output_fn=output.append,
+            )
+
+        self.assertEqual(status, 0)
+        trainer_type.assert_called_once()
+        trainer_type.return_value.train.assert_called_once_with()
+        dispatched = trainer_type.call_args.args[0]
+        artifact_writer.assert_called_once_with(dispatched, training_result)
+        self.assertEqual((dispatched.mode, dispatched.method_id), ("rl", "ca_gat_mappo"))
+        self.assertTrue(dispatched.training.formal_rl_enabled)
+        self.assertEqual(dispatched.training.mappo.training_device, "cpu")
+        self.assertTrue(any("requested=cpu, resolved=cpu" in line for line in output))
+        self.assertTrue(any("status=completed" in line for line in output))
+
+    def test_rl_trainer_failure_returns_nonzero_exit_code(self) -> None:
+        models_package = ModuleType("src.models")
+        models_package.__path__ = []
+        trainer_module = ModuleType("src.models.ca_gat_mappo_trainer")
+        trainer_type = Mock(side_effect=RuntimeError("gate failure"))
+        trainer_module.CAGATMAPPOTrainer = trainer_type
+        output: list[str] = []
+        with patch.dict(
+            sys.modules,
+            {
+                "src.models": models_package,
+                "src.models.ca_gat_mappo_trainer": trainer_module,
+            },
+        ):
+            status = main(["--profile", "rl-smoke"], output_fn=output.append)
+
+        self.assertEqual(status, 1)
+        self.assertTrue(any("status=failed" in line for line in output))
+        self.assertTrue(any("gate failure" in line for line in output))
 
     def test_direct_cli_uses_common_runner(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

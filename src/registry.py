@@ -208,6 +208,58 @@ def local_only_rollout_handler(config: RunConfig) -> RunResult:
     )
 
 
+def ca_gat_mappo_training_handler(config: RunConfig) -> RunResult:
+    """Run the real production CA-GAT-MAPPO Trainer through its public API."""
+
+    try:
+        from .models.ca_gat_mappo_trainer import CAGATMAPPOTrainer
+
+        training = CAGATMAPPOTrainer(config).train()
+    except Exception as exc:
+        return RunResult(
+            status="failed",
+            run_id=config.run_id,
+            mode=config.mode,
+            method_id=config.method_id,
+            message=f"CA-GAT-MAPPO training failed before completion: {exc}",
+        )
+    try:
+        from .training_artifacts import write_cagat_mappo_training_artifacts
+
+        diagnostics = write_cagat_mappo_training_artifacts(config, training)
+    except Exception as exc:
+        return RunResult(
+            status="failed",
+            run_id=config.run_id,
+            mode=config.mode,
+            method_id=config.method_id,
+            message=(
+                "CA-GAT-MAPPO training completed but diagnostic artifact generation "
+                f"failed: {exc}"
+            ),
+        )
+    status = "completed" if diagnostics.smoke_gate_status == "pass" else "failed"
+    return RunResult(
+        status=status,
+        run_id=config.run_id,
+        mode=config.mode,
+        method_id=config.method_id,
+        message=(
+            "CA-GAT-MAPPO training completed: "
+            f"transitions={training.total_environment_transitions}, "
+            f"episodes={training.completed_episode_count}, "
+            f"ppo_updates={training.ppo_update_count}, "
+            f"reward_mean={diagnostics.reward_mean:.6g}, "
+            f"actor_loss={diagnostics.actor_loss:.6g}, "
+            f"critic_loss={diagnostics.critic_loss:.6g}, "
+            f"entropy={diagnostics.entropy:.6g}, "
+            f"smoke_gate={diagnostics.smoke_gate_status}, "
+            f"signal_gate={diagnostics.signal_gate_status}"
+        ),
+        artifacts=diagnostics.artifacts,
+    )
+
+
 def build_default_registry() -> Registry:
     """Register the frozen menu surface with honest early-stage handlers."""
 
@@ -235,6 +287,7 @@ def build_default_registry() -> Registry:
         ("random", "random"): random_rollout_handler,
         ("heuristic", "heuristic"): heuristic_rollout_handler,
         ("baseline", "local_only"): local_only_rollout_handler,
+        ("rl", "ca_gat_mappo"): ca_gat_mappo_training_handler,
     }
     for mode, method_id in pairs:
         handler = implemented_handlers.get((mode, method_id), unavailable_handler)
@@ -248,6 +301,7 @@ __all__ = [
     "RegistryEntry",
     "RunResult",
     "build_default_registry",
+    "ca_gat_mappo_training_handler",
     "environment_sanity_handler",
     "gate0_handler",
     "heuristic_rollout_handler",
