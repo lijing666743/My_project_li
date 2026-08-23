@@ -90,6 +90,12 @@ def _finite(value: Any, name: str) -> float:
     return converted
 
 
+def _console_progress_logger(message: str) -> None:
+    """Write one immediately visible training-progress line to stdout."""
+
+    print(message, flush=True)
+
+
 @dataclass(frozen=True)
 class ScalarTrainingDiagnostics:
     """Immutable count/sum/mean for one scalar training diagnostic."""
@@ -643,6 +649,7 @@ class CAGATMAPPOTrainer:
             Any,
         ]
         | None = None,
+        progress_logger: Callable[[str], None] | None = None,
     ) -> None:
         if not isinstance(config, RunConfig):
             raise TypeError("config must be a RunConfig")
@@ -699,6 +706,13 @@ class CAGATMAPPOTrainer:
         )
         if not callable(getattr(self.updater, "update", None)):
             raise TypeError("updater must expose update(buffer)")
+        self._progress_logger = (
+            _console_progress_logger
+            if progress_logger is None
+            else progress_logger
+        )
+        if not callable(self._progress_logger):
+            raise TypeError("progress_logger must be callable")
 
         self.policy_version = MAPPO_INITIAL_POLICY_VERSION
         self._rollout_policy_version: int | None = None
@@ -883,6 +897,37 @@ class CAGATMAPPOTrainer:
         )
         self.rollout_buffer.clear()
         self._rollout_policy_version = None
+
+    def _report_episode_progress(
+        self, episode: CAGATMAPPOEpisodeDiagnostics
+    ) -> None:
+        """Report existing episode and latest-update diagnostics only."""
+
+        if self._updates:
+            latest = _aggregate_updates((self._updates[-1],))
+            actor_loss = f"{latest.actor_loss.mean:.6g}"
+            critic_loss = f"{latest.critic_loss.mean:.6g}"
+            entropy = f"{latest.entropy.mean:.6g}"
+        else:
+            actor_loss = critic_loss = entropy = "n/a"
+        mappo = self.config.training.mappo
+        self._progress_logger(
+            "CA-GAT-MAPPO progress: "
+            f"episode={episode.episode_index + 1}/"
+            f"{mappo.max_training_episodes}, "
+            f"collected_transitions={self._transitions}/"
+            f"{mappo.max_environment_transitions}, "
+            f"ppo_updates={len(self._updates)}, "
+            f"episode_reward={episode.reward.reward.total:.6g}, "
+            "completion_count="
+            f"{episode.reward.completed_task_count.total:.6g}, "
+            "expiration_count="
+            f"{episode.reward.expired_task_count.total:.6g}, "
+            f"actor_loss={actor_loss}, "
+            f"critic_loss={critic_loss}, "
+            f"entropy={entropy}, "
+            f"device={self.device}"
+        )
 
     def _optimizer_bundle(self) -> CAGATMAPPOOptimizerBundle:
         optimizers = getattr(self.updater, "optimizers", None)
@@ -1226,21 +1271,21 @@ class CAGATMAPPOTrainer:
             hidden = action_output.hidden_out.detach()
 
             if boundary:
-                self._episodes.append(
-                    CAGATMAPPOEpisodeDiagnostics(
-                        episode_index=episode_index,
-                        environment_seed=episode_seed,
-                        transition_count=episode_transitions,
-                        completed_boundary=True,
-                        reward=episode_reward.snapshot(),
-                    )
+                episode_diagnostics = CAGATMAPPOEpisodeDiagnostics(
+                    episode_index=episode_index,
+                    environment_seed=episode_seed,
+                    transition_count=episode_transitions,
+                    completed_boundary=True,
+                    reward=episode_reward.snapshot(),
                 )
+                self._episodes.append(episode_diagnostics)
                 self._completed_episodes += 1
                 self._next_episode_index = episode_index + 1
                 episode_active = False
                 if self.rollout_buffer.full:
                     self._perform_update(self._updates)
                     self._optimized += rollout_length
+                self._report_episode_progress(episode_diagnostics)
 
                 should_continue = self._should_continue(
                     self._completed_episodes, self._transitions

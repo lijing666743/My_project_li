@@ -129,6 +129,7 @@ knowledge/project_plan/方案2.md
 - 本次真实 smoke 的均值为 reward=-0.0615874、actor_loss=0.876723、critic_loss=0.599072、entropy=0.843768；数值均有限，reward 公式恒等式与 PPO update accounting 均通过；
 - Smoke Training Gate 状态为 `pass`，但 RL signal gate 为 `insufficient-horizon`：仅有 8 episodes / 4 个 PPO epoch 诊断点，且 completion component 为 0、penalty 主导；该产物只验证训练链路、日志和绘图，不证明收敛、稳定性、性能或优越性；
 - `rl-long-smoke` 已完成配置准备与聚焦测试：默认 `training_device` 已由 CPU 调整为 CUDA；保持 Extended Smoke 的 500-slot environment、reward 和冻结 PPO 配置，仅将预算扩展为 100 episodes / 50000 transitions，沿用统一 metrics CSV 与 dashboard writer；本轮未启动 Long Smoke 训练，也未生成 Long Smoke artifact。
+- CA-GAT-MAPPO 已新增 episode 级实时 console progress logger：每个真实完成边界输出 episode/预算、collected transitions/预算、PPO update 计数、episode reward、完成/过期计数、最近一次完整 PPO update 的 actor loss、critic loss、entropy 均值（尚无 update 时为 `n/a`）及实际 device；仅复用既有诊断数据，不修改 artifact writer、返回值、随机种子、训练预算或算法逻辑；新增 2 项 logger 测试，Trainer/CLI 联合回归 72/72 PASS，artifact/checkpoint 实现测试 14 项与 8 个 subtests PASS；本轮未启动正式训练，也未生成新训练结果。
 
 ## 下一步
 

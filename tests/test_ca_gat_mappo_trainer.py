@@ -369,10 +369,12 @@ class EpisodeBoundaryLifecycleTests(unittest.TestCase):
         cls.config = make_trainer_config(horizon=3, max_steps=4)
         cls.factory = RecordingFactory()
         cls.updater = CapturingUpdater()
+        cls.progress_lines: list[str] = []
         cls.trainer = CAGATMAPPOTrainer(
             cls.config,
             environment_factory=cls.factory,
             updater_factory=lambda *_: cls.updater,
+            progress_logger=cls.progress_lines.append,
         )
         cls.hidden_inputs: list[torch.Tensor] = []
         cls.generator_ids: list[int] = []
@@ -453,8 +455,49 @@ class EpisodeBoundaryLifecycleTests(unittest.TestCase):
             (True, False),
         )
 
+    def test_22_progress_logger_reports_only_completed_episodes(self) -> None:
+        self.assertEqual(len(self.progress_lines), 1)
+        line = self.progress_lines[0]
+        episode = self.result.episodes[0]
+        self.assertEqual(
+            line,
+            "CA-GAT-MAPPO progress: "
+            "episode=1/1000, collected_transitions=3/4, ppo_updates=0, "
+            f"episode_reward={episode.reward.reward.total:.6g}, "
+            "completion_count="
+            f"{episode.reward.completed_task_count.total:.6g}, "
+            "expiration_count="
+            f"{episode.reward.expired_task_count.total:.6g}, "
+            "actor_loss=n/a, critic_loss=n/a, entropy=n/a, device=cpu",
+        )
+
 
 class StartupAndFailureGuardTests(unittest.TestCase):
+    def test_progress_logger_reports_latest_completed_update_means(self) -> None:
+        progress_lines: list[str] = []
+        updater = CapturingUpdater()
+        trainer = CAGATMAPPOTrainer(
+            make_trainer_config(
+                horizon=256, max_steps=256, max_episodes=1
+            ),
+            updater_factory=lambda *_: updater,
+            progress_logger=progress_lines.append,
+        )
+        result = trainer.train()
+
+        self.assertEqual(result.completed_episode_count, 1)
+        self.assertEqual(result.ppo_update_count, 1)
+        self.assertEqual(len(progress_lines), 1)
+        line = progress_lines[0]
+        self.assertIn(
+            "episode=1/1, collected_transitions=256/256, ppo_updates=1",
+            line,
+        )
+        self.assertIn("actor_loss=2.5", line)
+        self.assertIn("critic_loss=3.5", line)
+        self.assertIn("entropy=2", line)
+        self.assertTrue(line.endswith("device=cpu"))
+
     def test_22_formal_gate_precedes_model_and_environment_work(self) -> None:
         config = make_trainer_config(formal_rl_enabled=False)
         factory = Mock()
