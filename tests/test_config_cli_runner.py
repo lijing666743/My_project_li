@@ -190,6 +190,41 @@ class RunnerAndCliTests(unittest.TestCase):
         self.assertEqual(smoke["training"]["mappo"]["max_training_environment_steps"], 256)
         self.assertEqual(smoke["training"]["mappo"]["rollout_length_slots"], 256)
 
+        long_smoke_output: list[str] = []
+        self.assertEqual(
+            main(
+                ["--profile", "rl-long-smoke", "--show-config"],
+                output_fn=long_smoke_output.append,
+            ),
+            0,
+        )
+        long_smoke = json.loads(long_smoke_output[-1])
+        self.assertEqual(
+            (
+                long_smoke["mode"],
+                long_smoke["method_id"],
+                long_smoke["scenario_id"],
+                long_smoke["seed"],
+            ),
+            ("rl", "ca_gat_mappo", "small", 42),
+        )
+        self.assertTrue(long_smoke["training"]["formal_rl_enabled"])
+        self.assertEqual(long_smoke["environment"]["episode_horizon"], 500)
+        long_smoke_mappo = long_smoke["training"]["mappo"]
+        self.assertEqual(long_smoke_mappo["training_device"], "cpu")
+        self.assertEqual(long_smoke_mappo["max_training_episodes"], 100)
+        self.assertEqual(long_smoke_mappo["max_training_environment_steps"], 50000)
+        self.assertEqual(long_smoke_mappo["evaluation_interval_steps"], 50000)
+        self.assertEqual(long_smoke_mappo["checkpoint_interval_steps"], 2500)
+        self.assertEqual(long_smoke_mappo["rollout_length_slots"], 256)
+        self.assertEqual(long_smoke_mappo["recurrent_chunk_length_slots"], 32)
+        self.assertEqual(long_smoke_mappo["sequence_minibatch_size"], 8)
+        self.assertEqual(long_smoke_mappo["update_epochs"], 4)
+        self.assertEqual(long_smoke_mappo["ppo_clip_epsilon"], 0.2)
+        self.assertEqual(long_smoke_mappo["gamma"], 0.99)
+        self.assertEqual(long_smoke_mappo["gae_lambda"], 0.95)
+        self.assertEqual(long_smoke_mappo["gradient_clip_norm"], 0.5)
+
         formal_output: list[str] = []
         self.assertEqual(
             main(["--profile", "rl-formal", "--show-config"], output_fn=formal_output.append),

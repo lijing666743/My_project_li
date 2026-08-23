@@ -54,6 +54,19 @@ RL_PROFILES: dict[str, dict[str, Any]] = {
         "training.mappo.evaluation_interval_steps": 256,
         "training.mappo.checkpoint_interval_steps": 128,
     },
+    "rl-long-smoke": {
+        "mode": "rl",
+        "method_id": "ca_gat_mappo",
+        "scenario_id": "small",
+        "seed": DEFAULT_SEED,
+        "training.formal_rl_enabled": True,
+        "training.mappo.training_device": "cpu",
+        "environment.episode_horizon": 500,
+        "training.mappo.max_training_episodes": 100,
+        "training.mappo.max_training_environment_steps": 50000,
+        "training.mappo.evaluation_interval_steps": 50000,
+        "training.mappo.checkpoint_interval_steps": 2500,
+    },
     "rl-formal": {
         "mode": "rl",
         "method_id": "ca_gat_mappo",
@@ -64,8 +77,10 @@ RL_PROFILES: dict[str, dict[str, Any]] = {
 
 RL_PROFILE_ALIASES = {
     "smoke": "rl-smoke",
+    "long-smoke": "rl-long-smoke",
     "formal": "rl-formal",
     "rl-smoke": "rl-smoke",
+    "rl-long-smoke": "rl-long-smoke",
     "rl-formal": "rl-formal",
 }
 
@@ -79,7 +94,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--profile",
         choices=tuple(RL_PROFILE_ALIASES),
-        help="RL launch profile: rl-smoke (CPU diagnostics) or rl-formal (CUDA)",
+        help=(
+            "RL launch profile: rl-smoke, rl-long-smoke "
+            "(CPU diagnostics), or rl-formal (CUDA)"
+        ),
     )
     parser.add_argument("--seed", type=int, help=f"master seed (default: {DEFAULT_SEED})")
     parser.add_argument(
@@ -155,9 +173,9 @@ def interactive_main(
         profile = _prompt_choice(
             input_fn,
             output_fn,
-            "RL profile [smoke/formal] "
+            "RL profile [smoke/long-smoke/formal] "
             "(default: smoke, source: conservative-default): ",
-            ("smoke", "formal"),
+            ("smoke", "long-smoke", "formal"),
             "smoke",
         )
         profile_overrides = _rl_profile_overrides(profile)
