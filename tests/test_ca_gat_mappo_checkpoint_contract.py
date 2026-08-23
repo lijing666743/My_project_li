@@ -425,18 +425,29 @@ class CAGATMAPPOCheckpointContractTests(unittest.TestCase):
             "9e004aa1b9aa2891c098f62a7039e0f54f87ce6a",
         )
 
-    def test_42_contract_freeze_does_not_implement_checkpoint_io(self) -> None:
-        sources = (
+    def test_42_checkpoint_implementation_is_isolated(self) -> None:
+        core_sources = (
             ROOT / "src" / "config.py",
             ROOT / "src" / "models" / "ca_gat_mappo_trainer.py",
             ROOT / "src" / "models" / "ca_gat_mappo_rollout.py",
             ROOT / "src" / "models" / "ca_gat_mappo_update.py",
         )
-        production = "\n".join(path.read_text(encoding="utf-8") for path in sources)
+        production = "\n".join(
+            path.read_text(encoding="utf-8") for path in core_sources
+        )
         self.assertNotIn("torch.save(", production)
         self.assertNotIn("torch.load(", production)
-        self.assertNotIn("def resume", production)
-        self.assertEqual(tuple((ROOT / "src").rglob("*checkpoint*")), ())
+        checkpoint = (
+            ROOT / "src" / "models" / "ca_gat_mappo_checkpoint.py"
+        )
+        checkpoint_source = checkpoint.read_text(encoding="utf-8")
+        self.assertIn("def resume_from_checkpoint", production)
+        self.assertIn("def atomic_save_checkpoint", checkpoint_source)
+        self.assertIn("def load_checkpoint_payload", checkpoint_source)
+        self.assertEqual(
+            tuple((ROOT / "src").rglob("*checkpoint*")),
+            (checkpoint,),
+        )
 
 
 if __name__ == "__main__":
