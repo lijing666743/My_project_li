@@ -123,12 +123,12 @@ knowledge/project_plan/方案2.md
 - 项目状态文档正在与冻结章节同步；
 - 完整 environment backend 与 Random/Heuristic rollout pipeline 已实现；CA-GAT-MAPPO 的 GAT/MAPPO、Rollout、GAE、PPO Objective/Update 和 Production Trainer 已实现；QMIX、正式论文绘图和正式论文实验结果仍未完成；
 - CA-GAT-MAPPO RL CLI Gate 已修复：交互菜单与直连 CLI 均经 registry 路由到真实 `CAGATMAPPOTrainer.train()` handler；`unavailable` 与 `failed` 状态返回非零退出码；
-- 已新增 `rl-smoke`（CPU、256 transitions、1 个完整 rollout）、`rl-long-smoke`（CPU、small、seed=42、50000 transitions）与 `rl-formal`（CUDA、冻结正式预算）profile，并修复带类型注解的 PyTorch CUDA provenance 解析；
+- 已新增 `rl-smoke`（CPU、256 transitions、1 个完整 rollout）、`rl-long-smoke`（CUDA、small、seed=42、50000 transitions）与 `rl-formal`（CUDA、冻结正式预算）profile，并修复带类型注解的 PyTorch CUDA provenance 解析；
 - CA-GAT-MAPPO Smoke Training Gate 已真实通过：CPU、seed=42、256 transitions、8 episodes、1 个完整 rollout、1 次 PPO update，CLI 退出码为 0；
 - 已新增 Trainer 外围训练诊断 writer，不修改 environment、reward 公式、PPO 算法或 Trainer 核心生命周期；真实运行已生成 config snapshot、raw JSONL、aggregate JSON、dashboard CSV 和 reward/loss dashboard PNG；
 - 本次真实 smoke 的均值为 reward=-0.0615874、actor_loss=0.876723、critic_loss=0.599072、entropy=0.843768；数值均有限，reward 公式恒等式与 PPO update accounting 均通过；
 - Smoke Training Gate 状态为 `pass`，但 RL signal gate 为 `insufficient-horizon`：仅有 8 episodes / 4 个 PPO epoch 诊断点，且 completion component 为 0、penalty 主导；该产物只验证训练链路、日志和绘图，不证明收敛、稳定性、性能或优越性；
-- `rl-long-smoke` 已完成配置准备与聚焦测试：保持 Extended Smoke 的 500-slot environment、reward 和冻结 PPO 配置，仅将预算扩展为 100 episodes / 50000 transitions，沿用统一 metrics CSV 与 dashboard writer；本轮未启动 Long Smoke 训练，也未生成 Long Smoke artifact。
+- `rl-long-smoke` 已完成配置准备与聚焦测试：默认 `training_device` 已由 CPU 调整为 CUDA；保持 Extended Smoke 的 500-slot environment、reward 和冻结 PPO 配置，仅将预算扩展为 100 episodes / 50000 transitions，沿用统一 metrics CSV 与 dashboard writer；本轮未启动 Long Smoke 训练，也未生成 Long Smoke artifact。
 
 ## 下一步
 

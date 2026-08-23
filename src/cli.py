@@ -60,7 +60,7 @@ RL_PROFILES: dict[str, dict[str, Any]] = {
         "scenario_id": "small",
         "seed": DEFAULT_SEED,
         "training.formal_rl_enabled": True,
-        "training.mappo.training_device": "cpu",
+        "training.mappo.training_device": "cuda",
         "environment.episode_horizon": 500,
         "training.mappo.max_training_episodes": 100,
         "training.mappo.max_training_environment_steps": 50000,
@@ -95,8 +95,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--profile",
         choices=tuple(RL_PROFILE_ALIASES),
         help=(
-            "RL launch profile: rl-smoke, rl-long-smoke "
-            "(CPU diagnostics), or rl-formal (CUDA)"
+            "RL launch profile: rl-smoke (CPU diagnostic), or "
+            "rl-long-smoke and rl-formal (CUDA)"
         ),
     )
     parser.add_argument("--seed", type=int, help=f"master seed (default: {DEFAULT_SEED})")

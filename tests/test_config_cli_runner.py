@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -211,7 +213,7 @@ class RunnerAndCliTests(unittest.TestCase):
         self.assertTrue(long_smoke["training"]["formal_rl_enabled"])
         self.assertEqual(long_smoke["environment"]["episode_horizon"], 500)
         long_smoke_mappo = long_smoke["training"]["mappo"]
-        self.assertEqual(long_smoke_mappo["training_device"], "cpu")
+        self.assertEqual(long_smoke_mappo["training_device"], "cuda")
         self.assertEqual(long_smoke_mappo["max_training_episodes"], 100)
         self.assertEqual(long_smoke_mappo["max_training_environment_steps"], 50000)
         self.assertEqual(long_smoke_mappo["evaluation_interval_steps"], 50000)
@@ -234,6 +236,29 @@ class RunnerAndCliTests(unittest.TestCase):
         self.assertTrue(formal["training"]["formal_rl_enabled"])
         self.assertEqual(formal["training"]["mappo"]["training_device"], "cuda")
         self.assertEqual(formal["training"]["mappo"]["max_training_environment_steps"], 500000)
+
+    def test_root_main_long_smoke_show_config_reports_cuda(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(project_root / "main.py"),
+                "--profile",
+                "rl-long-smoke",
+                "--show-config",
+            ],
+            cwd=project_root,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=environment,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        config = json.loads(completed.stdout)
+        self.assertEqual(config["training"]["mappo"]["training_device"], "cuda")
 
     def test_rl_menu_reaches_real_trainer_train_without_starting_training_in_gate(self) -> None:
         training_result = SimpleNamespace(
