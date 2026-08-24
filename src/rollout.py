@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .artifacts import atomic_write_text_group, preflight_rollout_artifacts
 from .config import RunConfig
 from .env.environment import U2UMECEnvironment
 from .policies.base import Policy
@@ -98,6 +99,8 @@ class RolloutRunner:
     def run(self, *, write_artifacts: bool = True) -> RolloutOutcome:
         """Execute one full finite-horizon episode and optionally persist it."""
 
+        if write_artifacts:
+            preflight_rollout_artifacts(self.config.artifact_paths())
         environment = U2UMECEnvironment(self.config)
         reset = environment.reset()
         observations = reset.observations
@@ -349,13 +352,15 @@ class RolloutRunner:
         ) + "\n"
         csv_text = self._dashboard_csv(raw_records)
 
-        for path, content in (
-            (snapshot_path, snapshot_text),
-            (raw_path, raw_text),
-            (aggregate_path, aggregate_text),
-            (csv_path, csv_text),
-        ):
-            self._write_text(path, content)
+        atomic_write_text_group(
+            (
+                (snapshot_path, snapshot_text),
+                (raw_path, raw_text),
+                (aggregate_path, aggregate_text),
+                (csv_path, csv_text),
+            ),
+            group_name="rollout artifact group",
+        )
         return tuple(str(path) for path in (snapshot_path, raw_path, aggregate_path, csv_path))
 
     def _dashboard_csv(self, raw_records: list[dict[str, Any]]) -> str:
@@ -425,16 +430,6 @@ class RolloutRunner:
     def _csv_value(value: Any) -> Any:
         return "NA" if value is None else value
 
-    @staticmethod
-    def _write_text(path: Path, content: str) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(path.name + ".tmp")
-        try:
-            temporary.write_text(content, encoding="utf-8", newline="")
-            temporary.replace(path)
-        finally:
-            if temporary.exists():
-                temporary.unlink()
 
 
 __all__ = [

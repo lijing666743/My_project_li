@@ -24,6 +24,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping, Sequence, TypeVar, get_args, get_origin, get_type_hints
 
+from .artifacts import atomic_write_text
+
 
 CONFIG_VERSION = "section4.v1"
 DEFAULT_SEED = 42
@@ -1284,13 +1286,14 @@ def load_run_config(
 
 
 def write_config_snapshot(config: RunConfig, path: str | Path | None = None) -> Path:
-    """Write a real canonical snapshot when a caller has a successful run."""
+    """Atomically publish a canonical snapshot without replacing an old run."""
 
     target = Path(path) if path is not None else Path(config.artifact_paths()["config_snapshot"])
-    target.parent.mkdir(parents=True, exist_ok=True)
     # JSON is valid YAML 1.2 and avoids introducing an unconfirmed dependency.
-    target.write_text(json.dumps(config.snapshot_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return target
+    return atomic_write_text(
+        target,
+        json.dumps(config.snapshot_dict(), ensure_ascii=False, indent=2) + "\n",
+    )
 
 
 def _construct_run_config(mapping: Mapping[str, Any]) -> RunConfig:

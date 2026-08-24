@@ -502,9 +502,10 @@ class TestRolloutRunner(unittest.TestCase):
                 output_fn=interactive_output.append,
             )
             self.assertEqual(direct_status, 0)
-            self.assertEqual(interactive_status, 0)
+            self.assertEqual(interactive_status, 1)
             self.assertTrue(any("status=completed" in line for line in direct_output))
-            self.assertTrue(any("status=completed" in line for line in interactive_output))
+            self.assertTrue(any("status=failed" in line for line in interactive_output))
+            self.assertTrue(any("already exists" in line for line in interactive_output))
             registry = build_default_registry()
             self.assertEqual(
                 registry.resolve("random", "random").__name__,
@@ -885,9 +886,10 @@ class TestHeuristicPolicy(unittest.TestCase):
                 output_fn=interactive_output.append,
             )
             self.assertEqual(direct_status, 0)
-            self.assertEqual(interactive_status, 0)
+            self.assertEqual(interactive_status, 1)
             self.assertTrue(any("status=completed" in line for line in direct_output))
-            self.assertTrue(any("status=completed" in line for line in interactive_output))
+            self.assertTrue(any("status=failed" in line for line in interactive_output))
+            self.assertTrue(any("already exists" in line for line in interactive_output))
             self.assertEqual(
                 build_default_registry().resolve(
                     "heuristic", "heuristic"

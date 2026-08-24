@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Iterable
 
+from .artifacts import preflight_formal_training_artifacts
 from .config import RunConfig
 from .execution import ExecutionContext, validate_execution_context
 
@@ -218,6 +219,11 @@ def ca_gat_mappo_training_handler(
 
     context = validate_execution_context(config, execution_context)
     try:
+        if config.launch_profile == "rl-formal":
+            preflight_formal_training_artifacts(
+                config.artifact_paths(),
+                resume=context.resume_from is not None,
+            )
         from .models.ca_gat_mappo_trainer import CAGATMAPPOTrainer
 
         if context.resume_from is not None:

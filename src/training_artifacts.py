@@ -12,11 +12,11 @@ import csv
 import io
 import json
 import math
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from .artifacts import atomic_write_bytes_group, require_artifact_targets_absent
 from .config import RunConfig
 
 
@@ -408,7 +408,11 @@ def _trailing_mean(values: list[float], window: int) -> list[float]:
     return means
 
 
-def _plot_dashboard(csv_text: str, output_path: Path, summary: Mapping[str, Any]) -> None:
+def _plot_dashboard(
+    csv_text: str,
+    output_stream: io.BytesIO,
+    summary: Mapping[str, Any],
+) -> None:
     try:
         import matplotlib
 
@@ -521,16 +525,9 @@ def _plot_dashboard(csv_text: str, output_path: Path, summary: Mapping[str, Any]
     )
     fig.tight_layout(rect=(0.0, 0.045, 1.0, 0.93))
     try:
-        fig.savefig(output_path, format="png", dpi=220, bbox_inches="tight")
+        fig.savefig(output_stream, format="png", dpi=220, bbox_inches="tight")
     finally:
         plt.close(fig)
-
-
-def _stage_text(path: Path, content: str) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(content, encoding="utf-8", newline="")
-    return temporary
 
 
 def write_cagat_mappo_training_artifacts(
@@ -559,6 +556,17 @@ def write_cagat_mappo_training_artifacts(
     aggregate_path = Path(paths["aggregate_metrics"])
     csv_path = Path(paths["dashboard_csv"])
     dashboard_path = Path(paths["dashboard_png"])
+    artifact_paths = (
+        snapshot_path,
+        raw_path,
+        aggregate_path,
+        csv_path,
+        dashboard_path,
+    )
+    require_artifact_targets_absent(
+        artifact_paths,
+        group_name="CA-GAT-MAPPO training artifact group",
+    )
     summary = _training_summary(
         config,
         training,
@@ -568,66 +576,43 @@ def write_cagat_mappo_training_artifacts(
         str(csv_path),
     )
 
-    staged: list[tuple[Path, Path]] = []
-    dashboard_temporary = dashboard_path.with_name(
-        f".{dashboard_path.name}.{os.getpid()}.tmp"
-    )
-    dashboard_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        staged.extend(
+    dashboard_stream = io.BytesIO()
+    _plot_dashboard(csv_text, dashboard_stream, summary)
+    atomic_write_bytes_group(
+        (
             (
+                snapshot_path,
                 (
-                    snapshot_path,
-                    _stage_text(
-                        snapshot_path,
-                        json.dumps(
-                            config.snapshot_dict(),
-                            ensure_ascii=False,
-                            indent=2,
-                            allow_nan=False,
-                        )
-                        + "\n",
-                    ),
-                ),
-                (raw_path, _stage_text(raw_path, _json_lines(records))),
+                    json.dumps(
+                        config.snapshot_dict(),
+                        ensure_ascii=False,
+                        indent=2,
+                        allow_nan=False,
+                    )
+                    + "\n"
+                ).encode("utf-8"),
+            ),
+            (raw_path, _json_lines(records).encode("utf-8")),
+            (
+                aggregate_path,
                 (
-                    aggregate_path,
-                    _stage_text(
-                        aggregate_path,
-                        json.dumps(
-                            summary,
-                            ensure_ascii=False,
-                            indent=2,
-                            sort_keys=True,
-                            allow_nan=False,
-                        )
-                        + "\n",
-                    ),
-                ),
-                (csv_path, _stage_text(csv_path, csv_text)),
-            )
-        )
-        _plot_dashboard(csv_text, dashboard_temporary, summary)
-        staged.append((dashboard_path, dashboard_temporary))
-        for destination, temporary in staged:
-            temporary.replace(destination)
-    finally:
-        for _destination, temporary in staged:
-            if temporary.exists():
-                temporary.unlink()
-        if dashboard_temporary.exists():
-            dashboard_temporary.unlink()
-
-    artifacts = tuple(
-        str(path)
-        for path in (
-            snapshot_path,
-            raw_path,
-            aggregate_path,
-            csv_path,
-            dashboard_path,
-        )
+                    json.dumps(
+                        summary,
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                        allow_nan=False,
+                    )
+                    + "\n"
+                ).encode("utf-8"),
+            ),
+            (csv_path, csv_text.encode("utf-8")),
+            (dashboard_path, dashboard_stream.getvalue()),
+        ),
+        group_name="CA-GAT-MAPPO training artifact group",
     )
+
+    artifacts = tuple(str(path) for path in artifact_paths)
     return TrainingArtifactOutcome(
         artifacts=artifacts,
         smoke_gate_status=smoke_gate_status,
