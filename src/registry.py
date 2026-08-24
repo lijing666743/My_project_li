@@ -287,6 +287,8 @@ def build_default_registry() -> Registry:
     """Register the frozen menu surface with honest early-stage handlers."""
 
     registry = Registry()
+    from .evaluation.handler import formal_evaluation_handler
+
     pairs: Iterable[tuple[str, str]] = (
         ("environment_sanity", "environment"),
         ("gate0", "environment"),
@@ -311,6 +313,7 @@ def build_default_registry() -> Registry:
         ("heuristic", "heuristic"): heuristic_rollout_handler,
         ("baseline", "local_only"): local_only_rollout_handler,
         ("rl", "ca_gat_mappo"): ca_gat_mappo_training_handler,
+        ("evaluation", "ca_gat_mappo"): formal_evaluation_handler,
     }
     for mode, method_id in pairs:
         handler = implemented_handlers.get((mode, method_id), unavailable_handler)

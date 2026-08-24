@@ -32,7 +32,10 @@ class Runner:
         config.validate()
         context = validate_execution_context(config, execution_context)
         handler = self.registry.resolve(config.mode, config.method_id)
-        if context.resume_from is None:
+        if (
+            context.resume_from is None
+            and context.evaluate_from is None
+        ):
             result = handler(config)
         else:
             result = handler(config, execution_context=context)

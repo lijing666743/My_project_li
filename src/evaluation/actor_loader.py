@@ -1,0 +1,269 @@
+"""Strict actor-only loading from immutable FINAL_COMPLETED checkpoints."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Mapping
+
+import torch
+
+from ..config import CHECKPOINT_KIND_FINAL_COMPLETED, RunConfig
+from ..models.ca_gat_mappo import CAGATMAPPOActor, MAPPOTensorSpec
+from ..models.ca_gat_mappo_checkpoint import CheckpointError, load_checkpoint_payload
+
+
+EVALUATION_DTYPE = torch.float32
+_ARCHITECTURE_FIELDS = (
+    "encoder_hidden_dimension",
+    "gat_layer_count",
+    "attention_head_count",
+    "gru_hidden_dimension",
+)
+
+
+class EvaluationCheckpointError(RuntimeError):
+    """Raised when a checkpoint is not safe for formal actor-only evaluation."""
+
+
+@dataclass(frozen=True)
+class LoadedEvaluationActor:
+    """Frozen actor plus the validated source identity needed by evaluation."""
+
+    actor: CAGATMAPPOActor
+    source_checkpoint_path: Path
+    source_checkpoint_sha256: str
+    source_checkpoint_kind: str
+    source_method_id: str
+    source_training_config_hash: str
+    source_training_git_commit: str
+    source_training_device: str
+    evaluation_device: str
+    dtype: str
+    actor_architecture_identity: Mapping[str, Any]
+    action_domain_identity: Mapping[str, Any]
+
+
+def checkpoint_sha256(path: str | Path) -> str:
+    """Hash one explicit checkpoint path without globbing or fallback."""
+
+    target = Path(path)
+    if not target.is_file():
+        raise EvaluationCheckpointError(
+            f"evaluation checkpoint is not a regular file: {target}"
+        )
+    digest = hashlib.sha256()
+    try:
+        with target.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+    except OSError as exc:
+        raise EvaluationCheckpointError(
+            f"evaluation checkpoint cannot be hashed: {exc}"
+        ) from exc
+    return digest.hexdigest()
+
+
+def load_final_actor_for_evaluation(
+    config: RunConfig,
+    checkpoint_path: str | Path,
+    *,
+    evaluation_device: str,
+) -> LoadedEvaluationActor:
+    """Load only the actor state from one strict FINAL_COMPLETED payload.
+
+    The full structured payload is schema-validated because Checkpoint V1 is a
+    single immutable file.  Critic, optimizer, policy RNG, partial rollout,
+    Trainer counters, and diagnostics are never reconstructed or restored.
+    """
+
+    if not isinstance(config, RunConfig):
+        raise TypeError("config must be a RunConfig")
+    config.validate()
+    if config.mode != "evaluation" or config.method_id != "ca_gat_mappo":
+        raise EvaluationCheckpointError(
+            "formal actor evaluation requires evaluation/ca_gat_mappo"
+        )
+    device = _validate_evaluation_device(evaluation_device)
+    target = Path(checkpoint_path)
+    source_hash_before = checkpoint_sha256(target)
+    try:
+        payload = load_checkpoint_payload(target)
+    except CheckpointError as exc:
+        raise EvaluationCheckpointError(str(exc)) from exc
+    source_hash_after = checkpoint_sha256(target)
+    if source_hash_before != source_hash_after:
+        raise EvaluationCheckpointError(
+            "evaluation checkpoint changed while it was being loaded"
+        )
+
+    if payload["checkpoint_kind"] != CHECKPOINT_KIND_FINAL_COMPLETED:
+        raise EvaluationCheckpointError(
+            "formal evaluation requires checkpoint kind FINAL_COMPLETED; "
+            f"got {payload['checkpoint_kind']!r}"
+        )
+    if payload["method_id"] != "ca_gat_mappo":
+        raise EvaluationCheckpointError("checkpoint method_id mismatch")
+
+    resolved_source = _validate_source_config_identity(payload)
+    _validate_source_compatibility(config, resolved_source)
+    runtime = payload["runtime_provenance"]
+    source_device = str(runtime["device_type"])
+    if source_device not in {"cpu", "cuda"}:
+        raise EvaluationCheckpointError("checkpoint training device is invalid")
+    if runtime["dtype"] != str(EVALUATION_DTYPE):
+        raise EvaluationCheckpointError("checkpoint actor dtype is not torch.float32")
+
+    source_git = str(payload["git_commit"])
+    evaluator_git = str(config.git_commit)
+    if not source_git or source_git == "unknown":
+        raise EvaluationCheckpointError("checkpoint training git provenance is unavailable")
+    if not evaluator_git or evaluator_git == "unknown":
+        raise EvaluationCheckpointError("evaluator git provenance is unavailable")
+
+    actor = CAGATMAPPOActor(config).to(device=device, dtype=EVALUATION_DTYPE)
+    actor_state = payload["model_state"]["actor"]
+    try:
+        actor.load_state_dict(actor_state, strict=True)
+    except (KeyError, RuntimeError, TypeError, ValueError) as exc:
+        raise EvaluationCheckpointError(
+            f"actor architecture/state is incompatible: {exc}"
+        ) from exc
+    actor.eval()
+    if actor.training:
+        raise EvaluationCheckpointError("actor did not enter evaluation mode")
+
+    tensor_spec = MAPPOTensorSpec.from_config(config)
+    architecture_identity = {
+        "tensor_spec": _jsonable(asdict(tensor_spec)),
+        "network_config": {
+            name: getattr(config.training.mappo, name)
+            for name in _ARCHITECTURE_FIELDS
+        },
+    }
+    action_identity = _action_domain_identity(config)
+    return LoadedEvaluationActor(
+        actor=actor,
+        source_checkpoint_path=target.resolve(),
+        source_checkpoint_sha256=source_hash_before,
+        source_checkpoint_kind=str(payload["checkpoint_kind"]),
+        source_method_id=str(payload["method_id"]),
+        source_training_config_hash=str(payload["config_hash"]),
+        source_training_git_commit=source_git,
+        source_training_device=source_device,
+        evaluation_device=device.type,
+        dtype=str(EVALUATION_DTYPE),
+        actor_architecture_identity=architecture_identity,
+        action_domain_identity=action_identity,
+    )
+
+
+def _validate_evaluation_device(value: str) -> torch.device:
+    if value not in {"cpu", "cuda"}:
+        raise EvaluationCheckpointError(
+            "evaluation device must be explicitly specified as 'cpu' or 'cuda'"
+        )
+    if value == "cuda" and not torch.cuda.is_available():
+        raise EvaluationCheckpointError(
+            "evaluation device 'cuda' was requested but CUDA is unavailable; "
+            "silent CPU fallback is forbidden"
+        )
+    return torch.device(value)
+
+
+def _validate_source_config_identity(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    snapshot = payload["config_snapshot"]
+    if not isinstance(snapshot, Mapping):
+        raise EvaluationCheckpointError("checkpoint config snapshot is invalid")
+    metadata = snapshot.get("_metadata")
+    if not isinstance(metadata, Mapping):
+        raise EvaluationCheckpointError("checkpoint config metadata is invalid")
+    resolved = {key: value for key, value in snapshot.items() if key != "_metadata"}
+    canonical = json.dumps(
+        resolved,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    recomputed = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    if recomputed != payload["config_hash"]:
+        raise EvaluationCheckpointError(
+            "checkpoint training config hash does not match its canonical snapshot"
+        )
+    if metadata.get("config_hash") != recomputed:
+        raise EvaluationCheckpointError(
+            "checkpoint training config hash metadata is inconsistent"
+        )
+    if metadata.get("git_commit") != payload["git_commit"]:
+        raise EvaluationCheckpointError(
+            "checkpoint git provenance differs from its config snapshot"
+        )
+    if resolved.get("mode") != "rl" or resolved.get("method_id") != "ca_gat_mappo":
+        raise EvaluationCheckpointError(
+            "FINAL_COMPLETED source config is not an rl/ca_gat_mappo run"
+        )
+    return resolved
+
+
+def _validate_source_compatibility(
+    config: RunConfig,
+    source: Mapping[str, Any],
+) -> None:
+    if source.get("scenario_id") != config.scenario_id:
+        raise EvaluationCheckpointError("checkpoint scenario_id mismatch")
+    current_environment = _jsonable(asdict(config.environment))
+    current_action = _jsonable(asdict(config.action))
+    if source.get("environment") != current_environment:
+        raise EvaluationCheckpointError(
+            "checkpoint environment/observation domain is incompatible"
+        )
+    if source.get("action") != current_action:
+        raise EvaluationCheckpointError("checkpoint action domain is incompatible")
+    source_training = source.get("training")
+    if not isinstance(source_training, Mapping):
+        raise EvaluationCheckpointError("checkpoint training config is invalid")
+    source_mappo = source_training.get("mappo")
+    if not isinstance(source_mappo, Mapping):
+        raise EvaluationCheckpointError("checkpoint MAPPO config is invalid")
+    for name in _ARCHITECTURE_FIELDS:
+        if source_mappo.get(name) != getattr(config.training.mappo, name):
+            raise EvaluationCheckpointError(
+                f"checkpoint actor architecture mismatch: {name}"
+            )
+
+
+def _action_domain_identity(config: RunConfig) -> Mapping[str, Any]:
+    return {
+        "uav_count": config.environment.uav_count,
+        "resource_group_count": config.environment.resource_group_count,
+        "sampling_order": list(config.action.sampling_order),
+        "route_fixed_actions": list(config.action.route_fixed_actions),
+        "tx_select_idle_action": config.action.tx_select_idle_action,
+        "resource_width_options": list(config.action.resource_width_options),
+        "power_levels": list(config.action.power_levels),
+        "cpu_queue_idle_action": config.action.cpu_queue_idle_action,
+        "cpu_frequency_levels": list(config.action.cpu_frequency_levels),
+        "canonical_inactive_values": _jsonable(
+            dict(config.action.canonical_inactive_values)
+        ),
+    }
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_jsonable(item) for item in value]
+    return value
+
+
+__all__ = [
+    "EVALUATION_DTYPE",
+    "EvaluationCheckpointError",
+    "LoadedEvaluationActor",
+    "checkpoint_sha256",
+    "load_final_actor_for_evaluation",
+]

@@ -120,6 +120,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="CHECKPOINT_PATH",
         help="resume one explicit periodic checkpoint for an rl-formal run",
     )
+    parser.add_argument(
+        "--evaluate-from",
+        dest="evaluate_from",
+        metavar="FINAL_CHECKPOINT_PATH",
+        help="evaluate one explicit FINAL_COMPLETED checkpoint",
+    )
+    parser.add_argument(
+        "--evaluation-device",
+        choices=("cpu", "cuda"),
+        help="explicit actor-only evaluation device; no automatic fallback",
+    )
     return parser
 
 
@@ -141,6 +152,15 @@ def build_run_config_from_args(args: argparse.Namespace):
 def build_execution_context_from_args(args: argparse.Namespace) -> ExecutionContext:
     """Build launch instructions without adding them to ``RunConfig``."""
 
+    if (
+        getattr(args, "evaluate_from", None) is not None
+        or getattr(args, "evaluation_device", None) is not None
+    ):
+        return ExecutionContext.from_paths(
+            resume_from=getattr(args, "resume_from", None),
+            evaluate_from=getattr(args, "evaluate_from", None),
+            evaluation_device=getattr(args, "evaluation_device", None),
+        )
     return ExecutionContext.from_resume_path(getattr(args, "resume_from", None))
 
 
@@ -226,7 +246,35 @@ def interactive_main(
     except ConfigError as exc:
         output_fn(f"Configuration error: {exc}")
         return 2
-    return _dispatch(config, output_fn=output_fn)
+    execution_context: ExecutionContext | None = None
+    if mode == "evaluation":
+        checkpoint_path = _prompt_optional(
+            input_fn,
+            output_fn,
+            "FINAL_COMPLETED checkpoint path (required): ",
+        )
+        evaluation_device = _prompt_choice(
+            input_fn,
+            output_fn,
+            "Evaluation device [cpu/cuda] "
+            "(default: cpu, source: conservative-default): ",
+            ("cpu", "cuda"),
+            "cpu",
+        )
+        execution_context = ExecutionContext.from_evaluation_path(
+            checkpoint_path or None,
+            evaluation_device,
+        )
+        try:
+            validate_execution_context(config, execution_context)
+        except ConfigError as exc:
+            output_fn(f"Configuration error: {exc}")
+            return 2
+    return _dispatch(
+        config,
+        execution_context=execution_context,
+        output_fn=output_fn,
+    )
 
 
 def _dispatch(
@@ -252,6 +300,19 @@ def _dispatch(
             f"requested={requested_device}, resolved={resolved_device}, "
             f"cuda_available={str(cuda_available).lower()}, "
             f"cuda_runtime_version={config.reproducibility.cuda_version}"
+        )
+    if config.mode == "evaluation" and execution_context is not None:
+        requested_device = execution_context.evaluation_device
+        cuda_available = _cuda_available()
+        resolved_device = (
+            requested_device
+            if requested_device == "cpu" or cuda_available
+            else "unavailable"
+        )
+        output_fn(
+            "Evaluation device provenance: "
+            f"requested={requested_device}, resolved={resolved_device}, "
+            f"cuda_available={str(cuda_available).lower()}"
         )
     result = Runner().run(config, execution_context=execution_context)
     output_fn(f"status={result.status}: {result.message}")
