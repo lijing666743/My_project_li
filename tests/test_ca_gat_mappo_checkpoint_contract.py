@@ -445,7 +445,7 @@ class CAGATMAPPOCheckpointContractTests(unittest.TestCase):
         self.assertIn("def atomic_save_checkpoint", checkpoint_source)
         self.assertIn("def load_checkpoint_payload", checkpoint_source)
         self.assertEqual(
-            tuple((ROOT / "src").rglob("*checkpoint*")),
+            tuple((ROOT / "src").rglob("*checkpoint*.py")),
             (checkpoint,),
         )
 

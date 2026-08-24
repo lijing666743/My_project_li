@@ -173,6 +173,11 @@ SUPPORTED_METHODS = (
     "factorized_action_gat_qmix",
 )
 SUPPORTED_SCENARIOS = ("small", "medium", "large")
+SUPPORTED_LAUNCH_PROFILES = (
+    "rl-smoke",
+    "rl-long-smoke",
+    "rl-formal",
+)
 
 STREAM_IDS = {
     "reset_mobility": 10,
@@ -573,6 +578,7 @@ class RunConfig:
     config_version: str = CONFIG_VERSION
     mode: str = "environment_sanity"
     method_id: str = "environment"
+    launch_profile: str | None = None
     scenario_id: str = "small"
     seed: int = DEFAULT_SEED
     environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
@@ -671,6 +677,14 @@ class RunConfig:
             raise ConfigError(f"mode must be one of {SUPPORTED_MODES}, got {self.mode!r}")
         if self.method_id not in SUPPORTED_METHODS:
             raise ConfigError(f"method_id must be one of {SUPPORTED_METHODS}, got {self.method_id!r}")
+        if (
+            self.launch_profile is not None
+            and self.launch_profile not in SUPPORTED_LAUNCH_PROFILES
+        ):
+            raise ConfigError(
+                "launch_profile must be None or one of "
+                f"{SUPPORTED_LAUNCH_PROFILES}, got {self.launch_profile!r}"
+            )
         if self.scenario_id not in SUPPORTED_SCENARIOS:
             raise ConfigError(f"scenario_id must be one of {SUPPORTED_SCENARIOS}, got {self.scenario_id!r}")
         if self.seed < 0:
@@ -1181,6 +1195,7 @@ DEFAULT_CONFIG_DATA: dict[str, Any] = {
     "mode": "environment_sanity",
     "method_id": "environment",
     "scenario_id": "small",
+    "launch_profile": None,
     "seed": DEFAULT_SEED,
     "environment": asdict(EnvironmentConfig()),
     "action": asdict(ActionConfig()),
@@ -1586,6 +1601,7 @@ __all__ = [
     "QMIXConfig",
     "RunConfig",
     "SUPPORTED_METHODS",
+    "SUPPORTED_LAUNCH_PROFILES",
     "SUPPORTED_MODES",
     "SUPPORTED_SCENARIOS",
     "TrainingConfig",

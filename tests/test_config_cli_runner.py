@@ -14,7 +14,7 @@ from unittest.mock import Mock, patch
 
 from src.cli import MENU_ROUTES, main
 from src.config import ConfigError, _detected_runtime_versions, load_run_config
-from src.registry import build_default_registry
+from src.registry import build_default_registry, ca_gat_mappo_training_handler
 from src.runner import Runner
 
 
@@ -23,6 +23,7 @@ class ConfigTests(unittest.TestCase):
         config = load_run_config()
         self.assertEqual(config.config_version, "section4.v1")
         self.assertEqual(config.seed, 42)
+        self.assertIsNone(config.launch_profile)
         self.assertEqual(config.environment.uav_count, 4)
         self.assertEqual(config.environment.ru_bandwidth_hz, 1_000_000.0)
         self.assertEqual(config.derived_stream_ids["task_arrival"], 20)
@@ -61,6 +62,25 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 load_run_config(path)
 
+    def test_launch_profile_is_validated_and_changes_canonical_identity(self) -> None:
+        shared = {
+            "mode": "rl",
+            "method_id": "ca_gat_mappo",
+            "training.formal_rl_enabled": True,
+        }
+        unprofiled = load_run_config(cli_overrides=shared)
+        formal = load_run_config(cli_overrides={**shared, "launch_profile": "rl-formal"})
+        formal_snapshot = formal.snapshot_dict()
+
+        self.assertIsNone(unprofiled.snapshot_dict()["launch_profile"])
+        self.assertEqual(formal.launch_profile, "rl-formal")
+        self.assertEqual(formal_snapshot["launch_profile"], "rl-formal")
+        self.assertEqual(formal_snapshot["_metadata"]["config_hash"], formal.config_hash)
+        self.assertNotEqual(unprofiled.config_hash, formal.config_hash)
+        self.assertNotEqual(unprofiled.run_id, formal.run_id)
+        with self.assertRaisesRegex(ConfigError, "launch_profile"):
+            load_run_config(cli_overrides={"launch_profile": "pilot"})
+
     def test_cuda_provenance_parses_annotated_torch_version_assignments(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             package_root = Path(directory) / "torch"
@@ -84,6 +104,47 @@ class ConfigTests(unittest.TestCase):
 
 
 class RunnerAndCliTests(unittest.TestCase):
+    def _run_stubbed_training_handler(self, config):
+        training_result = SimpleNamespace(
+            total_environment_transitions=500_000,
+            completed_episode_count=1_000,
+            ppo_update_count=1_953,
+        )
+        models_package = ModuleType("src.models")
+        models_package.__path__ = []
+        trainer_module = ModuleType("src.models.ca_gat_mappo_trainer")
+        trainer_type = Mock()
+        trainer_type.return_value.train.return_value = training_result
+        trainer_type.return_value.train_with_checkpoints.return_value = training_result
+        trainer_module.CAGATMAPPOTrainer = trainer_type
+        artifacts_module = ModuleType("src.training_artifacts")
+        artifact_writer = Mock(
+            return_value=SimpleNamespace(
+                artifacts=(),
+                smoke_gate_status="pass",
+                signal_gate_status="signal-pass",
+                reward_mean=0.1,
+                actor_loss=-0.2,
+                critic_loss=0.3,
+                entropy=0.4,
+            )
+        )
+        artifacts_module.write_cagat_mappo_training_artifacts = artifact_writer
+        with patch.dict(
+            sys.modules,
+            {
+                "src.models": models_package,
+                "src.models.ca_gat_mappo_trainer": trainer_module,
+                "src.training_artifacts": artifacts_module,
+            },
+        ):
+            result = ca_gat_mappo_training_handler(config)
+
+        self.assertEqual(result.status, "completed")
+        trainer_type.assert_called_once_with(config)
+        artifact_writer.assert_called_once_with(config, training_result)
+        return trainer_type
+
     def test_local_only_baseline_config_registry_and_menu(self) -> None:
         default = load_run_config(cli_overrides={"mode": "baseline"})
         explicit = load_run_config(cli_overrides={
@@ -237,6 +298,65 @@ class RunnerAndCliTests(unittest.TestCase):
         self.assertEqual(formal["training"]["mappo"]["training_device"], "cuda")
         self.assertEqual(formal["training"]["mappo"]["max_training_environment_steps"], 500000)
 
+    def test_rl_profile_aliases_normalize_to_canonical_config_and_hash(self) -> None:
+        aliases = (
+            ("smoke", "rl-smoke"),
+            ("long-smoke", "rl-long-smoke"),
+            ("formal", "rl-formal"),
+        )
+        for alias, canonical in aliases:
+            with self.subTest(alias=alias):
+                snapshots = []
+                for spelling in (alias, canonical):
+                    output: list[str] = []
+                    self.assertEqual(
+                        main(["--profile", spelling, "--show-config"], output_fn=output.append),
+                        0,
+                    )
+                    snapshot = json.loads(output[-1])
+                    self.assertEqual(snapshot["launch_profile"], canonical)
+                    snapshots.append(snapshot)
+                self.assertEqual(
+                    snapshots[0]["_metadata"]["config_hash"],
+                    snapshots[1]["_metadata"]["config_hash"],
+                )
+                for snapshot in snapshots:
+                    snapshot.pop("_metadata")
+                self.assertEqual(snapshots[0], snapshots[1])
+
+    def test_formal_handler_uses_checkpoint_training(self) -> None:
+        config = load_run_config(
+            cli_overrides={
+                "mode": "rl",
+                "method_id": "ca_gat_mappo",
+                "launch_profile": "rl-formal",
+                "training.formal_rl_enabled": True,
+            }
+        )
+
+        trainer_type = self._run_stubbed_training_handler(config)
+
+        trainer_type.return_value.train_with_checkpoints.assert_called_once_with()
+        trainer_type.return_value.train.assert_not_called()
+
+    def test_non_formal_handlers_keep_non_checkpoint_training(self) -> None:
+        shared = {
+            "mode": "rl",
+            "method_id": "ca_gat_mappo",
+            "training.formal_rl_enabled": True,
+        }
+        for launch_profile in ("rl-smoke", "rl-long-smoke", None):
+            with self.subTest(launch_profile=launch_profile):
+                overrides = dict(shared)
+                if launch_profile is not None:
+                    overrides["launch_profile"] = launch_profile
+                config = load_run_config(cli_overrides=overrides)
+
+                trainer_type = self._run_stubbed_training_handler(config)
+
+                trainer_type.return_value.train.assert_called_once_with()
+                trainer_type.return_value.train_with_checkpoints.assert_not_called()
+
     def test_root_main_long_smoke_show_config_reports_cuda(self) -> None:
         project_root = Path(__file__).resolve().parents[1]
         environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
@@ -304,9 +424,11 @@ class RunnerAndCliTests(unittest.TestCase):
         self.assertEqual(status, 0)
         trainer_type.assert_called_once()
         trainer_type.return_value.train.assert_called_once_with()
+        trainer_type.return_value.train_with_checkpoints.assert_not_called()
         dispatched = trainer_type.call_args.args[0]
         artifact_writer.assert_called_once_with(dispatched, training_result)
         self.assertEqual((dispatched.mode, dispatched.method_id), ("rl", "ca_gat_mappo"))
+        self.assertEqual(dispatched.launch_profile, "rl-smoke")
         self.assertTrue(dispatched.training.formal_rl_enabled)
         self.assertEqual(dispatched.training.mappo.training_device, "cpu")
         self.assertTrue(any("requested=cpu, resolved=cpu" in line for line in output))

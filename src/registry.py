@@ -214,7 +214,11 @@ def ca_gat_mappo_training_handler(config: RunConfig) -> RunResult:
     try:
         from .models.ca_gat_mappo_trainer import CAGATMAPPOTrainer
 
-        training = CAGATMAPPOTrainer(config).train()
+        trainer = CAGATMAPPOTrainer(config)
+        if config.launch_profile == "rl-formal":
+            training = trainer.train_with_checkpoints()
+        else:
+            training = trainer.train()
     except Exception as exc:
         return RunResult(
             status="failed",

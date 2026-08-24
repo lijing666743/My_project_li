@@ -241,7 +241,10 @@ def _rl_profile_overrides(profile: str) -> dict[str, Any]:
         canonical = RL_PROFILE_ALIASES[profile]
     except KeyError as exc:
         raise ConfigError(f"unknown RL profile: {profile!r}") from exc
-    return dict(RL_PROFILES[canonical])
+    return {
+        **RL_PROFILES[canonical],
+        "launch_profile": canonical,
+    }
 
 
 def _cuda_available() -> bool:
