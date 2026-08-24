@@ -1,0 +1,65 @@
+{
+  "checks": {
+    "critic_loss_is_nonnegative": true,
+    "entropy_is_nonnegative": true,
+    "environment_budget_reached": true,
+    "ppo_epoch_count_matches": true,
+    "ppo_update_accounting_matches": true,
+    "ppo_update_present": true,
+    "ppo_values_are_finite": true,
+    "ratio_is_positive": true,
+    "reward_count_matches_transitions": true,
+    "reward_formula_identity_holds": true,
+    "reward_values_are_finite": true
+  },
+  "claim_boundary": "single-seed, short-horizon smoke diagnostic; validates execution, finite training signals, logging, and plotting only; it is not evidence of convergence, stability, superiority, generalization, or manuscript readiness",
+  "dashboard": {
+    "ppo_series": "four diagnostics per completed PPO update",
+    "reward_series": "episode total reward",
+    "reward_smoothing": "trailing arithmetic mean, window up to 5 episodes, min_periods=1",
+    "source_csv": "dashboard_logs\\ca_gat_mappo__small__seed-42__cfg-6f2181b8e38c__git-e469ac5d152b_metrics.csv"
+  },
+  "method_id": "ca_gat_mappo",
+  "ppo": {
+    "actor_grad_norm_before_clip_mean": 1.8952046314875284,
+    "actor_loss_mean": 0.28607184729323937,
+    "critic_grad_norm_before_clip_mean": 7.503337124276619,
+    "critic_loss_mean": 2.5702801747581896,
+    "entropy_mean": 0.980734919088009,
+    "loss_type": "PPO clipped-surrogate actor + half-MSE critic",
+    "ratio_mean": 0.9990706961888534,
+    "total_loss_mean": 1.5614045842717856
+  },
+  "reward": {
+    "clipping": "none",
+    "completion_component_total": 2300.0,
+    "energy_penalty_total": 0.4410959843134577,
+    "expiration_penalty_total": 7102.0,
+    "mean_per_transition": -0.12080976537769739,
+    "neutral_baseline": 0.0,
+    "penalty_total": 8340.488268884903,
+    "positive_total": 2300.0,
+    "scale": "dimensionless fixed-reference normalized composite",
+    "total": -6040.488268884869,
+    "transition_count": 50000,
+    "workload_penalty_total": 1238.047172900589
+  },
+  "run_id": "ca_gat_mappo__small__seed-42__cfg-6f2181b8e38c__git-e469ac5d152b",
+  "scenario_id": "small",
+  "seed": 42,
+  "signal_gate_status": "signal-watch",
+  "smoke_training_gate_status": "pass",
+  "training": {
+    "completed_episode_count": 100,
+    "final_policy_version": 195,
+    "initial_policy_version": 0,
+    "optimized_transitions": 49920,
+    "ppo_epoch_diagnostic_count": 780,
+    "ppo_update_count": 195,
+    "started_episode_count": 100,
+    "total_environment_transitions": 50000,
+    "training_device": "cuda",
+    "unused_final_tail_transitions": 80
+  },
+  "validation_stage": "smoke-training"
+}

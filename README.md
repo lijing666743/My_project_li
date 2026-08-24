@@ -121,20 +121,25 @@ knowledge/project_plan/方案2.md
 - Section 2 系统模型、Section 3 方法接口和 Section 4 实验协议共同构成后续实现的冻结基线；
 - 最终项目方案已经冻结；
 - 项目状态文档正在与冻结章节同步；
-- 完整 environment backend 与 Random/Heuristic rollout pipeline 已实现；CA-GAT-MAPPO 的 GAT/MAPPO、Rollout、GAE、PPO Objective/Update 和 Production Trainer 已实现；QMIX、正式论文绘图和正式论文实验结果仍未完成；
+- 完整 environment backend 与 Random/Heuristic rollout pipeline 已实现；CA-GAT-MAPPO 的 GAT/MAPPO、Rollout、GAE、PPO Objective/Update、Production Trainer 和 Exact Resume Checkpoint 已实现；QMIX、正式论文绘图和正式论文实验结果仍未完成；
 - CA-GAT-MAPPO RL CLI Gate 已修复：交互菜单与直连 CLI 均经 registry 路由到真实 `CAGATMAPPOTrainer.train()` handler；`unavailable` 与 `failed` 状态返回非零退出码；
 - 已新增 `rl-smoke`（CPU、256 transitions、1 个完整 rollout）、`rl-long-smoke`（CUDA、small、seed=42、50000 transitions）与 `rl-formal`（CUDA、冻结正式预算）profile，并修复带类型注解的 PyTorch CUDA provenance 解析；
 - CA-GAT-MAPPO Smoke Training Gate 已真实通过：CPU、seed=42、256 transitions、8 episodes、1 个完整 rollout、1 次 PPO update，CLI 退出码为 0；
 - 已新增 Trainer 外围训练诊断 writer，不修改 environment、reward 公式、PPO 算法或 Trainer 核心生命周期；真实运行已生成 config snapshot、raw JSONL、aggregate JSON、dashboard CSV 和 reward/loss dashboard PNG；
 - 本次真实 smoke 的均值为 reward=-0.0615874、actor_loss=0.876723、critic_loss=0.599072、entropy=0.843768；数值均有限，reward 公式恒等式与 PPO update accounting 均通过；
 - Smoke Training Gate 状态为 `pass`，但 RL signal gate 为 `insufficient-horizon`：仅有 8 episodes / 4 个 PPO epoch 诊断点，且 completion component 为 0、penalty 主导；该产物只验证训练链路、日志和绘图，不证明收敛、稳定性、性能或优越性；
-- `rl-long-smoke` 已完成配置准备与聚焦测试：默认 `training_device` 已由 CPU 调整为 CUDA；保持 Extended Smoke 的 500-slot environment、reward 和冻结 PPO 配置，仅将预算扩展为 100 episodes / 50000 transitions，沿用统一 metrics CSV 与 dashboard writer；本轮未启动 Long Smoke 训练，也未生成 Long Smoke artifact。
+- 相关 RL CLI、Trainer、PPO Update 与 artifact 回归测试现为 92/92 PASS（其中 2 项 CUDA-only 测试因当前无 CUDA 跳过）；当前仍没有正式论文实验结果。
+- CA-GAT-MAPPO Extended Smoke Training 已在 CPU、small、seed=42、5000 transitions、10 episodes 下真实完成：19 个完整 rollout/PPO update，completion component 已出现，signal gate 为 `signal-watch`；该单种子结果仅支持 basic learning signal 诊断，不证明收敛、稳定性、性能或优越性；
+- `rl-long-smoke` 已完成配置准备与聚焦测试：默认 `training_device` 已由 CPU 调整为 CUDA；保持 Extended Smoke 的 500-slot environment、reward 和冻结 PPO 配置，仅将预算扩展为 100 episodes / 50000 transitions，沿用统一 metrics CSV 与 dashboard writer；该 profile 的 single-seed Long Smoke 已真实完成并归档。
 - CA-GAT-MAPPO 已新增 episode 级实时 console progress logger：每个真实完成边界输出 episode/预算、collected transitions/预算、PPO update 计数、episode reward、完成/过期计数、最近一次完整 PPO update 的 actor loss、critic loss、entropy 均值（尚无 update 时为 `n/a`）及实际 device；仅复用既有诊断数据，不修改 artifact writer、返回值、随机种子、训练预算或算法逻辑；新增 2 项 logger 测试，Trainer/CLI 联合回归 72/72 PASS，artifact/checkpoint 实现测试 14 项与 8 个 subtests PASS；本轮未启动正式训练，也未生成新训练结果。
+- 已将 CA-GAT-MAPPO single-seed Long Smoke（small、seed=42）真实运行产物归档至 `experiments/long_smoke/small_seed42/`，包括 aggregate metrics、配置快照、metrics CSV 与 dashboard PNG；本轮仅执行结果归档，未运行训练、未修改算法代码，该单 seed 产物不证明收敛、稳定性、性能或优越性。
+- Formal checkpoint 生命周期、显式 `--resume-from`、Artifact Non-Overwrite Gate 和 Formal Evaluation Runner 均已完成；真实 `128 → periodic checkpoint → CLI resume → 256 → final checkpoint` 验证已通过；最新完整测试为 405 passed、119 subtests passed。
+- 尚未运行小规模真实 final-checkpoint evaluation，也尚未运行任何 500,000-transition 正式实验；当前仍未生成正式实验结果。
 
 ## 下一步
 
-1. `rl-long-smoke` profile 已准备但尚未执行；仅在新的明确授权下启动 single-seed Long Smoke，并继续把输出限定为诊断证据；
-2. 当前不得自动启动 `rl-formal` 或 500000 transitions 训练；在正式多 seed 评估与对应证据门通过前，不作收敛、性能、稳定性或优越性结论。
+1. 生成当前最终 commit 对应的小规模 `FINAL_COMPLETED` checkpoint，并运行一次小规模真实 final-checkpoint evaluation；
+2. evaluation 通过后启动 seed 42 的 500,000-transition Formal 训练；第一个 `step_50000.pt` 正常后继续其余 seeds。
 
 - `knowledge/project_plan/方案2.md` 仍包含尚未同步的旧系统模型语义，因为该文件位于 AGENTS.md 定义的 protected `knowledge/` 目录，当前自动任务不得修改。当前环境实现规格以已经冻结的 `sections/2_system_model.md` 为准（PROTECTED SYNC DEBT）。
 
@@ -164,3 +169,12 @@ knowledge/project_plan/方案2.md
 ## 证据边界
 
 结果和讨论章节只能使用真实程序运行产生的数据、日志和图表。不得虚构实验结果、训练曲线、统计显著性或算法优势。
+
+
+## 结果绘图目录
+
+- `results/scripts/plot_training_curves.py`：从真实 Long Smoke 指标生成论文结果曲线，默认读取 `experiments/long_smoke/small_seed42/metrics.csv`，不启动训练且不修改原始实验数据。
+- `results/figures/`：保存可由脚本重新生成的四幅 PNG 图：`reward_curve.png`、`completion_penalty_curve.png`、`ppo_loss_curve.png` 和 `policy_diagnostics_curve.png`。
+- reward 图包含 episode reward 原始曲线与 window=10 的 trailing moving average；组件图使用 completion component 与 expiration penalty 的原始记录；PPO 图使用按 update/epoch 排序的 actor loss、critic loss、entropy 和 ratio 记录。
+- 当前图表来自单 seed（seed=42） Long Smoke 诊断产物，只用于训练信号与日志检查，不支持收敛、稳定性、性能、优越性或多 seed 泛化结论。
+- 在项目根目录运行 `python results/scripts/plot_training_curves.py` 可独立重新生成上述图表。
