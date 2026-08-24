@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .config import RunConfig, write_config_snapshot
+from .execution import ExecutionContext, validate_execution_context
 from .registry import Registry, RunResult, build_default_registry
 
 
@@ -22,10 +23,19 @@ class Runner:
     def __init__(self, registry: Registry | None = None) -> None:
         self.registry = registry or build_default_registry()
 
-    def run(self, config: RunConfig) -> RunResult:
+    def run(
+        self,
+        config: RunConfig,
+        *,
+        execution_context: ExecutionContext | None = None,
+    ) -> RunResult:
         config.validate()
+        context = validate_execution_context(config, execution_context)
         handler = self.registry.resolve(config.mode, config.method_id)
-        result = handler(config)
+        if context.resume_from is None:
+            result = handler(config)
+        else:
+            result = handler(config, execution_context=context)
         if not isinstance(result, RunResult):
             raise TypeError("registered runner handlers must return RunResult")
         return result
@@ -38,10 +48,18 @@ class Runner:
         return write_config_snapshot(config)
 
 
-def run_config(config: RunConfig, registry: Registry | None = None) -> RunResult:
+def run_config(
+    config: RunConfig,
+    registry: Registry | None = None,
+    *,
+    execution_context: ExecutionContext | None = None,
+) -> RunResult:
     """Functional façade used by tests and future batch orchestration."""
 
-    return Runner(registry=registry).run(config)
+    return Runner(registry=registry).run(
+        config,
+        execution_context=execution_context,
+    )
 
 
-__all__ = ["Runner", "run_config"]
+__all__ = ["ExecutionContext", "Runner", "run_config"]

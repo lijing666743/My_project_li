@@ -6,9 +6,10 @@ from dataclasses import dataclass
 from typing import Callable, Iterable
 
 from .config import RunConfig
+from .execution import ExecutionContext, validate_execution_context
 
 
-Handler = Callable[[RunConfig], "RunResult"]
+Handler = Callable[..., "RunResult"]
 
 
 @dataclass(frozen=True)
@@ -208,17 +209,29 @@ def local_only_rollout_handler(config: RunConfig) -> RunResult:
     )
 
 
-def ca_gat_mappo_training_handler(config: RunConfig) -> RunResult:
+def ca_gat_mappo_training_handler(
+    config: RunConfig,
+    *,
+    execution_context: ExecutionContext | None = None,
+) -> RunResult:
     """Run the real production CA-GAT-MAPPO Trainer through its public API."""
 
+    context = validate_execution_context(config, execution_context)
     try:
         from .models.ca_gat_mappo_trainer import CAGATMAPPOTrainer
 
-        trainer = CAGATMAPPOTrainer(config)
-        if config.launch_profile == "rl-formal":
+        if context.resume_from is not None:
+            trainer = CAGATMAPPOTrainer.resume_from_checkpoint(
+                config,
+                context.resume_from,
+            )
             training = trainer.train_with_checkpoints()
         else:
-            training = trainer.train()
+            trainer = CAGATMAPPOTrainer(config)
+            if config.launch_profile == "rl-formal":
+                training = trainer.train_with_checkpoints()
+            else:
+                training = trainer.train()
     except Exception as exc:
         return RunResult(
             status="failed",

@@ -12,9 +12,10 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
-from src.cli import MENU_ROUTES, main
+from src.cli import MENU_ROUTES, build_arg_parser, build_run_config_from_args, main
 from src.config import ConfigError, _detected_runtime_versions, load_run_config
-from src.registry import build_default_registry, ca_gat_mappo_training_handler
+from src.execution import ExecutionContext
+from src.registry import RunResult, build_default_registry, ca_gat_mappo_training_handler
 from src.runner import Runner
 
 
@@ -323,6 +324,153 @@ class RunnerAndCliTests(unittest.TestCase):
                 for snapshot in snapshots:
                     snapshot.pop("_metadata")
                 self.assertEqual(snapshots[0], snapshots[1])
+
+    def test_runner_forwards_resume_context_without_changing_config(self) -> None:
+        config = load_run_config(cli_overrides={
+            "mode": "rl",
+            "method_id": "ca_gat_mappo",
+            "launch_profile": "rl-formal",
+            "training.formal_rl_enabled": True,
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "periodic.pt"
+            checkpoint.write_bytes(b"stub checkpoint")
+            context = ExecutionContext.from_resume_path(checkpoint)
+            handler = Mock(return_value=RunResult(
+                status="completed",
+                run_id=config.run_id,
+                mode=config.mode,
+                method_id=config.method_id,
+                message="stubbed resume",
+            ))
+            registry = Mock()
+            registry.resolve.return_value = handler
+
+            result = Runner(registry=registry).run(
+                config,
+                execution_context=context,
+            )
+
+        self.assertEqual(result.status, "completed")
+        registry.resolve.assert_called_once_with(config.mode, config.method_id)
+        handler.assert_called_once_with(config, execution_context=context)
+
+    def test_resume_parser_and_config_identity_exclude_resume_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "periodic.pt"
+            checkpoint.write_bytes(b"stub checkpoint")
+            parser = build_arg_parser()
+            fresh_args = parser.parse_args(["--profile", "rl-formal"])
+            resumed_args = parser.parse_args([
+                "--profile",
+                "rl-formal",
+                "--resume-from",
+                str(checkpoint),
+            ])
+
+            self.assertEqual(resumed_args.resume_from, str(checkpoint))
+            fresh = build_run_config_from_args(fresh_args)
+            resumed = build_run_config_from_args(resumed_args)
+
+        self.assertEqual(fresh.config_hash, resumed.config_hash)
+        self.assertEqual(fresh.run_id, resumed.run_id)
+        self.assertNotIn("resume_from", resumed.resolved_dict())
+        self.assertNotIn(str(checkpoint), json.dumps(resumed.snapshot_dict()))
+        self.assertNotIn("resume_from", resumed.snapshot_dict()["_metadata"]["cli_overrides"])
+
+    def test_resume_is_allowed_for_formal_profile_aliases(self) -> None:
+        for profile in ("formal", "rl-formal"):
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as directory:
+                checkpoint = Path(directory) / "periodic.pt"
+                checkpoint.write_bytes(b"stub checkpoint")
+                args = build_arg_parser().parse_args([
+                    "--profile",
+                    profile,
+                    "--resume-from",
+                    str(checkpoint),
+                ])
+                config = build_run_config_from_args(args)
+                self.assertEqual(config.launch_profile, "rl-formal")
+                training_result = SimpleNamespace(
+                    total_environment_transitions=500_000,
+                    completed_episode_count=1_000,
+                    ppo_update_count=1_953,
+                )
+                models_package = ModuleType("src.models")
+                models_package.__path__ = []
+                trainer_module = ModuleType("src.models.ca_gat_mappo_trainer")
+                trainer_type = Mock()
+                resumed_trainer = Mock()
+                resumed_trainer.train_with_checkpoints.return_value = training_result
+                trainer_type.resume_from_checkpoint.return_value = resumed_trainer
+                trainer_module.CAGATMAPPOTrainer = trainer_type
+                artifacts_module = ModuleType("src.training_artifacts")
+                artifact_writer = Mock(return_value=SimpleNamespace(
+                    artifacts=(),
+                    smoke_gate_status="pass",
+                    signal_gate_status="signal-pass",
+                    reward_mean=0.1,
+                    actor_loss=-0.2,
+                    critic_loss=0.3,
+                    entropy=0.4,
+                ))
+                artifacts_module.write_cagat_mappo_training_artifacts = artifact_writer
+                with patch.dict(sys.modules, {
+                    "src.models": models_package,
+                    "src.models.ca_gat_mappo_trainer": trainer_module,
+                    "src.training_artifacts": artifacts_module,
+                }):
+                    result = ca_gat_mappo_training_handler(
+                        config,
+                        execution_context=ExecutionContext.from_resume_path(checkpoint),
+                    )
+
+                self.assertEqual(result.status, "completed")
+                trainer_type.assert_not_called()
+                trainer_type.resume_from_checkpoint.assert_called_once_with(config, checkpoint)
+                resumed_trainer.train.assert_not_called()
+                resumed_trainer.train_with_checkpoints.assert_called_once_with()
+                artifact_writer.assert_called_once_with(config, training_result)
+
+    def test_resume_is_rejected_for_non_formal_profiles_and_methods(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "periodic.pt"
+            checkpoint.write_bytes(b"stub checkpoint")
+            rejected = (
+                (["--profile", "smoke"], "launch_profile"),
+                (["--profile", "rl-smoke"], "launch_profile"),
+                (["--profile", "long-smoke"], "launch_profile"),
+                (["--profile", "rl-long-smoke"], "launch_profile"),
+                (["--mode", "rl", "--method-id", "ca_gat_mappo", "--set", "training.formal_rl_enabled=true"], "launch_profile"),
+                (["--profile", "rl-formal", "--method-id", "factorized_action_gat_qmix"], "method_id"),
+            )
+            for base_args, expected_text in rejected:
+                with self.subTest(base_args=base_args):
+                    output: list[str] = []
+                    status = main(
+                        [*base_args, "--resume-from", str(checkpoint)],
+                        output_fn=output.append,
+                    )
+                    self.assertEqual(status, 2)
+                    self.assertTrue(any(expected_text in line for line in output))
+
+    def test_resume_path_must_be_an_existing_regular_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cases = (
+                root / "missing.pt",
+                root / "checkpoint-directory",
+            )
+            cases[1].mkdir()
+            for checkpoint in cases:
+                with self.subTest(checkpoint=checkpoint):
+                    output: list[str] = []
+                    status = main(
+                        ["--profile", "rl-formal", "--resume-from", str(checkpoint)],
+                        output_fn=output.append,
+                    )
+                    self.assertEqual(status, 2)
+                    self.assertTrue(any("checkpoint path" in line for line in output))
 
     def test_formal_handler_uses_checkpoint_training(self) -> None:
         config = load_run_config(

@@ -14,6 +14,7 @@ from .config import (
     SUPPORTED_SCENARIOS,
     load_run_config,
 )
+from .execution import ExecutionContext, validate_execution_context
 from .runner import Runner
 
 
@@ -113,6 +114,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print the canonical RunConfig and stop before dispatch",
     )
+    parser.add_argument(
+        "--resume-from",
+        dest="resume_from",
+        metavar="CHECKPOINT_PATH",
+        help="resume one explicit periodic checkpoint for an rl-formal run",
+    )
     return parser
 
 
@@ -131,6 +138,12 @@ def build_run_config_from_args(args: argparse.Namespace):
     return load_run_config(args.config, cli_overrides=cli_overrides)
 
 
+def build_execution_context_from_args(args: argparse.Namespace) -> ExecutionContext:
+    """Build launch instructions without adding them to ``RunConfig``."""
+
+    return ExecutionContext.from_resume_path(getattr(args, "resume_from", None))
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -147,13 +160,19 @@ def main(
     args = parser.parse_args(arguments)
     try:
         config = build_run_config_from_args(args)
+        execution_context = build_execution_context_from_args(args)
+        validate_execution_context(config, execution_context)
     except ConfigError as exc:
         output_fn(f"Configuration error: {exc}")
         return 2
     if args.show_config:
         output_fn(json.dumps(config.snapshot_dict(), ensure_ascii=False, indent=2, sort_keys=True))
         return 0
-    return _dispatch(config, output_fn=output_fn)
+    return _dispatch(
+        config,
+        execution_context=execution_context,
+        output_fn=output_fn,
+    )
 
 
 def interactive_main(
@@ -210,7 +229,12 @@ def interactive_main(
     return _dispatch(config, output_fn=output_fn)
 
 
-def _dispatch(config, *, output_fn: Callable[[str], None]) -> int:
+def _dispatch(
+    config,
+    *,
+    execution_context: ExecutionContext | None = None,
+    output_fn: Callable[[str], None],
+) -> int:
     output_fn(
         f"Resolved RunConfig: mode={config.mode}, method_id={config.method_id}, "
         f"scenario_id={config.scenario_id}, seed={config.seed}, run_id={config.run_id}"
@@ -229,7 +253,7 @@ def _dispatch(config, *, output_fn: Callable[[str], None]) -> int:
             f"cuda_available={str(cuda_available).lower()}, "
             f"cuda_runtime_version={config.reproducibility.cuda_version}"
         )
-    result = Runner().run(config)
+    result = Runner().run(config, execution_context=execution_context)
     output_fn(f"status={result.status}: {result.message}")
     if result.artifacts:
         output_fn("artifacts=" + ", ".join(result.artifacts))
@@ -321,6 +345,7 @@ __all__ = [
     "MENU_ROUTES",
     "RL_PROFILES",
     "build_arg_parser",
+    "build_execution_context_from_args",
     "build_run_config_from_args",
     "interactive_main",
     "main",
