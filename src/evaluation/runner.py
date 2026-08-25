@@ -1,4 +1,4 @@
-"""Independent deterministic four-method Formal Evaluation Runner."""
+"""Independent deterministic Validation Gate V1 Evaluation Runner."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from typing import Any, Callable, Mapping, Sequence
 import numpy as np
 import torch
 
-from ..artifacts import atomic_write_text_group, require_artifact_targets_absent
+from ..artifacts import ArtifactConflictError, atomic_write_text
 from ..config import RunConfig
 from ..env.actions import ActionProposal
 from ..env.environment import U2UMECEnvironment
@@ -25,7 +25,11 @@ from ..models.ca_gat_mappo_actions import (
 from ..policies.heuristic_policy import HeuristicPolicy
 from ..policies.local_only_policy import LocalOnlyPolicy
 from ..policies.random_policy import RandomPolicy
-from .actor_loader import LoadedEvaluationActor, load_final_actor_for_evaluation
+from .actor_loader import (
+    LoadedEvaluationActor,
+    checkpoint_sha256,
+    load_actor_for_evaluation,
+)
 from .metrics import (
     FORMAL_EVALUATION_SCHEMA_VERSION,
     FORMAL_METRIC_FIELDS,
@@ -33,20 +37,23 @@ from .metrics import (
     aggregate_episode_metrics,
     build_episode_metrics,
 )
+from .protocol import EvaluationProtocol
 
 
 FORMAL_METHOD_SUITE = (
     "ca_gat_mappo",
-    "local_only",
     "heuristic",
+    "local_only",
     "random",
 )
 EVALUATION_ARTIFACT_FILENAMES = (
-    "evaluation_manifest.json",
+    "validation_protocol_snapshot.json",
     "episode_metrics.jsonl",
     "aggregate_metrics.json",
-    "evaluation_metrics.csv",
+    "aggregate_metrics.csv",
+    "evaluation_manifest.json",
 )
+FAILED_RUN_MARKER_FILENAME = "RUN_FAILED.json"
 _CONSUMED_ENVIRONMENT_STREAMS = (
     "reset_mobility",
     "task_arrival",
@@ -57,7 +64,55 @@ _CONSUMED_ENVIRONMENT_STREAMS = (
 
 
 class FormalEvaluationError(RuntimeError):
-    """Raised when the Formal Evaluation Gate cannot complete honestly."""
+    """Raised when Validation Gate V1 cannot complete honestly."""
+
+
+@dataclass(frozen=True)
+class EvaluationWorkspaceLayout:
+    """Machine-local source/input and evaluator/output roots."""
+
+    evaluator_root: Path
+    source_training_root: Path
+
+    def __post_init__(self) -> None:
+        evaluator = self.evaluator_root.resolve()
+        source = self.source_training_root.resolve()
+        if evaluator == source:
+            raise FormalEvaluationError(
+                "evaluator and source training worktrees must be different"
+            )
+        object.__setattr__(self, "evaluator_root", evaluator)
+        object.__setattr__(self, "source_training_root", source)
+
+    @classmethod
+    def discover_formal_v1(cls) -> "EvaluationWorkspaceLayout":
+        evaluator = Path(__file__).resolve().parents[2]
+        required = Path(r"D:\My_project_li_validation_gate_v1")
+        try:
+            required = required.resolve(strict=True)
+        except OSError as exc:
+            raise FormalEvaluationError(
+                f"formal Evaluation worktree is unavailable: {exc}"
+            ) from exc
+        if evaluator != required:
+            raise FormalEvaluationError(
+                "Validation Gate V1 must run from "
+                r"D:\My_project_li_validation_gate_v1"
+            )
+        source = evaluator.parent / "My_project_li"
+        if not source.is_dir():
+            raise FormalEvaluationError(
+                f"source training worktree is unavailable: {source}"
+            )
+        return cls(evaluator_root=evaluator, source_training_root=source)
+
+    def checkpoint_directory(self, source_run_id: str) -> Path:
+        return (
+            self.source_training_root
+            / "logs"
+            / source_run_id
+            / "checkpoints"
+        )
 
 
 @dataclass(frozen=True)
@@ -72,31 +127,44 @@ class FormalEvaluationResult:
 
 
 class FormalEvaluationRunner:
-    """Evaluate a frozen actor and three baselines on aligned seed realizations."""
+    """Evaluate a frozen Actor and three baselines on aligned realizations."""
 
     def __init__(
         self,
-        config: RunConfig,
+        evaluator_config: RunConfig,
         checkpoint_path: str | Path,
         *,
         evaluation_device: str,
+        protocol: EvaluationProtocol,
+        workspace_layout: EvaluationWorkspaceLayout | None = None,
         environment_factory: Callable[[RunConfig], U2UMECEnvironment] | None = None,
     ) -> None:
-        if not isinstance(config, RunConfig):
-            raise TypeError("config must be a RunConfig")
-        config.validate()
-        self._validate_config(config)
-        self.config = config
+        if not isinstance(evaluator_config, RunConfig):
+            raise TypeError("evaluator_config must be a RunConfig")
+        if not isinstance(protocol, EvaluationProtocol):
+            raise TypeError("protocol must be an EvaluationProtocol")
+        evaluator_config.validate()
+        self._validate_evaluator_config(evaluator_config, protocol)
+        if protocol.method_ids != FORMAL_METHOD_SUITE:
+            raise FormalEvaluationError("protocol method suite differs from runner")
+        self.evaluator_config = evaluator_config
+        self.protocol = protocol
+        self.workspace_layout = (
+            workspace_layout or EvaluationWorkspaceLayout.discover_formal_v1()
+        )
         self.environment_factory = environment_factory or U2UMECEnvironment
-        self.loaded_actor = load_final_actor_for_evaluation(
-            config,
-            checkpoint_path,
+        target, expected_checkpoint = self._resolve_checkpoint(checkpoint_path)
+        self.loaded_actor = load_actor_for_evaluation(
+            target,
+            protocol=protocol,
+            expected_checkpoint=expected_checkpoint,
             evaluation_device=evaluation_device,
         )
-        self.actor_tensorizer = ActorObservationTensorizer(config)
+        self.config = self.loaded_actor.source_run_config
+        self.actor_tensorizer = ActorObservationTensorizer(self.config)
         self.action_distribution = CAGATMAPPOActionDistribution(
             self.loaded_actor.actor,
-            config,
+            self.config,
         )
         self.evaluation_config_identity = self._evaluation_config_identity()
         self.evaluation_config_sha256 = _canonical_sha256(
@@ -105,13 +173,13 @@ class FormalEvaluationRunner:
         self.evaluation_run_id = self._evaluation_run_id()
 
     def run(self, *, write_artifacts: bool = True) -> FormalEvaluationResult:
-        """Run all configured seeds; a no-write path supports repeatability tests."""
+        """Run all protocol seeds and delay publication until every gate passes."""
 
-        artifact_paths = self.artifact_paths()
-        if write_artifacts:
-            require_artifact_targets_absent(
-                artifact_paths.values(),
-                group_name="formal evaluation artifact group",
+        run_directory = self.run_directory()
+        if write_artifacts and run_directory.exists():
+            raise ArtifactConflictError(
+                "formal evaluation run directory already exists; refusing overwrite: "
+                f"{run_directory}"
             )
 
         actor = self.loaded_actor.actor
@@ -123,43 +191,27 @@ class FormalEvaluationRunner:
         )
 
         episodes: list[EvaluationEpisodeResult] = []
-        for evaluation_seed in self.config.evaluation.evaluation_seeds:
-            seed_episodes: list[EvaluationEpisodeResult] = []
+        for evaluation_seed in self.protocol.validation_seeds:
             for method_id in FORMAL_METHOD_SUITE:
-                seed_episodes.append(
-                    self._run_episode(method_id, int(evaluation_seed))
-                )
-            trace_hashes = {
-                item.method_id: item.external_trace_sha256
-                for item in seed_episodes
-            }
-            if len(set(trace_hashes.values())) != 1:
-                raise FormalEvaluationError(
-                    "external environment realization diverged across methods for "
-                    f"evaluation seed {evaluation_seed}: {trace_hashes}"
-                )
-            episodes.extend(seed_episodes)
-
-        if actor.training:
-            raise FormalEvaluationError("frozen actor left evaluation mode")
-        after_state = _state_dict_snapshot(actor)
-        if tuple(before_state) != tuple(after_state) or any(
-            not torch.equal(before_state[name], after_state[name])
-            for name in before_state
-        ):
-            raise FormalEvaluationError("frozen actor state changed during evaluation")
-        after_requires_grad = tuple(
-            (name, parameter.requires_grad)
-            for name, parameter in actor.named_parameters()
-        )
-        if before_requires_grad != after_requires_grad:
-            raise FormalEvaluationError(
-                "actor parameter requires_grad state changed during evaluation"
-            )
+                episodes.append(self._run_episode(method_id, evaluation_seed))
 
         aggregate = aggregate_episode_metrics(episodes, FORMAL_METHOD_SUITE)
         aggregate["evaluation_run_id"] = self.evaluation_run_id
-        manifest = self._manifest(tuple(episodes), before_requires_grad)
+        checkpoint_hash_after_evaluation = checkpoint_sha256(
+            self.loaded_actor.source_checkpoint_path
+        )
+        self._validate_checkpoint_hashes(checkpoint_hash_after_evaluation)
+        shared_traces = self._validate_external_traces(tuple(episodes))
+        self._validate_actor_unchanged(
+            before_state=before_state,
+            before_requires_grad=before_requires_grad,
+        )
+        manifest = self._manifest(
+            tuple(episodes),
+            before_requires_grad,
+            checkpoint_hash_after_evaluation,
+            shared_traces,
+        )
         artifacts = (
             self._write_artifacts(manifest, tuple(episodes), aggregate)
             if write_artifacts
@@ -173,26 +225,61 @@ class FormalEvaluationRunner:
             artifacts=artifacts,
         )
 
-    def artifact_paths(self) -> Mapping[str, Path]:
-        """Return the isolated identity directory without creating it."""
-
-        root = (
-            Path(self.config.output.logs_dir)
+    def run_directory(self) -> Path:
+        return (
+            self.workspace_layout.evaluator_root
+            / "logs"
             / "evaluations"
+            / self.protocol.evaluation_phase
             / self.evaluation_run_id
+        )
+
+    def artifact_paths(self) -> Mapping[str, Path]:
+        """Return all five formal paths without creating their directory."""
+
+        root = self.run_directory()
+        names = (
+            "protocol_snapshot",
+            "episode_metrics",
+            "aggregate_metrics",
+            "aggregate_metrics_csv",
+            "manifest",
         )
         return {
             name: root / filename
-            for name, filename in zip(
-                (
-                    "manifest",
-                    "episode_metrics",
-                    "aggregate_metrics",
-                    "evaluation_metrics_csv",
-                ),
-                EVALUATION_ARTIFACT_FILENAMES,
-            )
+            for name, filename in zip(names, EVALUATION_ARTIFACT_FILENAMES)
         }
+
+    def _resolve_checkpoint(self, checkpoint_path: str | Path):
+        candidate = Path(checkpoint_path)
+        try:
+            selected = self.protocol.checkpoint_for_filename(candidate.name)
+        except ValueError as exc:
+            raise FormalEvaluationError(str(exc)) from exc
+        expected_path = (
+            self.workspace_layout.checkpoint_directory(self.protocol.source_run_id)
+            / selected.filename
+        )
+        try:
+            target = candidate.resolve(strict=True)
+            expected = expected_path.resolve(strict=True)
+        except OSError as exc:
+            raise FormalEvaluationError(
+                f"formal checkpoint path cannot be resolved: {exc}"
+            ) from exc
+        if target != expected:
+            raise FormalEvaluationError(
+                "checkpoint must be the allowlisted file in the fixed source run"
+            )
+        try:
+            target.relative_to(self.workspace_layout.evaluator_root)
+        except ValueError:
+            pass
+        else:
+            raise FormalEvaluationError(
+                "checkpoint input must not be inside the Evaluation worktree"
+            )
+        return target, selected
 
     def _run_episode(
         self,
@@ -269,9 +356,9 @@ class FormalEvaluationRunner:
                 )
             observations = step.observations
 
-        if len(slot_infos) != episode_config.environment.episode_horizon:
+        if len(slot_infos) != self.protocol.episode_horizon_slots:
             raise FormalEvaluationError(
-                "evaluation episode did not execute the configured horizon"
+                "evaluation episode did not execute the protocol horizon"
             )
         environment.assert_invariants()
         action_trace_tuple = tuple(action_trace)
@@ -311,8 +398,7 @@ class FormalEvaluationRunner:
             )
         if output.mode != "deterministic":
             raise FormalEvaluationError("actor did not use deterministic action mode")
-        proposals = tuple(output.proposals[0][0])
-        return proposals, output.hidden_out.detach()
+        return tuple(output.proposals[0][0]), output.hidden_out.detach()
 
     def _external_trace_record(
         self,
@@ -337,7 +423,7 @@ class FormalEvaluationRunner:
             "channel_fading": environment.channel_model.rng,
             "csi_error": environment.channel_history.csi_error_rng,
         }
-        record: dict[str, Any] = {
+        return {
             "phase": phase,
             "environment_seed": environment.config.seed,
             "rng_state_sha256": {
@@ -346,9 +432,7 @@ class FormalEvaluationRunner:
             },
             "mobility": {
                 "slot": environment.mobility.slot,
-                "positions_sha256": _array_sha256(
-                    environment.mobility.positions_m
-                ),
+                "positions_sha256": _array_sha256(environment.mobility.positions_m),
                 "velocities_sha256": _array_sha256(
                     environment.mobility.velocities_mps
                 ),
@@ -383,94 +467,150 @@ class FormalEvaluationRunner:
                 "status": "reserved_not_consumed_by_current_backend",
             },
         }
-        return record
+
+    def _validate_checkpoint_hashes(self, final_hash: str) -> None:
+        loaded = self.loaded_actor
+        if not (
+            loaded.checkpoint_expected_sha256
+            == loaded.checkpoint_sha256_before
+            == loaded.checkpoint_sha256_after_actor_load
+            == final_hash
+        ):
+            raise FormalEvaluationError(
+                "checkpoint SHA-256 changed during complete Evaluation"
+            )
+
+    def _validate_external_traces(
+        self,
+        episodes: tuple[EvaluationEpisodeResult, ...],
+    ) -> Mapping[str, str]:
+        shared: dict[str, str] = {}
+        for seed in self.protocol.validation_seeds:
+            selected = tuple(item for item in episodes if item.evaluation_seed == seed)
+            if tuple(item.method_id for item in selected) != FORMAL_METHOD_SUITE:
+                raise FormalEvaluationError(
+                    f"episode method suite is incomplete for seed {seed}"
+                )
+            traces = {item.method_id: item.external_trace_sha256 for item in selected}
+            if len(set(traces.values())) != 1:
+                raise FormalEvaluationError(
+                    "external environment realization diverged across methods for "
+                    f"evaluation seed {seed}: {traces}"
+                )
+            shared[str(seed)] = selected[0].external_trace_sha256
+        return shared
+
+    def _validate_actor_unchanged(
+        self,
+        *,
+        before_state: Mapping[str, torch.Tensor],
+        before_requires_grad: tuple[tuple[str, bool], ...],
+    ) -> None:
+        actor = self.loaded_actor.actor
+        if actor.training:
+            raise FormalEvaluationError("frozen actor left evaluation mode")
+        after_state = _state_dict_snapshot(actor)
+        if tuple(before_state) != tuple(after_state) or any(
+            not torch.equal(before_state[name], after_state[name])
+            for name in before_state
+        ):
+            raise FormalEvaluationError("frozen actor state changed during evaluation")
+        after_requires_grad = tuple(
+            (name, parameter.requires_grad)
+            for name, parameter in actor.named_parameters()
+        )
+        if before_requires_grad != after_requires_grad:
+            raise FormalEvaluationError(
+                "actor parameter requires_grad state changed during evaluation"
+            )
 
     def _evaluation_config_identity(self) -> Mapping[str, Any]:
         return {
+            "source_training_config_hash": self.loaded_actor.source_training_config_hash,
             "scenario_id": self.config.scenario_id,
             "environment": _jsonable(asdict(self.config.environment)),
             "action": _jsonable(asdict(self.config.action)),
-            "evaluation": _jsonable(asdict(self.config.evaluation)),
-            "evaluation_seeds": list(self.config.evaluation.evaluation_seeds),
-            "episode_horizon": self.config.environment.episode_horizon,
+            "evaluation_protocol_sha256": self.protocol.sha256,
+            "evaluation_seeds": list(self.protocol.validation_seeds),
+            "episode_horizon_slots": self.protocol.episode_horizon_slots,
             "method_suite": list(FORMAL_METHOD_SUITE),
             "evaluation_device": self.loaded_actor.evaluation_device,
             "dtype": self.loaded_actor.dtype,
         }
 
     def _evaluation_run_id(self) -> str:
-        identity = {
-            "source_checkpoint_sha256": (
-                self.loaded_actor.source_checkpoint_sha256
-            ),
-            "evaluation_config_sha256": self.evaluation_config_sha256,
-            "evaluation_seeds": list(self.config.evaluation.evaluation_seeds),
-            "method_suite": list(FORMAL_METHOD_SUITE),
-            "evaluator_git_commit": self.config.git_commit,
-            "evaluator_git_dirty": self.config.git_dirty,
-            "evaluation_device": self.loaded_actor.evaluation_device,
-            "dtype": self.loaded_actor.dtype,
-        }
-        digest = _canonical_sha256(identity)
+        loaded = self.loaded_actor
+        source_digest = _canonical_sha256(self.protocol.source_run_id)[:8]
+        kind = {
+            "PERIODIC_RESUME": "pr",
+            "FINAL_COMPLETED": "fc",
+        }[loaded.source_checkpoint_kind]
         return (
-            f"formal-eval__{self.config.scenario_id}__"
-            f"chk-{self.loaded_actor.source_checkpoint_sha256[:12]}__"
-            f"cfg-{self.evaluation_config_sha256[:12]}__"
-            f"eval-{digest[:12]}"
+            f"val-v1__src-{source_digest}__s-{loaded.source_training_seed}__"
+            f"k-{kind}__n-{loaded.source_checkpoint_step}__"
+            f"c-{loaded.checkpoint_expected_sha256[:8]}__"
+            f"p-{self.protocol.sha256[:8]}__"
+            f"e-{self.evaluator_config.git_commit[:8]}"
         )
 
     def _manifest(
         self,
         episodes: tuple[EvaluationEpisodeResult, ...],
         requires_grad: tuple[tuple[str, bool], ...],
+        checkpoint_hash_after_evaluation: str,
+        shared_traces: Mapping[str, str],
     ) -> Mapping[str, Any]:
         traces_by_seed: dict[str, Any] = {}
-        for seed in self.config.evaluation.evaluation_seeds:
-            selected = tuple(
-                item for item in episodes if item.evaluation_seed == seed
-            )
+        for seed in self.protocol.validation_seeds:
+            selected = tuple(item for item in episodes if item.evaluation_seed == seed)
             traces_by_seed[str(seed)] = {
-                "shared_external_trace_sha256": selected[0].external_trace_sha256,
+                "shared_external_trace_sha256": shared_traces[str(seed)],
                 "method_trace_sha256": {
-                    item.method_id: item.external_trace_sha256
-                    for item in selected
+                    item.method_id: item.external_trace_sha256 for item in selected
                 },
             }
+        loaded = self.loaded_actor
         stream_ids = self.config.reproducibility.stream_ids
         return {
+            "run_status": "completed",
             "evaluation_schema_version": FORMAL_EVALUATION_SCHEMA_VERSION,
             "evaluation_run_id": self.evaluation_run_id,
+            "evaluation_phase": self.protocol.evaluation_phase,
+            "evaluation_protocol_version": self.protocol.evaluation_protocol_version,
+            "evaluation_protocol_sha256": self.protocol.sha256,
             "evaluation_config_sha256": self.evaluation_config_sha256,
+            "source_run_id": loaded.source_run_id,
+            "source_training_seed": loaded.source_training_seed,
+            "source_training_git_commit": loaded.source_training_git_commit,
+            "evaluator_git_commit": self.evaluator_config.git_commit,
+            "evaluator_git_branch": self.evaluator_config.git_branch,
+            "evaluator_git_dirty": self.evaluator_config.git_dirty,
+            "source_training_config_hash": loaded.source_training_config_hash,
+            "recomputed_source_training_config_hash": (
+                loaded.recomputed_source_training_config_hash
+            ),
+            "scenario_id": self.protocol.scenario_id,
+            "episode_horizon_slots": self.protocol.episode_horizon_slots,
+            "evaluation_seeds": list(self.protocol.validation_seeds),
             "method_suite": list(FORMAL_METHOD_SUITE),
-            "source_checkpoint_path": str(
-                self.loaded_actor.source_checkpoint_path
+            "source_checkpoint_path": str(loaded.source_checkpoint_path),
+            "source_checkpoint_sha256": loaded.source_checkpoint_sha256,
+            "source_checkpoint_kind": loaded.source_checkpoint_kind,
+            "checkpoint_kind": loaded.source_checkpoint_kind,
+            "checkpoint_step": loaded.source_checkpoint_step,
+            "checkpoint_expected_sha256": loaded.checkpoint_expected_sha256,
+            "checkpoint_sha256_before": loaded.checkpoint_sha256_before,
+            "checkpoint_sha256_after_actor_load": (
+                loaded.checkpoint_sha256_after_actor_load
             ),
-            "source_checkpoint_sha256": (
-                self.loaded_actor.source_checkpoint_sha256
-            ),
-            "source_checkpoint_kind": self.loaded_actor.source_checkpoint_kind,
-            "source_method_id": self.loaded_actor.source_method_id,
-            "source_training_config_hash": (
-                self.loaded_actor.source_training_config_hash
-            ),
-            "source_training_git_commit": (
-                self.loaded_actor.source_training_git_commit
-            ),
-            "evaluator_git_commit": self.config.git_commit,
-            "evaluator_git_branch": self.config.git_branch,
-            "evaluator_git_dirty": self.config.git_dirty,
-            "scenario_id": self.config.scenario_id,
-            "evaluation_seeds": list(self.config.evaluation.evaluation_seeds),
-            "episode_horizon": self.config.environment.episode_horizon,
-            "actor_architecture_identity": dict(
-                self.loaded_actor.actor_architecture_identity
-            ),
-            "action_domain_identity": dict(
-                self.loaded_actor.action_domain_identity
-            ),
-            "training_device": self.loaded_actor.source_training_device,
-            "evaluation_device": self.loaded_actor.evaluation_device,
-            "dtype": self.loaded_actor.dtype,
+            "checkpoint_sha256_after_evaluation": checkpoint_hash_after_evaluation,
+            "checkpoint_sha256_after": checkpoint_hash_after_evaluation,
+            "source_method_id": loaded.source_method_id,
+            "actor_architecture_identity": dict(loaded.actor_architecture_identity),
+            "action_domain_identity": dict(loaded.action_domain_identity),
+            "training_device": loaded.source_training_device,
+            "evaluation_device": loaded.evaluation_device,
+            "dtype": loaded.dtype,
             "checkpoint_map_location_contract": (
                 "structured payload validated on CPU; actor state only copied to "
                 "the explicit evaluation device"
@@ -482,9 +622,7 @@ class FormalEvaluationRunner:
             "actor_requires_grad_state": {
                 name: value for name, value in requires_grad
             },
-            "cpu_bitwise_repeatability_required": (
-                self.loaded_actor.evaluation_device == "cpu"
-            ),
+            "cpu_bitwise_repeatability_required": loaded.evaluation_device == "cpu",
             "cuda_bitwise_repeatability_claimed": False,
             "environment_rng_stream_contract": {
                 name: {
@@ -500,6 +638,7 @@ class FormalEvaluationRunner:
                     "action_dependent_measurement_not_forced_equal": True,
                 }
             },
+            "external_trace_sha256_by_seed": dict(shared_traces),
             "shared_external_trace_by_seed": traces_by_seed,
             "artifact_filenames": list(EVALUATION_ARTIFACT_FILENAMES),
         }
@@ -511,22 +650,48 @@ class FormalEvaluationRunner:
         aggregate: Mapping[str, Any],
     ) -> tuple[str, ...]:
         paths = self.artifact_paths()
-        manifest_text = _pretty_json(manifest)
-        episode_text = "".join(
-            _compact_json(item.artifact_record(self.evaluation_run_id)) + "\n"
-            for item in episodes
-        )
-        aggregate_text = _pretty_json(aggregate)
-        csv_text = self._evaluation_csv(episodes)
-        ordered_paths = tuple(paths.values())
-        atomic_write_text_group(
-            zip(
-                ordered_paths,
-                (manifest_text, episode_text, aggregate_text, csv_text),
+        run_directory = self.run_directory()
+        try:
+            run_directory.mkdir(parents=True, exist_ok=False)
+        except FileExistsError as exc:
+            raise ArtifactConflictError(
+                "formal evaluation run directory already exists; refusing overwrite: "
+                f"{run_directory}"
+            ) from exc
+        contents = (
+            ("protocol_snapshot", self.protocol.snapshot_text),
+            (
+                "episode_metrics",
+                "".join(
+                    _compact_json(item.artifact_record(self.evaluation_run_id)) + "\n"
+                    for item in episodes
+                ),
             ),
-            group_name="formal evaluation artifact group",
+            ("aggregate_metrics", _pretty_json(aggregate)),
+            ("aggregate_metrics_csv", self._evaluation_csv(episodes)),
+            ("manifest", _pretty_json(manifest)),
         )
-        return tuple(str(path) for path in ordered_paths)
+        stage = "directory_created"
+        try:
+            for stage, content in contents:
+                atomic_write_text(paths[stage], content)
+        except Exception as exc:
+            marker = run_directory / FAILED_RUN_MARKER_FILENAME
+            failure = {
+                "run_status": "failed",
+                "evaluation_run_id": self.evaluation_run_id,
+                "failed_stage": stage,
+                "exception_type": type(exc).__name__,
+                "exception_message": str(exc),
+            }
+            try:
+                atomic_write_text(marker, _pretty_json(failure))
+            except Exception:
+                pass
+            raise FormalEvaluationError(
+                f"artifact publication failed at {stage}: {exc}"
+            ) from exc
+        return tuple(str(paths[name]) for name, _content in contents)
 
     def _evaluation_csv(
         self,
@@ -568,35 +733,33 @@ class FormalEvaluationRunner:
         return stream.getvalue()
 
     @staticmethod
-    def _validate_config(config: RunConfig) -> None:
+    def _validate_evaluator_config(
+        config: RunConfig,
+        protocol: EvaluationProtocol,
+    ) -> None:
         if config.mode != "evaluation" or config.method_id != "ca_gat_mappo":
             raise FormalEvaluationError(
-                "Formal Evaluation Runner requires evaluation/ca_gat_mappo"
+                "Validation Gate V1 requires evaluation/ca_gat_mappo dispatch"
             )
-        evaluation = config.evaluation
-        seeds = tuple(evaluation.evaluation_seeds)
-        if not seeds or any(
-            isinstance(seed, bool) or not isinstance(seed, int) or seed < 0
-            for seed in seeds
+        if not config.git_commit or config.git_commit == "unknown":
+            raise FormalEvaluationError("evaluator git provenance is unavailable")
+        if config.git_dirty:
+            raise FormalEvaluationError(
+                "formal Validation requires a clean evaluator worktree"
+            )
+        if config.git_commit == protocol.source_training_git_commit:
+            raise FormalEvaluationError(
+                "evaluator commit must be independent from the training source commit"
+            )
+        inference = protocol.inference_contract
+        if (
+            not inference.actor_eval
+            or not inference.torch_no_grad
+            or inference.action_selection != "deterministic_masked_argmax"
+            or inference.gru_hidden_reset_scope != "episode"
+            or inference.network_updates
         ):
-            raise FormalEvaluationError(
-                "evaluation seeds must be a non-empty tuple of non-negative integers"
-            )
-        if len(set(seeds)) != len(seeds):
-            raise FormalEvaluationError("evaluation seeds must be unique")
-        if set(seeds).intersection(evaluation.train_seeds):
-            raise FormalEvaluationError("train and evaluation seeds must be disjoint")
-        if evaluation.inference_rule_mappo != "masked_argmax":
-            raise FormalEvaluationError(
-                "MAPPO evaluation inference rule must remain masked_argmax"
-            )
-        if evaluation.update_network:
-            raise FormalEvaluationError("evaluation network updates are forbidden")
-        required_statistics = {"mean", "std", "valid_sample_count"}
-        if not required_statistics.issubset(evaluation.metric_statistics):
-            raise FormalEvaluationError(
-                "evaluation statistics must include mean, std, and valid_sample_count"
-            )
+            raise FormalEvaluationError("EvaluationProtocol inference contract is unsafe")
 
 
 def _proposal_record(proposal: ActionProposal) -> Mapping[str, Any]:
@@ -675,7 +838,9 @@ def _jsonable(value: Any) -> Any:
 
 __all__ = [
     "EVALUATION_ARTIFACT_FILENAMES",
+    "FAILED_RUN_MARKER_FILENAME",
     "FORMAL_METHOD_SUITE",
+    "EvaluationWorkspaceLayout",
     "FormalEvaluationError",
     "FormalEvaluationResult",
     "FormalEvaluationRunner",

@@ -123,8 +123,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--evaluate-from",
         dest="evaluate_from",
-        metavar="FINAL_CHECKPOINT_PATH",
-        help="evaluate one explicit FINAL_COMPLETED checkpoint",
+        metavar="CHECKPOINT_PATH",
+        help="evaluate one Validation Gate V1 allowlisted checkpoint",
     )
     parser.add_argument(
         "--evaluation-device",
@@ -146,7 +146,28 @@ def build_run_config_from_args(args: argparse.Namespace):
         if not separator or not key.strip():
             raise ConfigError(f"invalid --set override {raw_override!r}; expected KEY=VALUE")
         cli_overrides[key.strip()] = _parse_cli_value(raw_value.strip())
-    return load_run_config(args.config, cli_overrides=cli_overrides)
+    config = load_run_config(args.config, cli_overrides=cli_overrides)
+    _validate_formal_evaluation_cli_args(args, config.mode)
+    return config
+
+
+def _validate_formal_evaluation_cli_args(
+    args: argparse.Namespace,
+    resolved_mode: str,
+) -> None:
+    if resolved_mode != "evaluation":
+        return
+    forbidden: list[str] = []
+    for name in ("config", "profile", "scenario_id", "seed"):
+        if getattr(args, name, None) is not None:
+            forbidden.append(f"--{name.replace('_', '-')}")
+    if getattr(args, "overrides", None):
+        forbidden.append("--set")
+    if forbidden:
+        raise ConfigError(
+            "Validation Gate V1 does not accept CLI training/environment config: "
+            + ", ".join(forbidden)
+        )
 
 
 def build_execution_context_from_args(args: argparse.Namespace) -> ExecutionContext:
@@ -218,6 +239,44 @@ def interactive_main(
             "smoke",
         )
         profile_overrides = _rl_profile_overrides(profile)
+    if mode == "evaluation":
+        try:
+            config = load_run_config(
+                interactive_overrides={
+                    "mode": "evaluation",
+                    "method_id": "ca_gat_mappo",
+                }
+            )
+        except ConfigError as exc:
+            output_fn(f"Configuration error: {exc}")
+            return 2
+        checkpoint_path = _prompt_optional(
+            input_fn,
+            output_fn,
+            "Validation Gate V1 checkpoint path (required): ",
+        )
+        evaluation_device = _prompt_choice(
+            input_fn,
+            output_fn,
+            "Evaluation device [cpu/cuda] "
+            "(default: cpu, source: conservative-default): ",
+            ("cpu", "cuda"),
+            "cpu",
+        )
+        execution_context = ExecutionContext.from_evaluation_path(
+            checkpoint_path or None,
+            evaluation_device,
+        )
+        try:
+            validate_execution_context(config, execution_context)
+        except ConfigError as exc:
+            output_fn(f"Configuration error: {exc}")
+            return 2
+        return _dispatch(
+            config,
+            execution_context=execution_context,
+            output_fn=output_fn,
+        )
     scenario_id = _prompt_choice(
         input_fn,
         output_fn,
@@ -246,33 +305,9 @@ def interactive_main(
     except ConfigError as exc:
         output_fn(f"Configuration error: {exc}")
         return 2
-    execution_context: ExecutionContext | None = None
-    if mode == "evaluation":
-        checkpoint_path = _prompt_optional(
-            input_fn,
-            output_fn,
-            "FINAL_COMPLETED checkpoint path (required): ",
-        )
-        evaluation_device = _prompt_choice(
-            input_fn,
-            output_fn,
-            "Evaluation device [cpu/cuda] "
-            "(default: cpu, source: conservative-default): ",
-            ("cpu", "cuda"),
-            "cpu",
-        )
-        execution_context = ExecutionContext.from_evaluation_path(
-            checkpoint_path or None,
-            evaluation_device,
-        )
-        try:
-            validate_execution_context(config, execution_context)
-        except ConfigError as exc:
-            output_fn(f"Configuration error: {exc}")
-            return 2
     return _dispatch(
         config,
-        execution_context=execution_context,
+        execution_context=None,
         output_fn=output_fn,
     )
 

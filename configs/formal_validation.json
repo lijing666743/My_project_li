@@ -1,0 +1,44 @@
+{
+  "evaluation_phase": "validation",
+  "evaluation_protocol_version": "validation_gate_v1",
+  "source_run_id": "ca_gat_mappo__small__seed-42__cfg-e819fe0b2d47__git-f630ec5d0c2b",
+  "source_training_seed": 42,
+  "source_training_git_commit": "f630ec5d0c2b7e410c347a9c6ce17cd69510ecc1",
+  "source_training_config_hash": "e819fe0b2d4789318512bd0c0b33e0137a0a5a9d6928989ba632c6c3ba7b6584",
+  "scenario_id": "small",
+  "episode_horizon_slots": 500,
+  "validation_seeds": [1042, 1043, 1044, 1045, 1046],
+  "methods": [
+    {"id": "ca_gat_mappo", "display_name": "CA-GAT-MAPPO"},
+    {"id": "heuristic", "display_name": "Greedy Heuristic"},
+    {"id": "local_only", "display_name": "Local-only"},
+    {"id": "random", "display_name": "Random"}
+  ],
+  "checkpoints": [
+    {
+      "filename": "step_100000.pt",
+      "checkpoint_kind": "PERIODIC_RESUME",
+      "checkpoint_step": 100000,
+      "expected_sha256": "476061dba7689452495974f8bef68438428bb0ff3142c356bafe221f1733f5a0"
+    },
+    {
+      "filename": "step_200000.pt",
+      "checkpoint_kind": "PERIODIC_RESUME",
+      "checkpoint_step": 200000,
+      "expected_sha256": "b53ebbcd935a7b62a4cac3bd75c736dcd8ed923894ab9fb7a7da21d9d4c883ab"
+    },
+    {
+      "filename": "final.pt",
+      "checkpoint_kind": "FINAL_COMPLETED",
+      "checkpoint_step": 500000,
+      "expected_sha256": "df8582648aa3b3dce16711fee231d082084ed428e1c1e43129acdc6f5a582f5f"
+    }
+  ],
+  "inference_contract": {
+    "actor_eval": true,
+    "torch_no_grad": true,
+    "action_selection": "deterministic_masked_argmax",
+    "gru_hidden_reset_scope": "episode",
+    "network_updates": false
+  }
+}
