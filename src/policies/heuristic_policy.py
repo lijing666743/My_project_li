@@ -1,9 +1,10 @@
-"""Frozen deterministic heuristic baseline over actor-visible observations.
+"""Post-Validation-V1 V2 heuristic over actor-visible observations.
 
-The policy implements the Section 4 Deadline-and-Historical-Link-Aware
-Lexicographic Heuristic. It emits only the seven-branch proposal and
-deliberately has no access to centralized state, current channel truth,
-executor metadata, or environment RNG state.
+The historical Validation V1 baseline remains frozen in its original
+artifacts. This repair keeps the seven-branch proposal boundary while adding
+actor-visible coarse route feasibility and discrete-slot CPU deadline checks.
+It has no access to centralized state, current channel truth, executor
+metadata, or environment RNG state.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import numpy as np
 
 from ..config import RunConfig
 from ..env.actions import ActionProposal
+from ..env.channel import receiver_noise_power_w
 from ..env.observation import ActorObservation
 
 
@@ -29,6 +31,38 @@ class HistoricalQualityAggregate:
 
     history_valid: bool
     mean: float | None
+
+
+@dataclass(frozen=True)
+class CpuFrequencyTelemetry:
+    """Observable V2 deadline-feasibility result for one actor decision."""
+
+    uav_id: int
+    selected_queue: str | int
+    selected_frequency_level: float
+    selected_frequency_hz: float
+    pending_task_count: int
+    deadline_feasible: bool | None
+    infeasible_fallback: bool
+
+
+@dataclass(frozen=True)
+class _CpuFrequencyDecision:
+    level: float
+    frequency_hz: float
+    pending_task_count: int
+    deadline_feasible: bool | None
+    infeasible_fallback: bool
+
+
+@dataclass(frozen=True)
+class _CpuQueueDemand:
+    source: int
+    task_count: int
+    total_remaining_cycles: float
+    head_task_id: int
+    head_remaining_cycles: float
+    head_slack_slots: int
 
 
 def masked_historical_quality(
@@ -76,7 +110,7 @@ def masked_historical_quality(
 
 
 class HeuristicPolicy:
-    """Deadline- and historical-link-aware deterministic proposal policy."""
+    """Post-Validation-V1 deterministic V2 proposal policy."""
 
     method_id = "heuristic"
     policy_stream_id = None
@@ -96,12 +130,35 @@ class HeuristicPolicy:
             )
         self.policy_seed = resolved_seed
         self._slot_duration_s = float(config.environment.slot_duration_s)
+        self._reference_cpu_frequency_hz = float(
+            config.environment.reference_cpu_frequency_hz
+        )
+        self._ru_bandwidth_hz = float(
+            config.environment.ru_bandwidth_hz
+        )
+        self._reference_rate_bps = float(
+            config.environment.reference_rate_bps
+        )
+        self._cold_start_sinr_floor = float(
+            config.environment.outage_threshold_linear
+        )
+        self._reference_power_per_ru_w = float(
+            config.environment.reference_transmit_power_w
+            / config.environment.ru_count
+        )
+        self._noise_power_per_ru_w = receiver_noise_power_w(
+            config.environment
+        )
+        self._cold_start_width = max(
+            int(value) for value in config.action.resource_width_options
+        )
         self._sampling_order = tuple(config.action.sampling_order)
         self._canonical = dict(config.action.canonical_inactive_values)
         self._resource_groups = tuple(
             tuple(int(ru) - 1 for ru in group)
             for group in config.environment.resource_groups
         )
+        self._cpu_frequency_telemetry: dict[int, CpuFrequencyTelemetry] = {}
 
     @property
     def seed_material(self) -> dict[str, int | None]:
@@ -112,8 +169,17 @@ class HeuristicPolicy:
             "policy_stream_id": self.policy_stream_id,
         }
 
+    @property
+    def cpu_frequency_telemetry(self) -> tuple[CpuFrequencyTelemetry, ...]:
+        """Return immutable latest-per-UAV V2 feasibility telemetry."""
+
+        return tuple(
+            self._cpu_frequency_telemetry[uav_id]
+            for uav_id in sorted(self._cpu_frequency_telemetry)
+        )
+
     def act(self, observation: ActorObservation) -> ActionProposal:
-        """Choose one legal proposal in the frozen seven-branch order."""
+        """Choose one legal proposal in the unchanged seven-branch order."""
 
         masks = observation.action_masks
         if tuple(masks.sampling_order) != self._sampling_order:
@@ -134,7 +200,8 @@ class HeuristicPolicy:
         context["power_level"] = power_level
         cpu_queue = self._select_cpu_queue(observation, context)
         context["cpu_queue"] = cpu_queue
-        cpu_frequency = self._select_cpu_frequency(observation, context)
+        cpu_decision = self._select_cpu_frequency(observation, context)
+        cpu_frequency = cpu_decision.level
 
         proposal = ActionProposal(
             uav_id=observation.uav_id,
@@ -148,8 +215,19 @@ class HeuristicPolicy:
         )
         if not masks.is_legal(proposal):
             raise HeuristicPolicyError(
-                "frozen heuristic produced an illegal proposal"
+                "V2 heuristic produced an illegal proposal"
             )
+        self._cpu_frequency_telemetry[observation.uav_id] = (
+            CpuFrequencyTelemetry(
+                uav_id=observation.uav_id,
+                selected_queue=cpu_queue,
+                selected_frequency_level=cpu_decision.level,
+                selected_frequency_hz=cpu_decision.frequency_hz,
+                pending_task_count=cpu_decision.pending_task_count,
+                deadline_feasible=cpu_decision.deadline_feasible,
+                infeasible_fallback=cpu_decision.infeasible_fallback,
+            )
+        )
         return proposal
 
     def _select_route(
@@ -181,9 +259,16 @@ class HeuristicPolicy:
         remote_candidates = self._integer_actions(
             legal, exclude=observation.uav_id
         )
-        if slack >= 3 and remote_candidates:
+        feasible_remote_candidates = [
+            destination
+            for destination in remote_candidates
+            if self._remote_route_is_coarsely_feasible(
+                observation, destination
+            )
+        ]
+        if feasible_remote_candidates:
             return min(
-                remote_candidates,
+                feasible_remote_candidates,
                 key=lambda destination: self._historical_key(
                     self._destination_quality(observation, destination),
                     destination,
@@ -192,6 +277,163 @@ class HeuristicPolicy:
         if local_legal:
             return "local"
         return self._require_value("route", "defer", legal)
+
+    def _remote_route_is_coarsely_feasible(
+        self,
+        observation: ActorObservation,
+        destination: int,
+    ) -> bool:
+        """Exclude clearly infeasible destinations using actor-visible proxies."""
+
+        head = observation.private_queues.unbound
+        public = observation.neighbor_public
+        if bool(public.valid_mask[destination]):
+            maximum_hz = (
+                float(public.max_cpu_frequency_ratio[destination])
+                * self._reference_cpu_frequency_hz
+            )
+            queued_cycles = float(
+                public.cpu_load_remaining_cycles[destination]
+            )
+        else:
+            source_maximum_hz = float(
+                observation.self_resources.max_cpu_frequency_hz
+            )
+            tolerance = math.ulp(
+                max(1.0, self._reference_cpu_frequency_hz)
+            )
+            if (
+                source_maximum_hz
+                > self._reference_cpu_frequency_hz + tolerance
+            ):
+                return False
+            maximum_hz = source_maximum_hz
+            queued_cycles = 0.0
+        expected_rate_bps = self._estimated_route_rate_bps(
+            observation,
+            destination,
+        )
+        remaining_bits = float(head.head_remaining_bits)
+        remaining_cycles = float(head.head_remaining_cycles)
+        values = (
+            maximum_hz,
+            queued_cycles,
+            expected_rate_bps,
+            remaining_bits,
+            remaining_cycles,
+        )
+        if not all(math.isfinite(value) and value >= 0.0 for value in values):
+            raise HeuristicPolicyError(
+                "route-feasibility inputs must be finite and non-negative"
+            )
+        if maximum_hz <= 0.0 or expected_rate_bps <= 0.0:
+            return False
+
+        transmission_slots = self._required_service_slots(
+            remaining_bits,
+            expected_rate_bps,
+        )
+        available_cpu_slots = (
+            int(head.head_slack_slots) - 1 - transmission_slots
+        )
+        if available_cpu_slots <= 0:
+            return False
+        capacity_cycles = (
+            maximum_hz
+            * self._slot_duration_s
+            * available_cpu_slots
+        )
+        required_cycles = queued_cycles + remaining_cycles
+        tolerance = math.ulp(max(1.0, capacity_cycles))
+        return required_cycles <= capacity_cycles + tolerance
+
+    def _estimated_route_rate_bps(
+        self,
+        observation: ActorObservation,
+        destination: int,
+    ) -> float:
+        """Estimate a causal link rate without requiring a prior TX."""
+
+        edge = observation.edge_history
+        last_rates = np.asarray(
+            edge.last_effective_rate_bps,
+            dtype=np.float64,
+        )
+        last_valid = np.asarray(
+            edge.last_rate_valid_mask,
+            dtype=np.bool_,
+        )
+        if (
+            last_rates.ndim != 1
+            or last_valid.shape != last_rates.shape
+            or not 0 <= destination < last_rates.shape[0]
+        ):
+            raise HeuristicPolicyError(
+                "last-rate values and masks must share the UAV index"
+            )
+        rate = float(last_rates[destination])
+        if not math.isfinite(rate) or rate < 0.0:
+            raise HeuristicPolicyError(
+                "last effective rates must be finite and non-negative"
+            )
+        if bool(last_valid[destination]):
+            return rate
+
+        quality = np.asarray(
+            edge.historical_quality[destination],
+            dtype=np.float64,
+        )
+        quality_valid = np.asarray(
+            edge.quality_valid_mask[destination],
+            dtype=np.bool_,
+        )
+        if quality.ndim != 1 or quality_valid.shape != quality.shape:
+            raise HeuristicPolicyError(
+                "historical quality and mask must share the RU index"
+            )
+        if not np.all(np.isfinite(quality)) or np.any(quality < 0.0):
+            raise HeuristicPolicyError(
+                "historical quality must be finite and non-negative"
+            )
+        valid_quality = quality[quality_valid]
+        if valid_quality.size:
+            sinr_proxy = float(np.min(valid_quality))
+            usable_width = min(
+                self._cold_start_width,
+                int(valid_quality.size),
+            )
+        else:
+            csi_valid = np.asarray(
+                edge.csi_valid_mask,
+                dtype=np.bool_,
+            )
+            stale_csi = np.asarray(edge.stale_csi)
+            if (
+                csi_valid.shape != last_rates.shape
+                or stale_csi.ndim != 2
+                or stale_csi.shape[0] != last_rates.shape[0]
+                or not np.iscomplexobj(stale_csi)
+                or not np.all(np.isfinite(stale_csi))
+            ):
+                raise HeuristicPolicyError(
+                    "stale CSI values and masks must share the edge index"
+                )
+            if bool(csi_valid[destination]):
+                noise_only_quality = (
+                    self._reference_power_per_ru_w
+                    * np.abs(stale_csi[destination]) ** 2
+                    / self._noise_power_per_ru_w
+                )
+                sinr_proxy = float(np.min(noise_only_quality))
+            else:
+                sinr_proxy = self._cold_start_sinr_floor
+            usable_width = self._cold_start_width
+        estimated = (
+            usable_width
+            * self._ru_bandwidth_hz
+            * math.log2(1.0 + sinr_proxy)
+        )
+        return min(estimated, self._reference_rate_bps)
 
     def _select_tx(
         self,
@@ -349,18 +591,25 @@ class HeuristicPolicy:
         self,
         observation: ActorObservation,
         context: dict[str, str | int | float],
-    ) -> float:
+    ) -> _CpuFrequencyDecision:
         legal = self._legal_values(
             observation, "cpu_frequency", context
         )
         selected_queue = context["cpu_queue"]
         if selected_queue == self._canonical["cpu_queue"]:
-            return float(
+            level = float(
                 self._require_value(
                     "cpu_frequency",
                     self._canonical["cpu_frequency"],
                     legal,
                 )
+            )
+            return _CpuFrequencyDecision(
+                level=level,
+                frequency_hz=0.0,
+                pending_task_count=0,
+                deadline_feasible=None,
+                infeasible_fallback=False,
             )
         source = (
             observation.uav_id
@@ -376,15 +625,11 @@ class HeuristicPolicy:
             raise HeuristicPolicyError(
                 "selected CPU queue lacks an actor-visible head"
             )
-        slack = int(queues.head_slack_slots[source])
-        if slack <= 0:
+        demands = self._visible_cpu_demands(observation)
+        if all(demand.source != source for demand in demands):
             raise HeuristicPolicyError(
-                "serviceable CPU head must have positive slot-start slack"
+                "selected CPU head is absent from visible queue aggregates"
             )
-        required_hz = (
-            float(queues.head_remaining_cycles[source])
-            / (slack * self._slot_duration_s)
-        )
         maximum_hz = float(
             observation.self_resources.max_cpu_frequency_hz
         )
@@ -398,23 +643,196 @@ class HeuristicPolicy:
             if self._is_number(value) and float(value) > 0.0
         )
         if not positive:
-            return float(
+            level = float(
                 self._require_value(
                     "cpu_frequency",
                     self._canonical["cpu_frequency"],
                     legal,
                 )
             )
-        sufficient = [
-            item for item in positive if item[0] >= required_hz
-        ]
-        if sufficient:
-            return min(
-                sufficient, key=lambda item: (item[0], item[2])
-            )[1]
-        return max(
+            return _CpuFrequencyDecision(
+                level=level,
+                frequency_hz=0.0,
+                pending_task_count=sum(
+                    demand.task_count for demand in demands
+                ),
+                deadline_feasible=False,
+                infeasible_fallback=True,
+            )
+        for frequency_hz, level, _ in positive:
+            if self._frequency_meets_deadline_prefixes(
+                demands,
+                frequency_hz,
+            ):
+                return _CpuFrequencyDecision(
+                    level=level,
+                    frequency_hz=frequency_hz,
+                    pending_task_count=sum(
+                        demand.task_count for demand in demands
+                    ),
+                    deadline_feasible=True,
+                    infeasible_fallback=False,
+                )
+        frequency_hz, level, _ = max(
             positive, key=lambda item: (item[0], -item[2])
-        )[1]
+        )
+        return _CpuFrequencyDecision(
+            level=level,
+            frequency_hz=frequency_hz,
+            pending_task_count=sum(
+                demand.task_count for demand in demands
+            ),
+            deadline_feasible=False,
+            infeasible_fallback=True,
+        )
+
+    def _frequency_meets_deadline_prefixes(
+        self,
+        demands: Sequence[_CpuQueueDemand],
+        frequency_hz: float,
+    ) -> bool:
+        """Check conservative head-deadline prefixes in discrete slots."""
+
+        if not math.isfinite(frequency_hz) or frequency_hz <= 0.0:
+            raise HeuristicPolicyError(
+                "candidate CPU frequency must be finite and positive"
+            )
+        cumulative_slots = 0
+        previous_key: tuple[int, int, int] | None = None
+        for demand in demands:
+            key = (
+                demand.head_slack_slots,
+                demand.head_task_id,
+                demand.source,
+            )
+            if previous_key is not None and key < previous_key:
+                raise HeuristicPolicyError(
+                    "CPU queue demands are not in deterministic EDF order"
+                )
+            previous_key = key
+            cumulative_slots += self._queue_service_slot_upper_bound(
+                demand,
+                frequency_hz,
+            )
+            if cumulative_slots > demand.head_slack_slots:
+                return False
+        return True
+
+    def _visible_cpu_demands(
+        self,
+        observation: ActorObservation,
+    ) -> tuple[_CpuQueueDemand, ...]:
+        """Build deterministic demand records from actor-tensor queue fields."""
+
+        queues = observation.private_queues.cpu_by_source
+        demands: list[_CpuQueueDemand] = []
+        for source, head_valid in enumerate(queues.head_valid_mask):
+            if not bool(head_valid):
+                continue
+            task_count = int(queues.task_count[source])
+            total_cycles = float(queues.remaining_cycles[source])
+            head_cycles = float(queues.head_remaining_cycles[source])
+            head_slack = int(queues.head_slack_slots[source])
+            head_task_id = int(queues.head_task_id[source])
+            if (
+                task_count <= 0
+                or head_slack <= 0
+                or head_task_id < 0
+                or not math.isfinite(total_cycles)
+                or not math.isfinite(head_cycles)
+                or total_cycles < 0.0
+                or head_cycles < 0.0
+            ):
+                raise HeuristicPolicyError(
+                    "visible CPU queue aggregates are internally inconsistent"
+                )
+            tolerance = math.ulp(max(1.0, total_cycles))
+            if head_cycles > total_cycles + tolerance:
+                raise HeuristicPolicyError(
+                    "CPU queue head cycles exceed aggregate remaining cycles"
+                )
+            demands.append(
+                _CpuQueueDemand(
+                    source=source,
+                    task_count=task_count,
+                    total_remaining_cycles=total_cycles,
+                    head_task_id=head_task_id,
+                    head_remaining_cycles=head_cycles,
+                    head_slack_slots=head_slack,
+                )
+            )
+        return tuple(
+            sorted(
+                demands,
+                key=lambda item: (
+                    item.head_slack_slots,
+                    item.head_task_id,
+                    item.source,
+                ),
+            )
+        )
+
+    def _queue_service_slot_upper_bound(
+        self,
+        demand: _CpuQueueDemand,
+        frequency_hz: float,
+    ) -> int:
+        """Upper-bound per-task ceil demand when only a queue aggregate is visible."""
+
+        if demand.task_count == 1:
+            return self._required_service_slots(
+                demand.total_remaining_cycles,
+                frequency_hz,
+            )
+        head_slots = self._required_service_slots(
+            demand.head_remaining_cycles,
+            frequency_hz,
+        )
+        tail_cycles = max(
+            0.0,
+            demand.total_remaining_cycles - demand.head_remaining_cycles,
+        )
+        tail_slots_from_cycles = self._required_service_slots(
+            tail_cycles,
+            frequency_hz,
+        )
+        tail_task_count = demand.task_count - 1
+        tail_slots = max(
+            tail_task_count,
+            tail_slots_from_cycles + tail_task_count - 1,
+        )
+        return head_slots + tail_slots
+
+    def _required_service_slots(
+        self,
+        remaining_work: float,
+        service_rate_per_s: float,
+    ) -> int:
+        """Return ceil(work / per-slot service) with boundary-safe rounding."""
+
+        if (
+            not math.isfinite(remaining_work)
+            or remaining_work < 0.0
+            or not math.isfinite(service_rate_per_s)
+            or service_rate_per_s <= 0.0
+        ):
+            raise HeuristicPolicyError(
+                "service-slot inputs must be finite with a positive rate"
+            )
+        if remaining_work == 0.0:
+            return 0
+        ratio = remaining_work / (
+            service_rate_per_s * self._slot_duration_s
+        )
+        nearest_integer = round(ratio)
+        if math.isclose(
+            ratio,
+            nearest_integer,
+            rel_tol=1.0e-12,
+            abs_tol=1.0e-12,
+        ):
+            ratio = float(nearest_integer)
+        return int(math.ceil(ratio))
 
     @staticmethod
     def _historical_key(
@@ -504,6 +922,7 @@ class HeuristicPolicy:
 
 
 __all__ = [
+    "CpuFrequencyTelemetry",
     "HeuristicPolicy",
     "HeuristicPolicyError",
     "HistoricalQualityAggregate",

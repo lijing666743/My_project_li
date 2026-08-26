@@ -2,6 +2,7 @@
 
 from .base import Policy
 from .heuristic_policy import (
+    CpuFrequencyTelemetry,
     HeuristicPolicy,
     HeuristicPolicyError,
     HistoricalQualityAggregate,
@@ -11,6 +12,7 @@ from .local_only_policy import LocalOnlyPolicy, LocalOnlyPolicyError
 from .random_policy import RandomPolicy, RandomPolicyError
 
 __all__ = [
+    "CpuFrequencyTelemetry",
     "HeuristicPolicy",
     "HeuristicPolicyError",
     "HistoricalQualityAggregate",

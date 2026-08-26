@@ -135,6 +135,7 @@ knowledge/project_plan/方案2.md
 - 已将 CA-GAT-MAPPO single-seed Long Smoke（small、seed=42）真实运行产物归档至 `experiments/long_smoke/small_seed42/`，包括 aggregate metrics、配置快照、metrics CSV 与 dashboard PNG；本轮仅执行结果归档，未运行训练、未修改算法代码，该单 seed 产物不证明收敛、稳定性、性能或优越性。
 - Formal checkpoint 生命周期、显式 `--resume-from`、Artifact Non-Overwrite Gate 和 Formal Evaluation Runner 均已完成；真实 `128 → periodic checkpoint → CLI resume → 256 → final checkpoint` 验证已通过；最新完整测试为 405 passed、119 subtests passed。
 - 尚未运行小规模真实 final-checkpoint evaluation，也尚未运行任何 500,000-transition 正式实验；当前仍未生成正式实验结果。
+- Post-Validation-V1 Fix/V2（分支 `codex/heuristic-fix-v2`）已完成 Fix Package 1 工程修复：未新增 observation/schema 字段，Heuristic 仅使用当前 actor tensor 已编码的队列聚合/队首、self resource、neighbor public、stale CSI、历史质量与 last-rate/mask 信息。远端路由在公开目的端状态有效时执行 `f_max + queued_cycles` coarse gate；冷启动时仅允许自身 `f_max` 不高于 reference 的 actor 使用自身 `f_max` 检查新任务本身，并以 stale CSI 的 noise-floor rate 解除 prior-TX 循环依赖，compute-rich actor 不向未知能力目的端盲目外送；历史链路质量仅在通过 gate 的候选间排序。DVFS 改为基于 `task_count + total/head cycles + head slack` 的保守离散 service-slot prefix approximation，无可行正档时保持最大正档 fallback 并暴露 infeasible telemetry。targeted Heuristic 24/24、lifecycle/conservation/energy 52/52、全量 437/437 均通过；seed 1042 同一冻结外部轨迹上 Fix-V2 为 82 completed、13 expired、reward 63.2674，zero-based `UAV1->UAV2=7`、`UAV2->UAV1=0`，外部 trace SHA-256 仍为 `752cf520a2eb735fc1d05863ea6aef17443ed9177a953cd0848e8a53d844294e`。历史 Validation V1 checkpoint、manifest、protocol、evaluation artifacts 与 run IDs 均未修改，本轮未训练、未运行 Seeds 43–46、未覆盖旧结果；后续若重新评估，必须使用新的 config/protocol identity 以及新的 run/artifact。
 
 ## 下一步
 

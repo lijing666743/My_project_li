@@ -105,6 +105,7 @@ def make_local_only_config(
 def make_heuristic_observation(
     *,
     unbound_slack: int | None = None,
+    unbound_bits: float = 20.0,
     unbound_cycles: float = 20.0,
     local_backlog_cycles: float = 0.0,
     route_remotes: tuple[int, ...] = (),
@@ -114,12 +115,22 @@ def make_heuristic_observation(
     cpu_slacks: dict[int, int] | None = None,
     cpu_task_ids: dict[int, int] | None = None,
     cpu_cycles: dict[int, float] | None = None,
+    cpu_task_counts: dict[int, int] | None = None,
+    cpu_total_cycles: dict[int, float] | None = None,
     quality_values: dict[int, tuple[float, ...]] | None = None,
     quality_masks: dict[int, tuple[bool, ...]] | None = None,
+    destination_max_cpu_frequency_hz: dict[int, float] | None = None,
+    destination_queued_cycles: dict[int, float] | None = None,
+    destination_rates_bps: dict[int, float] | None = None,
+    destination_public_valid: dict[int, bool] | None = None,
+    destination_rate_valid: dict[int, bool] | None = None,
+    destination_stale_csi: dict[int, complex] | None = None,
+    destination_csi_valid: dict[int, bool] | None = None,
     power_legal: tuple[float, ...] = (0.0, 0.25, 0.5, 1.0),
     cpu_frequency_legal: dict[int, tuple[float, ...]] | None = None,
     max_cpu_frequency_hz: float = 1000.0,
 ):
+    config = make_heuristic_config()
     count = 4
     ru_count = 20
     route_domain = ("idle", "local", "defer", 1, 2, 3)
@@ -192,23 +203,45 @@ def make_heuristic_observation(
     cpu_slacks = cpu_slacks or {}
     cpu_task_ids = cpu_task_ids or {}
     cpu_cycles = cpu_cycles or {}
+    cpu_task_counts = cpu_task_counts or {}
+    cpu_total_cycles = cpu_total_cycles or {}
+    destination_max_cpu_frequency_hz = (
+        destination_max_cpu_frequency_hz or {}
+    )
+    destination_queued_cycles = destination_queued_cycles or {}
+    destination_rates_bps = destination_rates_bps or {}
+    destination_public_valid = destination_public_valid or {}
+    destination_rate_valid = destination_rate_valid or {}
+    destination_stale_csi = destination_stale_csi or {}
+    destination_csi_valid = destination_csi_valid or {}
 
     def indexed_queues(
         candidates: tuple[int, ...],
         slacks: dict[int, int],
         task_ids: dict[int, int],
         cycles: dict[int, float],
+        task_counts: dict[int, int],
+        total_cycles: dict[int, float],
     ):
         valid = np.zeros(count, dtype=np.bool_)
+        counts = np.zeros(count, dtype=np.int64)
+        aggregate_cycles = np.zeros(count, dtype=np.float64)
         head_slack = np.zeros(count, dtype=np.int64)
         head_task_id = np.full(count, -1, dtype=np.int64)
         head_cycles = np.zeros(count, dtype=np.float64)
         for source in candidates:
             valid[source] = True
+            counts[source] = task_counts.get(source, 1)
             head_slack[source] = slacks.get(source, 3)
             head_task_id[source] = task_ids.get(source, source)
             head_cycles[source] = cycles.get(source, 20.0)
+            aggregate_cycles[source] = total_cycles.get(
+                source,
+                head_cycles[source],
+            )
         return SimpleNamespace(
+            task_count=counts,
+            remaining_cycles=aggregate_cycles,
             head_valid_mask=valid,
             head_slack_slots=head_slack,
             head_task_id=head_task_id,
@@ -217,6 +250,40 @@ def make_heuristic_observation(
 
     quality = np.zeros((count, ru_count), dtype=np.float64)
     quality_valid = np.zeros((count, ru_count), dtype=np.bool_)
+    public_valid = np.zeros(count, dtype=np.bool_)
+    destination_cpu_ratio = np.zeros(count, dtype=np.float64)
+    destination_cpu_cycles = np.zeros(count, dtype=np.float64)
+    effective_rate = np.zeros(count, dtype=np.float64)
+    effective_rate_valid = np.zeros(count, dtype=np.bool_)
+    stale_csi = np.zeros((count, ru_count), dtype=np.complex128)
+    csi_valid = np.zeros(count, dtype=np.bool_)
+    for destination in route_remotes:
+        public_valid[destination] = destination_public_valid.get(
+            destination, True
+        )
+        destination_cpu_ratio[destination] = (
+            destination_max_cpu_frequency_hz.get(
+                destination, max_cpu_frequency_hz
+            )
+            / config.environment.reference_cpu_frequency_hz
+        )
+        destination_cpu_cycles[destination] = (
+            destination_queued_cycles.get(destination, 0.0)
+        )
+        effective_rate[destination] = destination_rates_bps.get(
+            destination, 1.0e9
+        )
+        effective_rate_valid[destination] = destination_rate_valid.get(
+            destination, True
+        )
+        stale_csi[destination] = destination_stale_csi.get(
+            destination,
+            0.0j,
+        )
+        csi_valid[destination] = destination_csi_valid.get(
+            destination,
+            False,
+        )
     for destination, values in (quality_values or {}).items():
         if len(values) != ru_count:
             raise ValueError("quality fixture must contain 20 RUs")
@@ -229,6 +296,7 @@ def make_heuristic_observation(
     unbound = SimpleNamespace(
         head_valid_mask=unbound_slack is not None,
         head_slack_slots=0 if unbound_slack is None else unbound_slack,
+        head_remaining_bits=0.0 if unbound_slack is None else unbound_bits,
         head_remaining_cycles=0.0 if unbound_slack is None else unbound_cycles,
     )
     observation = SimpleNamespace(
@@ -246,21 +314,34 @@ def make_heuristic_observation(
                 tx_slacks,
                 {},
                 {},
+                {},
+                {},
             ),
             cpu_by_source=indexed_queues(
                 cpu_candidates,
                 cpu_slacks,
                 cpu_task_ids,
                 cpu_cycles,
+                cpu_task_counts,
+                cpu_total_cycles,
             ),
+        ),
+        neighbor_public=SimpleNamespace(
+            valid_mask=public_valid,
+            max_cpu_frequency_ratio=destination_cpu_ratio,
+            cpu_load_remaining_cycles=destination_cpu_cycles,
         ),
         edge_history=SimpleNamespace(
             historical_quality=quality,
             quality_valid_mask=quality_valid,
+            last_effective_rate_bps=effective_rate,
+            last_rate_valid_mask=effective_rate_valid,
+            stale_csi=stale_csi,
+            csi_valid_mask=csi_valid,
         ),
         action_masks=masks,
     )
-    return make_heuristic_config(), observation
+    return config, observation
 
 
 def observations_with_active_queues():
@@ -600,6 +681,140 @@ class TestHeuristicPolicy(unittest.TestCase):
         )
         self.assertEqual(HeuristicPolicy(config).act(observation).route, 1)
 
+    def test_route_excludes_compute_poor_infeasible_destination(self) -> None:
+        config, observation = make_heuristic_observation(
+            unbound_slack=4,
+            unbound_cycles=20.0,
+            local_backlog_cycles=1_000.0,
+            route_remotes=(1,),
+            destination_max_cpu_frequency_hz={1: 100.0},
+            destination_queued_cycles={1: 5.0},
+        )
+
+        self.assertEqual(
+            HeuristicPolicy(config).act(observation).route,
+            "local",
+        )
+
+    def test_route_feasibility_precedes_historical_quality_ranking(self) -> None:
+        valid = (True,) * 20
+        config, observation = make_heuristic_observation(
+            unbound_slack=4,
+            unbound_cycles=20.0,
+            local_backlog_cycles=1_000.0,
+            route_remotes=(1, 2),
+            destination_max_cpu_frequency_hz={1: 1_000.0, 2: 1_000.0},
+            destination_queued_cycles={1: 25.0, 2: 0.0},
+            quality_values={1: (10.0,) * 20, 2: (1.0,) * 20},
+            quality_masks={1: valid, 2: valid},
+        )
+
+        self.assertEqual(HeuristicPolicy(config).act(observation).route, 2)
+
+    def test_route_all_remote_infeasible_preserves_local_fallback(self) -> None:
+        config, observation = make_heuristic_observation(
+            unbound_slack=3,
+            unbound_bits=1_000.0,
+            local_backlog_cycles=1_000.0,
+            route_remotes=(1, 2),
+            destination_rates_bps={1: 1.0, 2: 1.0},
+        )
+
+        self.assertEqual(
+            HeuristicPolicy(config).act(observation).route,
+            "local",
+        )
+
+    def test_route_cold_start_uses_actor_visible_historical_quality(self) -> None:
+        config, observation = make_heuristic_observation(
+            unbound_slack=3,
+            local_backlog_cycles=1_000.0,
+            route_remotes=(1,),
+            destination_rate_valid={1: False},
+            quality_values={1: (0.25,) * 20},
+            quality_masks={1: (True,) * 20},
+        )
+
+        policy = HeuristicPolicy(config)
+        expected = (
+            max(config.action.resource_width_options)
+            * config.environment.ru_bandwidth_hz
+            * math.log2(1.0 + 0.25)
+        )
+
+        self.assertAlmostEqual(
+            policy._estimated_route_rate_bps(observation, 1),
+            expected,
+        )
+        self.assertEqual(policy.act(observation).route, 1)
+
+    def test_route_valid_last_rate_is_used_without_bootstrap_fallback(self) -> None:
+        config, observation = make_heuristic_observation(
+            unbound_slack=4,
+            local_backlog_cycles=1_000.0,
+            route_remotes=(1,),
+            destination_rates_bps={1: 1_234.0},
+            destination_rate_valid={1: True},
+            quality_values={1: (100.0,) * 20},
+            quality_masks={1: (True,) * 20},
+        )
+
+        policy = HeuristicPolicy(config)
+
+        self.assertEqual(
+            policy._estimated_route_rate_bps(observation, 1),
+            1_234.0,
+        )
+        self.assertEqual(policy.act(observation).route, 1)
+
+    def test_route_cold_start_uses_actor_visible_stale_csi(self) -> None:
+        config, observation = make_heuristic_observation(
+            unbound_slack=3,
+            local_backlog_cycles=1_000.0,
+            route_remotes=(1,),
+            destination_public_valid={1: False},
+            destination_rate_valid={1: False},
+            destination_stale_csi={1: 1.0e-5 + 0.0j},
+            destination_csi_valid={1: True},
+        )
+
+        policy = HeuristicPolicy(config)
+        estimated = policy._estimated_route_rate_bps(observation, 1)
+
+        self.assertTrue(math.isfinite(estimated))
+        self.assertGreater(estimated, 0.0)
+        self.assertLessEqual(
+            estimated,
+            config.environment.reference_rate_bps,
+        )
+        self.assertEqual(policy.act(observation).route, 1)
+
+    def test_route_invalid_all_history_has_finite_masked_fallback(self) -> None:
+        config, observation = make_heuristic_observation(
+            unbound_slack=3,
+            local_backlog_cycles=1_000.0,
+            route_remotes=(1,),
+            destination_rate_valid={1: False},
+            destination_public_valid={1: False},
+            max_cpu_frequency_hz=2.1e9,
+        )
+
+        policy = HeuristicPolicy(config)
+        expected = min(
+            max(config.action.resource_width_options)
+            * config.environment.ru_bandwidth_hz
+            * math.log2(
+                1.0 + config.environment.outage_threshold_linear
+            ),
+            config.environment.reference_rate_bps,
+        )
+        estimated = policy._estimated_route_rate_bps(observation, 1)
+
+        self.assertTrue(math.isfinite(estimated))
+        self.assertGreater(estimated, 0.0)
+        self.assertAlmostEqual(estimated, expected)
+        self.assertEqual(policy.act(observation).route, "local")
+
     def test_tx_lexicographic_slack_history_mean_and_destination(self) -> None:
         valid = (True,) * 20
         invalid = (False,) * 20
@@ -787,6 +1002,107 @@ class TestHeuristicPolicy(unittest.TestCase):
             cpu_frequency_legal={0: (0.0,)},
         )
         self.assertEqual(HeuristicPolicy(config).act(observation).cpu_frequency, 0.0)
+
+    def test_cpu_frequency_cumulative_demand_requires_higher_level(self) -> None:
+        config, observation = make_heuristic_observation(
+            cpu_candidates=(0,),
+            cpu_slacks={0: 2},
+            cpu_cycles={0: 10.0},
+            cpu_task_counts={0: 2},
+            cpu_total_cycles={0: 20.0},
+        )
+
+        policy = HeuristicPolicy(config)
+        proposal = policy.act(observation)
+
+        self.assertEqual(proposal.cpu_frequency, 0.5)
+        telemetry = policy.cpu_frequency_telemetry[0]
+        self.assertTrue(telemetry.deadline_feasible)
+        self.assertFalse(telemetry.infeasible_fallback)
+        self.assertEqual(telemetry.pending_task_count, 2)
+
+    def test_cpu_frequency_two_small_tasks_need_two_service_slots(self) -> None:
+        config, observation = make_heuristic_observation(
+            cpu_candidates=(0,),
+            cpu_slacks={0: 1},
+            cpu_cycles={0: 1.0},
+            cpu_task_counts={0: 2},
+            cpu_total_cycles={0: 2.0},
+        )
+
+        policy = HeuristicPolicy(config)
+        proposal = policy.act(observation)
+
+        self.assertEqual(proposal.cpu_frequency, 1.0)
+        telemetry = policy.cpu_frequency_telemetry[0]
+        self.assertFalse(telemetry.deadline_feasible)
+        self.assertTrue(telemetry.infeasible_fallback)
+
+    def test_cpu_frequency_checks_each_discrete_deadline_prefix(self) -> None:
+        config, observation = make_heuristic_observation(
+            cpu_candidates=(0, 1),
+            cpu_slacks={0: 1, 1: 4},
+            cpu_task_ids={0: 0, 1: 1},
+            cpu_cycles={0: 5.0, 1: 6.0},
+            cpu_task_counts={0: 1, 1: 2},
+            cpu_total_cycles={0: 5.0, 1: 17.0},
+        )
+
+        policy = HeuristicPolicy(config)
+        proposal = policy.act(observation)
+
+        self.assertEqual(proposal.cpu_frequency, 0.5)
+        self.assertTrue(
+            policy.cpu_frequency_telemetry[0].deadline_feasible
+        )
+
+    def test_cpu_frequency_single_task_matches_old_minimum_sufficient(self) -> None:
+        config, observation = make_heuristic_observation(
+            cpu_candidates=(0,),
+            cpu_slacks={0: 2},
+            cpu_cycles={0: 10.0},
+            cpu_task_counts={0: 1},
+            cpu_total_cycles={0: 10.0},
+        )
+
+        policy = HeuristicPolicy(config)
+        proposal = policy.act(observation)
+
+        self.assertEqual(proposal.cpu_frequency, 0.25)
+        self.assertTrue(
+            policy.cpu_frequency_telemetry[0].deadline_feasible
+        )
+
+    def test_cpu_frequency_deadline_slot_counts_as_serviceable(self) -> None:
+        config, observation = make_heuristic_observation(
+            cpu_candidates=(0,),
+            cpu_slacks={0: 1},
+            cpu_cycles={0: 20.0},
+            cpu_task_counts={0: 1},
+            cpu_total_cycles={0: 20.0},
+        )
+
+        policy = HeuristicPolicy(config)
+        proposal = policy.act(observation)
+
+        self.assertEqual(proposal.cpu_frequency, 1.0)
+        self.assertTrue(
+            policy.cpu_frequency_telemetry[0].deadline_feasible
+        )
+
+    def test_cpu_queue_aggregate_deadline_order_is_deterministic(self) -> None:
+        config, observation = make_heuristic_observation(
+            cpu_candidates=(0, 1, 2),
+            cpu_slacks={0: 3, 1: 2, 2: 2},
+            cpu_task_ids={0: 1, 1: 9, 2: 1},
+        )
+
+        policy = HeuristicPolicy(config)
+        first = policy._visible_cpu_demands(observation)
+        second = policy._visible_cpu_demands(observation)
+
+        self.assertEqual(first, second)
+        self.assertEqual(tuple(item.source for item in first), (2, 1, 0))
 
     def test_canonical_values_order_actor_boundary_and_seed_independence(self) -> None:
         config, observation = make_heuristic_observation()
