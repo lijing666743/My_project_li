@@ -6,6 +6,7 @@ import csv
 import hashlib
 import io
 import json
+import re
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -65,6 +66,31 @@ _CONSUMED_ENVIRONMENT_STREAMS = (
 
 class FormalEvaluationError(RuntimeError):
     """Raised when Validation Gate V1 cannot complete honestly."""
+
+
+def _normalize_evaluation_device_identity(value: str) -> str:
+    """Return a stable Windows-safe identity for one resolved torch device."""
+
+    if not isinstance(value, str):
+        raise FormalEvaluationError("resolved evaluation device identity is invalid")
+    match = re.fullmatch(r"(cpu|cuda)(?::([0-9]+))?", value.strip().lower())
+    if match is None:
+        raise FormalEvaluationError("resolved evaluation device identity is invalid")
+    device_type, index = match.groups()
+    return device_type if index is None else f"{device_type}-{index}"
+
+
+def _normalize_evaluation_dtype_identity(value: str) -> str:
+    """Return a stable Windows-safe identity for one resolved torch dtype."""
+
+    if not isinstance(value, str):
+        raise FormalEvaluationError("resolved evaluation dtype identity is invalid")
+    normalized = value.strip().lower()
+    if normalized.startswith("torch."):
+        normalized = normalized.removeprefix("torch.")
+    if re.fullmatch(r"[a-z][a-z0-9]*", normalized) is None:
+        raise FormalEvaluationError("resolved evaluation dtype identity is invalid")
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -541,6 +567,10 @@ class FormalEvaluationRunner:
     def _evaluation_run_id(self) -> str:
         loaded = self.loaded_actor
         source_digest = _canonical_sha256(self.protocol.source_run_id)[:8]
+        device_identity = _normalize_evaluation_device_identity(
+            loaded.evaluation_device
+        )
+        dtype_identity = _normalize_evaluation_dtype_identity(loaded.dtype)
         kind = {
             "PERIODIC_RESUME": "pr",
             "FINAL_COMPLETED": "fc",
@@ -550,6 +580,7 @@ class FormalEvaluationRunner:
             f"k-{kind}__n-{loaded.source_checkpoint_step}__"
             f"c-{loaded.checkpoint_expected_sha256[:8]}__"
             f"p-{self.protocol.sha256[:8]}__"
+            f"dev-{device_identity}__dtype-{dtype_identity}__"
             f"e-{self.evaluator_config.git_commit[:8]}"
         )
 

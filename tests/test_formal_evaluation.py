@@ -7,7 +7,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -223,6 +223,17 @@ def rewrite_payload_snapshot(fixture, mutator) -> None:
     )
 
 
+def write_payload_and_refresh_expected_hash(fixture, payload) -> None:
+    """Write one synthetic payload and keep only its protocol file hash current."""
+
+    torch.save(payload, fixture.checkpoint)
+    fixture.protocol = protocol_with_checkpoint_hash(
+        fixture.protocol,
+        fixture.checkpoint.name,
+        checkpoint_sha256(fixture.checkpoint),
+    )
+
+
 def make_runner(fixture, *, environment_factory=None) -> FormalEvaluationRunner:
     return FormalEvaluationRunner(
         fixture.evaluator,
@@ -393,7 +404,10 @@ class TestActorOnlyLoader(unittest.TestCase):
                     torch.optim.Optimizer,
                     "step",
                     side_effect=AssertionError("optimizer.step forbidden"),
-                ):
+                ), patch(
+                    "src.models.ca_gat_mappo.MAPPOCentralizedCritic",
+                    side_effect=AssertionError("Critic construction forbidden"),
+                ) as critic_constructor:
                     loaded = load_actor_for_evaluation(
                         fixture.checkpoint,
                         protocol=fixture.protocol,
@@ -403,6 +417,7 @@ class TestActorOnlyLoader(unittest.TestCase):
                 restore_all.assert_not_called()
                 restore_rng.assert_not_called()
                 restore_rollout.assert_not_called()
+                critic_constructor.assert_not_called()
                 self.assertFalse(loaded.actor.training)
                 self.assertEqual(loaded.source_checkpoint_kind, kind)
                 self.assertEqual(
@@ -462,6 +477,89 @@ class TestActorOnlyLoader(unittest.TestCase):
             payload_load.assert_not_called()
             actor_constructor.assert_not_called()
 
+    def test_loader_rejects_non_allowlisted_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = make_evaluation_fixture(Path(directory))
+            selected = fixture.protocol.checkpoint_for_filename("final.pt")
+            unlisted = replace(selected, filename="unlisted_checkpoint.pt")
+            with self.assertRaisesRegex(EvaluationCheckpointError, "filename"):
+                load_actor_for_evaluation(
+                    fixture.checkpoint,
+                    protocol=fixture.protocol,
+                    expected_checkpoint=unlisted,
+                    evaluation_device="cpu",
+                )
+
+    def test_loader_rejects_non_allowlisted_checkpoint_kind(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = make_evaluation_fixture(Path(directory))
+            selected = fixture.protocol.checkpoint_for_filename("final.pt")
+            unlisted = replace(selected, checkpoint_kind="UNLISTED_KIND")
+            with self.assertRaisesRegex(EvaluationCheckpointError, "kind"):
+                load_actor_for_evaluation(
+                    fixture.checkpoint,
+                    protocol=fixture.protocol,
+                    expected_checkpoint=unlisted,
+                    evaluation_device="cpu",
+                )
+
+    def test_loader_rejects_wrong_checkpoint_step(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = make_evaluation_fixture(Path(directory))
+            selected = fixture.protocol.checkpoint_for_filename("final.pt")
+            wrong_step = replace(
+                selected,
+                checkpoint_step=selected.checkpoint_step + 1,
+            )
+            with self.assertRaisesRegex(EvaluationCheckpointError, "step"):
+                load_actor_for_evaluation(
+                    fixture.checkpoint,
+                    protocol=fixture.protocol,
+                    expected_checkpoint=wrong_step,
+                    evaluation_device="cpu",
+                )
+
+    def test_runner_expected_sha_mismatch_precedes_loading_and_episode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = make_evaluation_fixture(Path(directory))
+            protocol = protocol_with_checkpoint_hash(
+                fixture.protocol,
+                fixture.checkpoint.name,
+                "0" * 64,
+            )
+            environment_factory = Mock(
+                side_effect=AssertionError("environment construction forbidden")
+            )
+            output_root = (
+                fixture.layout.evaluator_root
+                / "logs"
+                / "evaluations"
+                / "validation"
+            )
+            with patch(
+                "src.evaluation.actor_loader.load_checkpoint_payload"
+            ) as payload_load, patch(
+                "src.evaluation.actor_loader.CAGATMAPPOActor"
+            ) as actor_constructor, patch.object(
+                FormalEvaluationRunner,
+                "_run_episode",
+                side_effect=AssertionError("episode execution forbidden"),
+            ) as episode_execution:
+                with self.assertRaisesRegex(EvaluationCheckpointError, "allowlist"):
+                    FormalEvaluationRunner(
+                        fixture.evaluator,
+                        fixture.checkpoint,
+                        evaluation_device="cpu",
+                        protocol=protocol,
+                        workspace_layout=fixture.layout,
+                        environment_factory=environment_factory,
+                    )
+            payload_load.assert_not_called()
+            actor_constructor.assert_not_called()
+            environment_factory.assert_not_called()
+            episode_execution.assert_not_called()
+            self.assertFalse(output_root.exists())
+
     def test_wrong_source_path_is_rejected_before_loading(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = make_evaluation_fixture(Path(directory))
@@ -519,6 +617,78 @@ class TestActorOnlyLoader(unittest.TestCase):
                     expected_checkpoint=fixture.protocol.checkpoint_for_filename(
                         "final.pt"
                     ),
+                    evaluation_device="cpu",
+                )
+
+    def test_payload_config_hash_mismatch_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = make_evaluation_fixture(Path(directory))
+            payload = load_checkpoint_payload(fixture.checkpoint)
+            payload["config_hash"] = "0" * 64
+            write_payload_and_refresh_expected_hash(fixture, payload)
+            with self.assertRaisesRegex(
+                EvaluationCheckpointError,
+                "config snapshot hash metadata mismatch",
+            ):
+                load_actor_for_evaluation(
+                    fixture.checkpoint,
+                    protocol=fixture.protocol,
+                    expected_checkpoint=fixture.protocol.checkpoint_for_filename(
+                        "final.pt"
+                    ),
+                    evaluation_device="cpu",
+                )
+
+    def test_snapshot_metadata_config_hash_mismatch_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = make_evaluation_fixture(Path(directory))
+            payload = load_checkpoint_payload(fixture.checkpoint)
+            payload["config_snapshot"]["_metadata"]["config_hash"] = "0" * 64
+            write_payload_and_refresh_expected_hash(fixture, payload)
+            with self.assertRaisesRegex(EvaluationCheckpointError, "metadata"):
+                load_actor_for_evaluation(
+                    fixture.checkpoint,
+                    protocol=fixture.protocol,
+                    expected_checkpoint=fixture.protocol.checkpoint_for_filename(
+                        "final.pt"
+                    ),
+                    evaluation_device="cpu",
+                )
+
+    def test_recomputed_snapshot_hash_mismatch_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = make_evaluation_fixture(Path(directory))
+            payload = load_checkpoint_payload(fixture.checkpoint)
+            payload["config_snapshot"]["seed"] = fixture.source.seed + 1
+            write_payload_and_refresh_expected_hash(fixture, payload)
+            with self.assertRaisesRegex(
+                EvaluationCheckpointError,
+                "canonical snapshot",
+            ):
+                load_actor_for_evaluation(
+                    fixture.checkpoint,
+                    protocol=fixture.protocol,
+                    expected_checkpoint=fixture.protocol.checkpoint_for_filename(
+                        "final.pt"
+                    ),
+                    evaluation_device="cpu",
+                )
+
+    def test_protocol_source_training_config_hash_mismatch_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = make_evaluation_fixture(Path(directory))
+            protocol = replace(
+                fixture.protocol,
+                source_training_config_hash="f" * 64,
+            )
+            with self.assertRaisesRegex(
+                EvaluationCheckpointError,
+                "differs from EvaluationProtocol",
+            ):
+                load_actor_for_evaluation(
+                    fixture.checkpoint,
+                    protocol=protocol,
+                    expected_checkpoint=protocol.checkpoint_for_filename("final.pt"),
                     evaluation_device="cpu",
                 )
 
@@ -619,6 +789,91 @@ class TestFormalEvaluationRunner(unittest.TestCase):
                     for path in result.artifacts
                 )
             )
+
+    def test_manifest_contains_complete_identity_and_runtime_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = make_evaluation_fixture(Path(directory))
+            result = make_runner(fixture).run(write_artifacts=False)
+            required = {
+                "run_status",
+                "evaluation_run_id",
+                "source_run_id",
+                "source_training_seed",
+                "source_training_git_commit",
+                "evaluator_git_commit",
+                "evaluator_git_dirty",
+                "source_training_config_hash",
+                "recomputed_source_training_config_hash",
+                "scenario_id",
+                "episode_horizon_slots",
+                "evaluation_phase",
+                "evaluation_protocol_version",
+                "evaluation_protocol_sha256",
+                "checkpoint_kind",
+                "checkpoint_step",
+                "checkpoint_expected_sha256",
+                "checkpoint_sha256_before",
+                "checkpoint_sha256_after_actor_load",
+                "checkpoint_sha256_after_evaluation",
+                "checkpoint_sha256_after",
+                "external_trace_sha256_by_seed",
+                "evaluation_device",
+                "dtype",
+            }
+            self.assertTrue(required.issubset(result.manifest))
+            self.assertEqual(result.manifest["evaluation_device"], "cpu")
+            self.assertEqual(result.manifest["dtype"], "torch.float32")
+            self.assertIn("__dev-cpu__dtype-float32__", result.evaluation_run_id)
+
+    def test_protocol_snapshot_canonical_sha_matches_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = make_evaluation_fixture(Path(directory))
+            runner = make_runner(fixture)
+            runner.run(write_artifacts=True)
+            paths = runner.artifact_paths()
+            raw_snapshot = paths["protocol_snapshot"].read_bytes()
+            snapshot_mapping = json.loads(raw_snapshot.decode("utf-8"))
+            canonical_bytes = json.dumps(
+                snapshot_mapping,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            snapshot_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
+            manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+            self.assertEqual(raw_snapshot, fixture.protocol.snapshot_text.encode("utf-8"))
+            self.assertEqual(snapshot_sha256, fixture.protocol.sha256)
+            self.assertEqual(
+                snapshot_sha256,
+                manifest["evaluation_protocol_sha256"],
+            )
+
+    def test_run_id_encodes_stable_device_and_dtype_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = make_evaluation_fixture(Path(directory))
+            runner = make_runner(fixture)
+            loaded = runner.loaded_actor
+            cpu_float32_id = runner.evaluation_run_id
+            self.assertEqual(cpu_float32_id, runner._evaluation_run_id())
+            self.assertIn("__dev-cpu__dtype-float32__", cpu_float32_id)
+
+            runner.loaded_actor = replace(
+                loaded,
+                evaluation_device="cuda:0",
+            )
+            cuda_float32_id = runner._evaluation_run_id()
+            self.assertIn("__dev-cuda-0__dtype-float32__", cuda_float32_id)
+            self.assertNotIn(":", cuda_float32_id)
+            self.assertEqual(cuda_float32_id, runner._evaluation_run_id())
+
+            runner.loaded_actor = replace(
+                loaded,
+                dtype="torch.float64",
+            )
+            cpu_float64_id = runner._evaluation_run_id()
+            self.assertIn("__dev-cpu__dtype-float64__", cpu_float64_id)
+            self.assertEqual(len({cpu_float32_id, cuda_float32_id, cpu_float64_id}), 3)
 
     def test_checkpoint_or_trace_failure_creates_no_output_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
