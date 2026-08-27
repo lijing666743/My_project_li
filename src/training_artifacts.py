@@ -18,6 +18,10 @@ from typing import Any, Iterable, Mapping
 
 from .artifacts import atomic_write_bytes_group, require_artifact_targets_absent
 from .config import RunConfig
+from .models.ca_gat_mappo_route_telemetry import (
+    ROUTE_TELEMETRY_SCHEMA_VERSION,
+    RouteTelemetry,
+)
 
 
 LOSS_TYPE = "PPO clipped-surrogate actor + half-MSE critic"
@@ -27,6 +31,23 @@ REWARD_SMOOTHING_WINDOW_EPISODES = 5
 MIN_SIGNAL_EPISODES = 10
 MIN_SIGNAL_PPO_EPOCHS = 10
 
+TRAINING_DIAGNOSTICS_SCHEMA_VERSION = 2
+ROUTE_TELEMETRY_ROLLING_WINDOW_PPO_EPOCHS = 4
+_ROUTE_TELEMETRY_COLUMNS = (
+    "route_telemetry_schema_version",
+    *RouteTelemetry.field_names()[1:],
+)
+_ROUTE_ROLLING_FIELDS = (
+    ("route_entropy_rolling_mean", "route_entropy_mean"),
+    ("remote_selection_rate_rolling_mean", "remote_selection_rate_given_legal_remote"),
+    ("mean_local_probability_rolling_mean", "mean_local_probability"),
+    ("mean_best_remote_probability_rolling_mean", "mean_best_remote_probability"),
+    ("local_minus_best_remote_logit_margin_rolling_mean", "mean_local_minus_best_remote_logit_margin"),
+    ("route_head_total_grad_norm_rolling_mean", "route_head_total_grad_norm"),
+    ("route_active_advantage_rolling_mean", "route_active_advantage_mean"),
+)
+_ROUTE_ROLLING_COLUMNS = tuple(name for name, _ in _ROUTE_ROLLING_FIELDS)
+
 TRAINING_METRIC_COLUMNS = (
     "run_id",
     "method_id",
@@ -34,7 +55,9 @@ TRAINING_METRIC_COLUMNS = (
     "seed",
     "git_commit",
     "config_hash",
+    "diagnostics_schema_version",
     "record_type",
+    "telemetry_scope",
     "series_index",
     "environment_steps",
     "episode_index",
@@ -65,8 +88,13 @@ TRAINING_METRIC_COLUMNS = (
     "entropy",
     "total_loss",
     "ratio",
+    "approx_kl",
+    "clip_fraction",
     "actor_grad_norm_before_clip",
     "critic_grad_norm_before_clip",
+    "route_telemetry_enabled",
+    *_ROUTE_TELEMETRY_COLUMNS,
+    *_ROUTE_ROLLING_COLUMNS,
     "signal_gate_status",
 )
 
@@ -92,7 +120,9 @@ def _base_record(config: RunConfig, signal_gate_status: str) -> dict[str, Any]:
         "seed": config.seed,
         "git_commit": config.git_commit,
         "config_hash": config.config_hash,
+        "diagnostics_schema_version": TRAINING_DIAGNOSTICS_SCHEMA_VERSION,
         "record_type": None,
+        "telemetry_scope": None,
         "series_index": None,
         "environment_steps": None,
         "episode_index": None,
@@ -123,8 +153,13 @@ def _base_record(config: RunConfig, signal_gate_status: str) -> dict[str, Any]:
         "entropy": None,
         "total_loss": None,
         "ratio": None,
+        "approx_kl": None,
+        "clip_fraction": None,
         "actor_grad_norm_before_clip": None,
         "critic_grad_norm_before_clip": None,
+        "route_telemetry_enabled": None,
+        **{column: None for column in _ROUTE_TELEMETRY_COLUMNS},
+        **{column: None for column in _ROUTE_ROLLING_COLUMNS},
         "signal_gate_status": signal_gate_status,
     }
 
@@ -185,6 +220,27 @@ def _episode_records(
     return records
 
 
+def _add_route_rolling_aggregates(
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Add trailing per-PPO-epoch means without replacing raw telemetry."""
+
+    window = ROUTE_TELEMETRY_ROLLING_WINDOW_PPO_EPOCHS
+    for index, record in enumerate(records):
+        start = max(0, index + 1 - window)
+        rows = records[start : index + 1]
+        for output_name, source_name in _ROUTE_ROLLING_FIELDS:
+            values = [
+                float(row[source_name])
+                for row in rows
+                if row[source_name] is not None
+            ]
+            record[output_name] = (
+                None if not values else math.fsum(values) / len(values)
+            )
+    return records
+
+
 def _ppo_epoch_records(
     config: RunConfig,
     training: Any,
@@ -204,6 +260,7 @@ def _ppo_epoch_records(
             record.update(
                 {
                     "record_type": "ppo_epoch",
+                    "telemetry_scope": "per_ppo_epoch",
                     "series_index": series_index,
                     "environment_steps": update_environment_steps,
                     "update_index": update.update_index,
@@ -220,12 +277,21 @@ def _ppo_epoch_records(
                     "entropy": epoch.entropy_mean,
                     "total_loss": epoch.total_loss,
                     "ratio": epoch.ratio_mean,
+                    "approx_kl": epoch.approx_kl,
+                    "clip_fraction": epoch.clip_fraction,
                     "actor_grad_norm_before_clip": epoch.actor_grad_norm_before_clip,
                     "critic_grad_norm_before_clip": epoch.critic_grad_norm_before_clip,
+                    "route_telemetry_enabled": epoch.route_telemetry is not None,
                 }
             )
+            if epoch.route_telemetry is not None:
+                telemetry_record = epoch.route_telemetry.record()
+                telemetry_record["route_telemetry_schema_version"] = (
+                    telemetry_record.pop("schema_version")
+                )
+                record.update(telemetry_record)
             records.append(record)
-    return records
+    return _add_route_rolling_aggregates(records)
 
 
 def _all_finite(values: Iterable[float]) -> bool:
@@ -252,6 +318,17 @@ def _diagnostic_checks(config: RunConfig, training: Any) -> dict[str, bool]:
             epoch.critic_grad_norm_before_clip,
         )
     ]
+    stability_values = [
+        value
+        for epoch in ppo_epochs
+        for value in (epoch.approx_kl, epoch.clip_fraction)
+        if value is not None
+    ]
+    route_telemetry = [
+        epoch.route_telemetry
+        for epoch in ppo_epochs
+        if epoch.route_telemetry is not None
+    ]
     return {
         "environment_budget_reached": (
             training.total_environment_transitions
@@ -277,6 +354,11 @@ def _diagnostic_checks(config: RunConfig, training: Any) -> dict[str, bool]:
             == training.ppo_update_count * config.training.mappo.update_epochs
         ),
         "ppo_values_are_finite": bool(ppo_values) and _all_finite(ppo_values),
+        "ppo_stability_telemetry_is_finite": _all_finite(stability_values),
+        "route_telemetry_schema_is_valid": all(
+            item.schema_version == ROUTE_TELEMETRY_SCHEMA_VERSION
+            for item in route_telemetry
+        ),
         "critic_loss_is_nonnegative": bool(ppo_epochs)
         and all(epoch.critic_loss >= 0.0 for epoch in ppo_epochs),
         "entropy_is_nonnegative": bool(ppo_epochs)
@@ -328,6 +410,90 @@ def _json_lines(records: list[dict[str, Any]]) -> str:
     )
 
 
+def read_training_metrics_csv_text(csv_text: str) -> tuple[dict[str, str], ...]:
+    """Read schema-v1 or schema-v2 metrics with missing v2 fields as blanks."""
+
+    if not isinstance(csv_text, str):
+        raise TypeError("csv_text must be a string")
+    rows = []
+    for row in csv.DictReader(io.StringIO(csv_text)):
+        normalized = {column: row.get(column, "") or "" for column in TRAINING_METRIC_COLUMNS}
+        normalized["diagnostics_schema_version"] = (
+            row.get("diagnostics_schema_version") or "1"
+        )
+        rows.append(normalized)
+    return tuple(rows)
+
+
+def _mean_present(values: Iterable[float | None]) -> float | None:
+    present = [float(value) for value in values if value is not None]
+    return None if not present else math.fsum(present) / len(present)
+
+
+def _route_telemetry_summary(training: Any) -> dict[str, Any]:
+    epochs = [
+        epoch
+        for update in training.updates
+        for epoch in update.output.epoch_diagnostics
+    ]
+    present = [epoch.route_telemetry for epoch in epochs if epoch.route_telemetry is not None]
+    unique_rollouts = [
+        update.output.epoch_diagnostics[0].route_telemetry
+        for update in training.updates
+        if update.output.epoch_diagnostics[0].route_telemetry is not None
+    ]
+    count_fields = (
+        "route_branch_active_count",
+        "legal_remote_route_count",
+        "route_selected_local_count",
+        "route_selected_remote_count",
+        "route_selected_defer_count",
+    )
+    curve_fields = (
+        "route_entropy_mean",
+        "remote_selection_rate_given_legal_remote",
+        "mean_local_probability",
+        "mean_best_remote_probability",
+        "mean_local_minus_best_remote_logit_margin",
+        "route_head_total_grad_norm",
+        "route_active_advantage_mean",
+    )
+    return {
+        "schema_version": ROUTE_TELEMETRY_SCHEMA_VERSION,
+        "per_ppo_epoch": {
+            "record_type": "ppo_epoch",
+            "telemetry_scope": "per_ppo_epoch",
+            "present_count": len(present),
+            "missing_count": len(epochs) - len(present),
+            "sample_counts_repeat_across_the_four_epochs_of_one_update": True,
+        },
+        "rolling_window": {
+            "window_ppo_epochs": ROUTE_TELEMETRY_ROLLING_WINDOW_PPO_EPOCHS,
+            "semantics": "trailing rows, valid values only, NA when the window has no valid value",
+            "columns": list(_ROUTE_ROLLING_COLUMNS),
+        },
+        "final_summary": {
+            "unique_rollout_sample_totals": {
+                name: sum(getattr(item, name) for item in unique_rollouts)
+                for name in count_fields
+            },
+            "mean_over_valid_ppo_epochs": {
+                name: _mean_present(getattr(item, name) for item in present)
+                for name in curve_fields
+            },
+            "latest_ppo_epoch": None if not present else present[-1].record(),
+        },
+        "na_semantics": (
+            "CSV blank and JSON null mean no valid sample or legacy checkpoint telemetry; "
+            "zero is retained only for an observed numeric zero"
+        ),
+        "checkpoint_v1_compatibility": (
+            "route telemetry is intentionally excluded from Checkpoint V1 payload fields; "
+            "restored legacy epoch diagnostics use NA and the checkpoint identity is unchanged"
+        ),
+    }
+
+
 def _training_summary(
     config: RunConfig,
     training: Any,
@@ -338,11 +504,17 @@ def _training_summary(
 ) -> dict[str, Any]:
     reward = training.reward
     ppo = training.ppo
+    ppo_epochs = [
+        epoch
+        for update in training.updates
+        for epoch in update.output.epoch_diagnostics
+    ]
     return {
         "run_id": config.run_id,
         "method_id": config.method_id,
         "scenario_id": config.scenario_id,
         "seed": config.seed,
+        "diagnostics_schema_version": TRAINING_DIAGNOSTICS_SCHEMA_VERSION,
         "validation_stage": "smoke-training",
         "smoke_training_gate_status": smoke_gate_status,
         "signal_gate_status": signal_gate_status,
@@ -380,9 +552,12 @@ def _training_summary(
             "entropy_mean": ppo.entropy.mean,
             "total_loss_mean": ppo.total_loss.mean,
             "ratio_mean": ppo.ratio.mean,
+            "approx_kl_mean": _mean_present(epoch.approx_kl for epoch in ppo_epochs),
+            "clip_fraction_mean": _mean_present(epoch.clip_fraction for epoch in ppo_epochs),
             "actor_grad_norm_before_clip_mean": ppo.actor_grad_norm_before_clip.mean,
             "critic_grad_norm_before_clip_mean": ppo.critic_grad_norm_before_clip.mean,
         },
+        "route_telemetry": _route_telemetry_summary(training),
         "dashboard": {
             "source_csv": dashboard_csv,
             "reward_series": "episode total reward",
@@ -390,6 +565,11 @@ def _training_summary(
             "reward_smoothing": (
                 "trailing arithmetic mean, window up to "
                 f"{REWARD_SMOOTHING_WINDOW_EPISODES} episodes, min_periods=1"
+            ),
+            "route_telemetry_smoothing": (
+                "trailing arithmetic mean over up to "
+                f"{ROUTE_TELEMETRY_ROLLING_WINDOW_PPO_EPOCHS} PPO epoch rows; "
+                "NA values are excluded"
             ),
         },
         "claim_boundary": (
@@ -408,6 +588,20 @@ def _trailing_mean(values: list[float], window: int) -> list[float]:
     return means
 
 
+def _optional_float_series(
+    rows: Iterable[Mapping[str, str]],
+    name: str,
+) -> list[float]:
+    return [
+        math.nan if row.get(name) in {None, ""} else float(row[name])
+        for row in rows
+    ]
+
+
+def _has_finite(values: Iterable[float]) -> bool:
+    return any(math.isfinite(value) for value in values)
+
+
 def _plot_dashboard(
     csv_text: str,
     output_stream: io.BytesIO,
@@ -423,7 +617,7 @@ def _plot_dashboard(
             "matplotlib is required to generate the training dashboard"
         ) from exc
 
-    rows = list(csv.DictReader(io.StringIO(csv_text)))
+    rows = list(read_training_metrics_csv_text(csv_text))
     episode_rows = [row for row in rows if row["record_type"] == "episode"]
     ppo_rows = [row for row in rows if row["record_type"] == "ppo_epoch"]
     if not episode_rows or not ppo_rows:
@@ -457,8 +651,19 @@ def _plot_dashboard(
     critic_loss = [float(row["critic_loss"]) for row in ppo_rows]
     entropy = [float(row["entropy"]) for row in ppo_rows]
     ratio = [float(row["ratio"]) for row in ppo_rows]
+    approx_kl = _optional_float_series(ppo_rows, "approx_kl")
+    clip_fraction = _optional_float_series(ppo_rows, "clip_fraction")
+    route_x = [int(row["environment_steps"]) for row in ppo_rows]
+    route_entropy = _optional_float_series(ppo_rows, "route_entropy_mean")
+    route_entropy_rolling = _optional_float_series(ppo_rows, "route_entropy_rolling_mean")
+    remote_rate = _optional_float_series(ppo_rows, "remote_selection_rate_given_legal_remote")
+    local_probability = _optional_float_series(ppo_rows, "mean_local_probability")
+    best_remote_probability = _optional_float_series(ppo_rows, "mean_best_remote_probability")
+    logit_margin = _optional_float_series(ppo_rows, "mean_local_minus_best_remote_logit_margin")
+    route_grad = _optional_float_series(ppo_rows, "route_head_total_grad_norm")
+    route_advantage = _optional_float_series(ppo_rows, "route_active_advantage_mean")
 
-    fig, axes = plt.subplots(2, 2, figsize=(10.0, 7.0))
+    fig, axes = plt.subplots(4, 2, figsize=(11.0, 13.0))
     ax = axes[0, 0]
     ax.plot(episode_x, rewards, color=colors[0], marker="o", label="raw")
     ax.plot(
@@ -505,9 +710,66 @@ def _plot_dashboard(
         linestyle=":",
         label="_nolegend_",
     )
+    if _has_finite(approx_kl):
+        ratio_axis.plot(ppo_x, approx_kl, color=colors[3], label="approx KL")
+    if _has_finite(clip_fraction):
+        ratio_axis.plot(ppo_x, clip_fraction, color=colors[1], label="clip fraction")
     ratio_axis.set_ylabel("Policy ratio")
-    handles = [ax.get_lines()[0], ratio_axis.get_lines()[0]]
+    handles = [ax.get_lines()[0], *ratio_axis.get_lines()]
     ax.legend(handles, [line.get_label() for line in handles], loc="best")
+
+    route_series = (
+        route_entropy,
+        remote_rate,
+        local_probability,
+        best_remote_probability,
+        logit_margin,
+        route_grad,
+        route_advantage,
+    )
+    if not any(_has_finite(values) for values in route_series):
+        for route_ax in axes[2:, :].flat:
+            route_ax.text(
+                0.5,
+                0.5,
+                "Route telemetry unavailable (legacy/disabled)",
+                ha="center",
+                va="center",
+                transform=route_ax.transAxes,
+            )
+            route_ax.set_axis_off()
+    else:
+        ax = axes[2, 0]
+        ax.plot(route_x, route_entropy, color=colors[2], marker="o", label="route entropy")
+        ax.plot(route_x, route_entropy_rolling, color=colors[2], linestyle="--", label="entropy rolling")
+        ax.set(title="Route entropy / remote selection", xlabel="Environment steps", ylabel="Entropy")
+        rate_axis = ax.twinx()
+        rate_axis.plot(route_x, remote_rate, color=colors[1], marker="s", label="remote rate")
+        rate_axis.set_ylabel("P(remote | legal remote)")
+        handles = ax.get_lines() + rate_axis.get_lines()
+        ax.legend(handles, [line.get_label() for line in handles], loc="best")
+
+        ax = axes[2, 1]
+        ax.plot(route_x, local_probability, color=colors[0], marker="o", label="P(local)")
+        ax.plot(route_x, best_remote_probability, color=colors[3], marker="s", label="P(best remote)")
+        ax.set(title="Legal-remote route probabilities", xlabel="Environment steps", ylabel="Probability")
+        ax.legend(loc="best")
+
+        ax = axes[3, 0]
+        ax.plot(route_x, logit_margin, color=colors[4], marker="o", label="local - best remote logit")
+        ax.axhline(0.0, color="0.35", linewidth=1.0, linestyle=":")
+        ax.set(title="Route margin / gradient", xlabel="Environment steps", ylabel="Logit margin")
+        grad_axis = ax.twinx()
+        grad_axis.plot(route_x, route_grad, color=colors[1], marker="s", label="route-head grad norm")
+        grad_axis.set_ylabel("Gradient norm")
+        handles = ax.get_lines()[:1] + grad_axis.get_lines()
+        ax.legend(handles, [line.get_label() for line in handles], loc="best")
+
+        ax = axes[3, 1]
+        ax.plot(route_x, route_advantage, color=colors[0], marker="o", label="route-active advantage")
+        ax.axhline(0.0, color="0.35", linewidth=1.0, linestyle=":")
+        ax.set(title="Route-active advantage", xlabel="Environment steps", ylabel="Advantage")
+        ax.legend(loc="best")
 
     fig.suptitle(
         "CA-GAT-MAPPO smoke training diagnostics\n"
