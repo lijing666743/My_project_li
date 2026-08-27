@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 from pathlib import Path
 from typing import Any
@@ -42,6 +42,7 @@ from .ca_gat_mappo_actions import (
     CAGATMAPPOActionDistribution,
     SequentialActionMaskBatch,
 )
+from .ca_gat_mappo_route_telemetry import RouteOutcomeTracker
 from .ca_gat_mappo_checkpoint import (
     CheckpointError,
     atomic_save_checkpoint,
@@ -230,6 +231,7 @@ class CAGATMAPPOTrainingResult:
     ppo: CAGATMAPPOLossDiagnostics
     episodes: tuple[CAGATMAPPOEpisodeDiagnostics, ...]
     updates: tuple[CAGATMAPPOUpdateDiagnostics, ...]
+    route_outcomes: tuple[object, ...] = field(default=(), compare=False)
 
     def __post_init__(self) -> None:
         counts = (
@@ -1145,6 +1147,7 @@ class CAGATMAPPOTrainer:
         self.actor.train()
         self.critic.train()
 
+        route_outcome_tracker = RouteOutcomeTracker(self.config.environment.slot_duration_s)
         episode_reward = _RewardAccumulator()
         episode_transitions = 0
         episode_index = self._next_episode_index
@@ -1225,6 +1228,17 @@ class CAGATMAPPOTrainer:
 
             proposals = tuple(action_output.proposals[0][0])
             step_result = environment.step(proposals)
+            route_action_indices = {
+                proposal.uav_id: int(
+                    action_output.action_indices["route"][0, 0, proposal.uav_id].item()
+                )
+                for proposal in proposals
+            }
+            route_outcome_tracker.observe_step(
+                episode_index,
+                step_result.info,
+                route_action_indices=route_action_indices,
+            )
             boundary = self._validate_step_result(slot, step_result)
             if self.policy_version != step_policy_version:
                 raise CAGATMAPPOTrainerError(
@@ -1389,6 +1403,7 @@ class CAGATMAPPOTrainer:
             episode_seeds=tuple(self._episode_seeds),
             reward=self._global_reward.snapshot(),
             ppo=_aggregate_updates(self._updates),
+            route_outcomes=route_outcome_tracker.finalize(),
             episodes=tuple(self._episodes),
             updates=tuple(self._updates),
         )

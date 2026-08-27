@@ -28,6 +28,7 @@ from src.models.ca_gat_mappo_trainer import (
 )
 from src.models.ca_gat_mappo_update import (
     CAGATMAPPORecurrentPPOUpdater,
+    _prepare_device_minibatch,
     RecurrentPPOEpochDiagnostics,
     RecurrentPPOUpdateOutput,
 )
@@ -447,6 +448,30 @@ class RouteTelemetryNeutralityTests(unittest.TestCase):
             self.assertTrue(torch.equal(left, right))
         for left, right in zip(critic_enabled.parameters(), critic_disabled.parameters()):
             self.assertTrue(torch.equal(left, right))
+        for left, right in zip(actor_enabled.parameters(), actor_disabled.parameters()):
+            if left.grad is None or right.grad is None:
+                self.assertIs(left.grad, right.grad)
+            else:
+                self.assertTrue(torch.equal(left.grad, right.grad))
+        for left, right in zip(critic_enabled.parameters(), critic_disabled.parameters()):
+            if left.grad is None or right.grad is None:
+                self.assertIs(left.grad, right.grad)
+            else:
+                self.assertTrue(torch.equal(left.grad, right.grad))
+        for optimizer_name in ("actor_optimizer", "critic_optimizer"):
+            enabled_state = getattr(enabled.optimizers, optimizer_name).state_dict()
+            disabled_state = getattr(disabled.optimizers, optimizer_name).state_dict()
+            self.assertEqual(enabled_state["param_groups"], disabled_state["param_groups"])
+            self.assertEqual(enabled_state["state"].keys(), disabled_state["state"].keys())
+            for parameter_id in enabled_state["state"]:
+                self.assertEqual(enabled_state["state"][parameter_id].keys(), disabled_state["state"][parameter_id].keys())
+                for name, value in enabled_state["state"][parameter_id].items():
+                    other = disabled_state["state"][parameter_id][name]
+                    if torch.is_tensor(value):
+                        self.assertTrue(torch.equal(value, other))
+                    else:
+                        self.assertEqual(value, other)
+
         fields = (
             "actor_loss",
             "critic_loss",
@@ -467,6 +492,40 @@ class RouteTelemetryNeutralityTests(unittest.TestCase):
                 self.assertEqual(getattr(left, name), getattr(right, name))
             self.assertIsNotNone(left.route_telemetry)
             self.assertIsNone(right.route_telemetry)
+
+
+    def test_enabled_disabled_full_joint_ratio_tensor_is_identical(self) -> None:
+        actor_enabled = CAGATMAPPOActor(self.config)
+        critic_enabled = MAPPOCentralizedCritic(self.config)
+        actor_disabled = CAGATMAPPOActor(self.config)
+        critic_disabled = MAPPOCentralizedCritic(self.config)
+        enabled = CAGATMAPPORecurrentPPOUpdater(
+            actor_enabled, critic_enabled, self.config, route_telemetry_enabled=True
+        )
+        disabled = CAGATMAPPORecurrentPPOUpdater(
+            actor_disabled, critic_disabled, self.config, route_telemetry_enabled=False
+        )
+        from src.models.ca_gat_mappo_update import build_recurrent_ppo_minibatch
+
+        minibatch = build_recurrent_ppo_minibatch(self.buffer, self.config)
+        prepared_enabled = _prepare_device_minibatch(
+            minibatch, enabled.device, enabled.dtype
+        )
+        prepared_disabled = _prepare_device_minibatch(
+            minibatch, disabled.device, disabled.dtype
+        )
+        with torch.no_grad():
+            evaluation_enabled = enabled._evaluate_prepared(prepared_enabled)
+            evaluation_disabled = disabled._evaluate_prepared(prepared_disabled)
+            ratio_enabled = torch.exp(
+                evaluation_enabled.policy.joint_log_prob
+                - prepared_enabled.old_joint_log_prob
+            )
+            ratio_disabled = torch.exp(
+                evaluation_disabled.policy.joint_log_prob
+                - prepared_disabled.old_joint_log_prob
+            )
+        self.assertTrue(torch.equal(ratio_enabled, ratio_disabled))
 
 
 class RouteTelemetryPersistenceTests(unittest.TestCase):

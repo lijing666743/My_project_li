@@ -12,7 +12,7 @@ import csv
 import io
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -20,6 +20,9 @@ from .artifacts import atomic_write_bytes_group, require_artifact_targets_absent
 from .config import RunConfig
 from .models.ca_gat_mappo_route_telemetry import (
     ROUTE_TELEMETRY_SCHEMA_VERSION,
+    RouteOutcomeAssociation,
+    aggregate_route_outcomes,
+    ROUTE_ACTION_CATEGORIES,
     RouteTelemetry,
 )
 
@@ -31,11 +34,39 @@ REWARD_SMOOTHING_WINDOW_EPISODES = 5
 MIN_SIGNAL_EPISODES = 10
 MIN_SIGNAL_PPO_EPOCHS = 10
 
-TRAINING_DIAGNOSTICS_SCHEMA_VERSION = 2
+TRAINING_DIAGNOSTICS_SCHEMA_VERSION = 3
 ROUTE_TELEMETRY_ROLLING_WINDOW_PPO_EPOCHS = 4
 _ROUTE_TELEMETRY_COLUMNS = (
     "route_telemetry_schema_version",
     *RouteTelemetry.field_names()[1:],
+)
+_ROUTE_SAMPLE_COLUMNS = (
+    "route_sample_batch_index",
+    "route_sample_time_index",
+    "route_sample_agent_index",
+    "route_sample_source_uav",
+    "route_sample_category",
+    "route_sample_legal_remote_destinations",
+    "route_sample_remote_probability_by_destination",
+    "route_sample_local_probability",
+    "route_sample_defer_probability",
+    "route_sample_total_remote_probability_mass",
+    "route_sample_best_remote_probability",
+    "route_sample_number_of_legal_remote_destinations",
+    "route_sample_selected_route_action_index",
+    "route_sample_selected_destination_uav",
+    "route_sample_old_route_log_prob",
+    "route_sample_new_route_log_prob",
+    "route_sample_log_ratio",
+    "route_sample_ratio",
+    "route_sample_approx_kl",
+    "route_sample_clip_indicator",
+    "route_sample_advantage",
+    "route_sample_return_target",
+    "route_sample_td_residual",
+)
+_ROUTE_OUTCOME_COLUMNS = tuple(
+    f"route_outcome_{item.name}" for item in fields(RouteOutcomeAssociation)
 )
 _ROUTE_ROLLING_FIELDS = (
     ("route_entropy_rolling_mean", "route_entropy_mean"),
@@ -46,6 +77,7 @@ _ROUTE_ROLLING_FIELDS = (
     ("route_head_total_grad_norm_rolling_mean", "route_head_total_grad_norm"),
     ("route_active_advantage_rolling_mean", "route_active_advantage_mean"),
 )
+
 _ROUTE_ROLLING_COLUMNS = tuple(name for name, _ in _ROUTE_ROLLING_FIELDS)
 
 TRAINING_METRIC_COLUMNS = (
@@ -95,6 +127,8 @@ TRAINING_METRIC_COLUMNS = (
     "route_telemetry_enabled",
     *_ROUTE_TELEMETRY_COLUMNS,
     *_ROUTE_ROLLING_COLUMNS,
+    *_ROUTE_SAMPLE_COLUMNS,
+    *_ROUTE_OUTCOME_COLUMNS,
     "signal_gate_status",
 )
 
@@ -160,6 +194,8 @@ def _base_record(config: RunConfig, signal_gate_status: str) -> dict[str, Any]:
         "route_telemetry_enabled": None,
         **{column: None for column in _ROUTE_TELEMETRY_COLUMNS},
         **{column: None for column in _ROUTE_ROLLING_COLUMNS},
+        **{column: None for column in _ROUTE_SAMPLE_COLUMNS},
+        **{column: None for column in _ROUTE_OUTCOME_COLUMNS},
         "signal_gate_status": signal_gate_status,
     }
 
@@ -295,7 +331,69 @@ def _ppo_epoch_records(
 
 
 def _all_finite(values: Iterable[float]) -> bool:
+
     return all(math.isfinite(float(value)) for value in values)
+
+def _route_sample_records(
+    config: RunConfig,
+    training: Any,
+    signal_gate_status: str,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    series_index = 0
+    mappo = config.training.mappo
+    for update in training.updates:
+        environment_steps = min(
+            (update.update_index + 1) * mappo.rollout_length_slots,
+            training.total_environment_transitions,
+        )
+        for epoch in update.output.epoch_diagnostics:
+            series_index += 1
+            telemetry = epoch.route_telemetry
+            if telemetry is None:
+                continue
+            for sample in getattr(telemetry, "samples", ()) or ():
+                record = _base_record(config, signal_gate_status)
+                record.update({
+                    "record_type": "route_sample",
+                    "telemetry_scope": "per_route_active_sample",
+                    "series_index": series_index,
+                    "environment_steps": environment_steps,
+                    "update_index": update.update_index,
+                    "ppo_epoch_index": epoch.epoch_index,
+                    "policy_version_before": update.rollout_policy_version,
+                    "policy_version_after": update.policy_version_after_update,
+                    "ppo_clip_epsilon": mappo.ppo_clip_epsilon,
+                    "route_telemetry_enabled": True,
+                    "route_telemetry_schema_version": telemetry.schema_version,
+                })
+                record.update(sample.record())
+                records.append(record)
+    return records
+
+
+def _route_outcome_records(
+    config: RunConfig,
+    training: Any,
+    signal_gate_status: str,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for series_index, outcome in enumerate(
+        getattr(training, "route_outcomes", ()) or (), start=1
+    ):
+        if not isinstance(outcome, RouteOutcomeAssociation):
+            continue
+        record = _base_record(config, signal_gate_status)
+        record.update({
+            "record_type": "route_outcome",
+            "telemetry_scope": "route_decision_to_task_outcome",
+            "series_index": series_index,
+            "route_telemetry_enabled": True,
+            "route_telemetry_schema_version": ROUTE_TELEMETRY_SCHEMA_VERSION,
+        })
+        record.update(outcome.record())
+        records.append(record)
+    return records
 
 
 def _diagnostic_checks(config: RunConfig, training: Any) -> dict[str, bool]:
@@ -457,6 +555,10 @@ def _route_telemetry_summary(training: Any) -> dict[str, Any]:
         "mean_local_minus_best_remote_logit_margin",
         "route_head_total_grad_norm",
         "route_active_advantage_mean",
+        "mean_defer_probability_all_route_active",
+        "mean_total_remote_probability_mass",
+        "mean_local_minus_total_remote_probability",
+        "mean_local_minus_total_remote_logit_margin",
     )
     return {
         "schema_version": ROUTE_TELEMETRY_SCHEMA_VERSION,
@@ -483,6 +585,12 @@ def _route_telemetry_summary(training: Any) -> dict[str, Any]:
             },
             "latest_ppo_epoch": None if not present else present[-1].record(),
         },
+        "per_route_active_sample": {
+            "record_type": "route_sample",
+            "telemetry_scope": "per_route_active_sample",
+            "present_count": sum(len(getattr(item, "samples", ()) or ()) for item in present),
+        },
+        "route_outcomes": aggregate_route_outcomes(getattr(training, "route_outcomes", ()) or ()),
         "na_semantics": (
             "CSV blank and JSON null mean no valid sample or legacy checkpoint telemetry; "
             "zero is retained only for an observed numeric zero"
@@ -810,6 +918,8 @@ def write_cagat_mappo_training_artifacts(
     smoke_gate_status = "pass" if all(checks.values()) else "fail"
     records = _episode_records(config, training, signal_gate_status)
     records.extend(_ppo_epoch_records(config, training, signal_gate_status))
+    records.extend(_route_sample_records(config, training, signal_gate_status))
+    records.extend(_route_outcome_records(config, training, signal_gate_status))
     csv_text = _csv_text(records)
 
     paths = config.artifact_paths()

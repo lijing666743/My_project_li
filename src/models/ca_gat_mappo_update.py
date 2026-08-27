@@ -106,6 +106,8 @@ class RecurrentPPOMinibatch:
     advantage: Tensor
     return_target: Tensor
     sequence_valid_mask: Tensor
+    old_branch_log_probs: Tensor | None = None
+    td_residual: Tensor | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.spec, MAPPOTensorSpec):
@@ -143,6 +145,16 @@ class RecurrentPPOMinibatch:
                 raise RecurrentPPOUpdateError(f"{name} has an invalid shape")
             if tensor.device.type != "cpu":
                 raise RecurrentPPOUpdateError(f"{name} must remain a CPU snapshot")
+        optional = {
+            "old_branch_log_probs": (8, 32, self.spec.uav_count, len(ACTION_BRANCH_ORDER)),
+            "td_residual": (8, 32),
+        }
+        for name, expected_shape in optional.items():
+            tensor = getattr(self, name)
+            if tensor is not None and (not isinstance(tensor, Tensor) or tuple(tensor.shape) != expected_shape or tensor.device.type != "cpu"):
+                raise RecurrentPPOUpdateError(f"{name} has an invalid optional snapshot shape")
+            if tensor is not None and (tensor.dtype != torch.float32 or tensor.requires_grad or not torch.isfinite(tensor).all()):
+                raise RecurrentPPOUpdateError(f"{name} must be a detached finite CPU float32 snapshot")
         if self.rollout_indices.dtype != torch.long:
             raise RecurrentPPOUpdateError("rollout_indices must use torch.long")
         expected_indices = torch.arange(256, dtype=torch.long).reshape(8, 32)
@@ -243,6 +255,8 @@ def build_recurrent_ppo_minibatch(
         advantage=gae.advantage.reshape(8, 32).clone(),
         return_target=gae.return_target.reshape(8, 32).clone(),
         sequence_valid_mask=gae.sequence_mask.reshape(8, 32).clone(),
+        old_branch_log_probs=torch.stack([chunk.old_branch_log_probs for chunk in chunks], dim=0),
+        td_residual=gae.td_residual.reshape(8, 32).clone(),
     )
     return result
 
@@ -530,6 +544,8 @@ class _DeviceRecurrentPPOMinibatch:
     advantage: Tensor
     return_target: Tensor
     sequence_valid_mask: Tensor
+    old_branch_log_probs: Tensor | None = None
+    td_residual: Tensor | None = None
 
 
 def _prepare_device_minibatch(
@@ -549,6 +565,10 @@ def _prepare_device_minibatch(
         advantage=minibatch.advantage.to(device=device, dtype=dtype),
         return_target=minibatch.return_target.to(device=device, dtype=dtype),
         sequence_valid_mask=minibatch.sequence_valid_mask.to(device=device),
+        old_branch_log_probs=(minibatch.old_branch_log_probs.to(device=device, dtype=dtype)
+                              if minibatch.old_branch_log_probs is not None else None),
+        td_residual=(minibatch.td_residual.to(device=device, dtype=dtype)
+                     if minibatch.td_residual is not None else None),
     )
 
 
@@ -773,6 +793,10 @@ class CAGATMAPPORecurrentPPOUpdater:
                     return_target=prepared.return_target,
                     sequence_valid_mask=prepared.sequence_valid_mask,
                     route_head=self.actor.action_heads["route"],
+                    old_branch_log_probs=prepared.old_branch_log_probs,
+                    td_residual=prepared.td_residual,
+                    shared_trunk=self.actor,
+                    epsilon_clip=self.config.training.mappo.ppo_clip_epsilon,
                 )
             actor_grad_norm = self._finite_grad_norm(
                 self.optimizers.actor_parameters,
