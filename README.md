@@ -182,3 +182,4 @@ knowledge/project_plan/方案2.md
 - reward 图包含 episode reward 原始曲线与 window=10 的 trailing moving average；组件图使用 completion component 与 expiration penalty 的原始记录；PPO 图使用按 update/epoch 排序的 actor loss、critic loss、entropy 和 ratio 记录。
 - 当前图表来自单 seed（seed=42） Long Smoke 诊断产物，只用于训练信号与日志检查，不支持收敛、稳定性、性能、优越性或多 seed 泛化结论。
 - 在项目根目录运行 `python results/scripts/plot_training_curves.py` 可独立重新生成上述图表。
+- Diagnostic Package 3.1 已完成 Return/TD residual 分布持久化补全：route-active、local/remote/defer 与 legal-remote subset 均写出 valid sample count、mean、std、median、p25、p75、positive/negative fraction；统计复用既有 detached collector 的 finite/NA/quantile 语义，schema 保持 v3，旧 artifact 未改写。本轮未训练、未改 checkpoint interval/reward/GAE/PPO/entropy/LR/network/observation/action mask/environment/Heuristic，未运行 Seeds 43–46，targeted 5/5、Package 3 11/11、PPO 39/39、update 17/17、GAE 28/28、persistence 13/13、full unittest 445/445 PASS，待人工审核。

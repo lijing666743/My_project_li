@@ -284,11 +284,29 @@ class RouteTelemetry:
             )
             distribution_names.extend(
                 f"{group}_return_target_{suffix}"
-                for suffix in ("valid_sample_count", "mean", "std", "median")
+                for suffix in (
+                    "valid_sample_count",
+                    "mean",
+                    "std",
+                    "median",
+                    "p25",
+                    "p75",
+                    "positive_fraction",
+                    "negative_fraction",
+                )
             )
             distribution_names.extend(
                 f"{group}_td_residual_{suffix}"
-                for suffix in ("valid_sample_count", "mean", "std", "median")
+                for suffix in (
+                    "valid_sample_count",
+                    "mean",
+                    "std",
+                    "median",
+                    "p25",
+                    "p75",
+                    "positive_fraction",
+                    "negative_fraction",
+                )
             )
         return names + tuple(ROUTE_PPO_RECORD_FIELDS) + tuple(distribution_names)
 
@@ -312,8 +330,8 @@ class RouteTelemetry:
             result.update({name: None for name in ROUTE_PPO_RECORD_FIELDS})
         for prefix, summaries, include_quantiles in (
             ("advantage", self._advantage_distributions, True),
-            ("return_target", self._return_distributions, False),
-            ("td_residual", self._td_residual_distributions, False),
+            ("return_target", self._return_distributions, True),
+            ("td_residual", self._td_residual_distributions, True),
         ):
             for group in ROUTE_DISTRIBUTION_GROUPS:
                 summary = (summaries or {}).get(group, RouteDistributionSummary())
