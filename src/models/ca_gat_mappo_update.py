@@ -36,6 +36,10 @@ from .ca_gat_mappo_ppo import (
     CAGATMAPPOLossOutput,
     compute_configured_ppo_objective_and_loss,
 )
+from .ca_gat_mappo_route_telemetry import (
+    RouteTelemetry,
+    collect_route_telemetry,
+)
 from .ca_gat_mappo_rollout import CAGATMAPPORolloutBuffer
 
 
@@ -561,6 +565,9 @@ class RecurrentPPOEpochDiagnostics:
     actor_grad_norm_before_clip: float
     critic_grad_norm_before_clip: float
     clip_max_norm: float
+    approx_kl: float | None = None
+    clip_fraction: float | None = None
+    route_telemetry: RouteTelemetry | None = None
 
     def __post_init__(self) -> None:
         if self.epoch_index not in range(4):
@@ -577,6 +584,16 @@ class RecurrentPPOEpochDiagnostics:
         )
         if not all(math.isfinite(value) for value in values):
             raise RecurrentPPOUpdateError("update diagnostics contain NaN or Inf")
+        if self.approx_kl is not None and not math.isfinite(self.approx_kl):
+            raise RecurrentPPOUpdateError("approx_kl must be finite or NA")
+        if self.clip_fraction is not None and not (
+            math.isfinite(self.clip_fraction) and 0.0 <= self.clip_fraction <= 1.0
+        ):
+            raise RecurrentPPOUpdateError("clip_fraction must lie in [0, 1] or be NA")
+        if self.route_telemetry is not None and not isinstance(
+            self.route_telemetry, RouteTelemetry
+        ):
+            raise TypeError("route_telemetry must be RouteTelemetry or None")
 
 
 @dataclass(frozen=True)
@@ -613,6 +630,7 @@ class CAGATMAPPORecurrentPPOUpdater:
         *,
         optimizers: CAGATMAPPOOptimizerBundle | None = None,
         action_distribution: CAGATMAPPOActionDistribution | None = None,
+        route_telemetry_enabled: bool = True,
     ) -> None:
         _validate_frozen_contract(config)
         if not isinstance(actor, CAGATMAPPOActor):
@@ -648,6 +666,9 @@ class CAGATMAPPORecurrentPPOUpdater:
             raise TypeError("action_distribution must be CAGATMAPPOActionDistribution")
         if self.action_distribution.actor is not actor:
             raise RecurrentPPOUpdateError("action distribution must own the updated actor")
+        if not isinstance(route_telemetry_enabled, bool):
+            raise TypeError("route_telemetry_enabled must be boolean")
+        self.route_telemetry_enabled = route_telemetry_enabled
 
     def _evaluate_prepared(
         self,
@@ -742,6 +763,17 @@ class CAGATMAPPORecurrentPPOUpdater:
                 config=self.config,
             )
             loss.total_loss.backward()
+            route_telemetry = None
+            if self.route_telemetry_enabled:
+                route_telemetry = collect_route_telemetry(
+                    policy=evaluation.policy,
+                    action_mask_batch=prepared.action_mask_batch,
+                    proposals=prepared.proposals,
+                    advantage=prepared.advantage,
+                    return_target=prepared.return_target,
+                    sequence_valid_mask=prepared.sequence_valid_mask,
+                    route_head=self.actor.action_heads["route"],
+                )
             actor_grad_norm = self._finite_grad_norm(
                 self.optimizers.actor_parameters,
                 mappo.gradient_clip_norm,
@@ -770,6 +802,9 @@ class CAGATMAPPORecurrentPPOUpdater:
                     actor_grad_norm_before_clip=actor_grad_norm,
                     critic_grad_norm_before_clip=critic_grad_norm,
                     clip_max_norm=mappo.gradient_clip_norm,
+                    approx_kl=loss.diagnostics.approx_kl,
+                    clip_fraction=loss.diagnostics.clipped_fraction,
+                    route_telemetry=route_telemetry,
                 )
             )
         return RecurrentPPOUpdateOutput(

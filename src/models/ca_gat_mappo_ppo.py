@@ -95,6 +95,7 @@ class PPOObjectiveDiagnostics:
     ratio_min: float
     ratio_max: float
     clipped_fraction: float
+    approx_kl: float
     surrogate_mean: float
     value_squared_error_mean: float
     entropy_mean: float
@@ -107,6 +108,7 @@ class PPOObjectiveDiagnostics:
             self.ratio_min,
             self.ratio_max,
             self.clipped_fraction,
+            self.approx_kl,
             self.surrogate_mean,
             self.value_squared_error_mean,
             self.entropy_mean,
@@ -310,6 +312,7 @@ def compute_ppo_objective_and_loss(
         raise PPOObjectiveError("total_loss produced NaN or Inf")
 
     valid_ratios = ratio.masked_select(actor_valid_mask).detach()
+    valid_log_ratios = log_ratio.masked_select(actor_valid_mask).detach()
     valid_surrogate = surrogate.masked_select(actor_valid_mask).detach()
     valid_value_error = value_squared_error.masked_select(critic_valid_mask).detach()
     clipped_positions = (ratio != clipped_ratio) & actor_valid_mask
@@ -323,6 +326,9 @@ def compute_ppo_objective_and_loss(
             clipped_positions.sum().to(dtype=torch.float32).div(
                 actor_valid_mask.sum()
             ).cpu().item()
+        ),
+        approx_kl=float(
+            ((valid_ratios - 1.0) - valid_log_ratios).mean().cpu().item()
         ),
         surrogate_mean=float(valid_surrogate.mean().cpu().item()),
         value_squared_error_mean=float(valid_value_error.mean().cpu().item()),
