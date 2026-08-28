@@ -10,7 +10,7 @@ from typing import Any, Mapping
 
 import torch
 
-from ..config import CHECKPOINT_KIND_FINAL_COMPLETED, RunConfig
+from ..config import ActorRatioMode, CHECKPOINT_KIND_FINAL_COMPLETED, RunConfig
 from ..models.ca_gat_mappo import CAGATMAPPOActor, MAPPOTensorSpec
 from ..models.ca_gat_mappo_checkpoint import CheckpointError, load_checkpoint_payload
 
@@ -38,6 +38,7 @@ class LoadedEvaluationActor:
     source_checkpoint_kind: str
     source_method_id: str
     source_training_config_hash: str
+    source_training_actor_ratio_mode: str
     source_training_git_commit: str
     source_training_device: str
     evaluation_device: str
@@ -109,6 +110,23 @@ def load_final_actor_for_evaluation(
 
     resolved_source = _validate_source_config_identity(payload)
     _validate_source_compatibility(config, resolved_source)
+    source_training = resolved_source.get("training")
+    source_mappo = (
+        source_training.get("mappo")
+        if isinstance(source_training, Mapping)
+        else None
+    )
+    raw_ratio_mode = (
+        source_mappo.get("actor_ratio_mode", ActorRatioMode.JOINT.value)
+        if isinstance(source_mappo, Mapping)
+        else ActorRatioMode.JOINT.value
+    )
+    try:
+        source_actor_ratio_mode = ActorRatioMode(raw_ratio_mode).value
+    except (TypeError, ValueError) as exc:
+        raise EvaluationCheckpointError(
+            "checkpoint training actor_ratio_mode is invalid"
+        ) from exc
     runtime = payload["runtime_provenance"]
     source_device = str(runtime["device_type"])
     if source_device not in {"cpu", "cuda"}:
@@ -151,6 +169,7 @@ def load_final_actor_for_evaluation(
         source_checkpoint_kind=str(payload["checkpoint_kind"]),
         source_method_id=str(payload["method_id"]),
         source_training_config_hash=str(payload["config_hash"]),
+        source_training_actor_ratio_mode=source_actor_ratio_mode,
         source_training_git_commit=source_git,
         source_training_device=source_device,
         evaluation_device=device.type,

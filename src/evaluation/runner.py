@@ -453,6 +453,9 @@ class FormalEvaluationRunner:
             "source_training_config_hash": (
                 self.loaded_actor.source_training_config_hash
             ),
+            "source_training_actor_ratio_mode": (
+                self.loaded_actor.source_training_actor_ratio_mode
+            ),
             "source_training_git_commit": (
                 self.loaded_actor.source_training_git_commit
             ),

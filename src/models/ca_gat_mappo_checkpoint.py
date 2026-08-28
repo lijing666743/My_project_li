@@ -751,6 +751,18 @@ def validate_periodic_checkpoint_compatibility(
 
     mapping = validate_checkpoint_payload(payload)
     runtime = mapping["runtime_provenance"]
+    source_snapshot = _mapping(mapping["config_snapshot"], "config_snapshot")
+    source_training = source_snapshot.get("training")
+    source_mappo = (
+        source_training.get("mappo")
+        if isinstance(source_training, Mapping)
+        else None
+    )
+    source_actor_ratio_mode = (
+        source_mappo.get("actor_ratio_mode")
+        if isinstance(source_mappo, Mapping)
+        else None
+    )
     try:
         validate_mappo_checkpoint_resume_compatibility(
             config,
@@ -761,6 +773,7 @@ def validate_periodic_checkpoint_compatibility(
             config_hash=mapping["config_hash"],
             training_device=runtime["device_type"],
             cuda_available=cuda_available,
+            checkpoint_actor_ratio_mode=source_actor_ratio_mode,
         )
     except ConfigError as exc:
         raise CheckpointError(str(exc)) from exc

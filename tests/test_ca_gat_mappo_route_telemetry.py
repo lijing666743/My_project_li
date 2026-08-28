@@ -527,6 +527,38 @@ class RouteTelemetryNeutralityTests(unittest.TestCase):
             )
         self.assertTrue(torch.equal(ratio_enabled, ratio_disabled))
 
+    def test_production_update_emits_all_branch_stats_and_rollout_activity(self) -> None:
+        actor = CAGATMAPPOActor(self.config)
+        critic = MAPPOCentralizedCritic(self.config)
+        updater = CAGATMAPPORecurrentPPOUpdater(
+            actor,
+            critic,
+            self.config,
+            route_telemetry_enabled=True,
+        )
+        output = updater.update(self.buffer)
+        telemetry = output.epoch_diagnostics[0].route_telemetry
+        self.assertIsNotNone(telemetry)
+        self.assertEqual(telemetry.actor_ratio_mode, "joint")
+        self.assertEqual(
+            tuple(telemetry.branch_ppo_dynamics.groups),
+            tuple(self.config.action.sampling_order),
+        )
+        self.assertEqual(len(telemetry.active_branch_matrix), 256)
+        self.assertTrue(
+            all(
+                len(time_step) == self.config.environment.uav_count
+                and all(len(agent_row) == 7 for agent_row in time_step)
+                for time_step in telemetry.active_branch_matrix
+            )
+        )
+        route = telemetry.branch_ppo_dynamics.groups["route"]
+        self.assertEqual(route.active_count, telemetry.route_branch_active_count)
+        if route.active_count:
+            self.assertIsNotNone(route.ratio_mean)
+            self.assertIsNotNone(route.clip_fraction)
+            self.assertIsNotNone(route.surrogate_contribution_mean)
+
 
 class RouteTelemetryPersistenceTests(unittest.TestCase):
     @classmethod

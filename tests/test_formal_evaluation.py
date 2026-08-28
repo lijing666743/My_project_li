@@ -17,6 +17,7 @@ from src.cli import (
     main as cli_main,
 )
 from src.config import (
+    ActorRatioMode,
     CHECKPOINT_KIND_FINAL_COMPLETED,
     CHECKPOINT_KIND_PERIODIC_RESUME,
     ConfigError,
@@ -39,8 +40,19 @@ def make_evaluation_fixture(
     evaluation_seeds: tuple[int, ...] = (1042,),
     arrivals: tuple[float, ...] | None = None,
     kind: str = CHECKPOINT_KIND_FINAL_COMPLETED,
+    actor_ratio_mode: ActorRatioMode = ActorRatioMode.JOINT,
 ):
     source = make_checkpoint_config(root, horizon=4, interval=4, budget=8)
+    source = replace(
+        source,
+        training=replace(
+            source.training,
+            mappo=replace(
+                source.training.mappo,
+                actor_ratio_mode=actor_ratio_mode,
+            ),
+        ),
+    )
     if arrivals is not None:
         source = replace(
             source,
@@ -204,10 +216,32 @@ class TestFinalActorOnlyLoader(unittest.TestCase):
             restore_rollout.assert_not_called()
             self.assertFalse(loaded.actor.training)
             self.assertEqual(loaded.source_checkpoint_kind, "FINAL_COMPLETED")
+            self.assertEqual(loaded.source_training_actor_ratio_mode, "joint")
             self.assertEqual(loaded.source_training_device, "cpu")
             self.assertEqual(loaded.evaluation_device, "cpu")
             for name, value in source_actor.state_dict().items():
                 self.assertTrue(torch.equal(value.cpu(), loaded.actor.state_dict()[name].cpu()))
+
+    def test_branch_specific_training_provenance_reaches_formal_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _source, config, checkpoint, _actor = make_evaluation_fixture(
+                Path(directory),
+                actor_ratio_mode=ActorRatioMode.BRANCH_SPECIFIC,
+            )
+            runner = FormalEvaluationRunner(
+                config,
+                checkpoint,
+                evaluation_device="cpu",
+            )
+            self.assertEqual(
+                runner.loaded_actor.source_training_actor_ratio_mode,
+                "branch_specific",
+            )
+            result = runner.run(write_artifacts=False)
+            self.assertEqual(
+                result.manifest["source_training_actor_ratio_mode"],
+                "branch_specific",
+            )
 
     def test_periodic_resume_is_rejected_for_formal_evaluation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -384,6 +418,7 @@ class TestFormalEvaluationRunner(unittest.TestCase):
             self.assertTrue(manifest["masked_argmax"])
             self.assertIn("source_checkpoint_sha256", manifest)
             self.assertIn("source_training_config_hash", manifest)
+            self.assertEqual(manifest["source_training_actor_ratio_mode"], "joint")
             self.assertIn("shared_external_trace_by_seed", manifest)
             self.assertIn("/evaluations/", first.artifacts[0].replace("\\", "/"))
 

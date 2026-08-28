@@ -13,7 +13,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from ..config import RunConfig
+from ..config import ActorRatioMode, RunConfig
 
 
 class PPOObjectiveError(ValueError):
@@ -141,6 +141,15 @@ class CAGATMAPPOLossOutput:
     value_coefficient: float
     entropy_coefficient: float
     diagnostics: PPOObjectiveDiagnostics
+    actor_ratio_mode: str = ActorRatioMode.JOINT.value
+    branch_log_ratio: Tensor | None = None
+    branch_ratio: Tensor | None = None
+    branch_clipped_ratio: Tensor | None = None
+    branch_unclipped_surrogate: Tensor | None = None
+    branch_clipped_surrogate: Tensor | None = None
+    branch_surrogate: Tensor | None = None
+    active_branch_indicators: Tensor | None = None
+    active_branch_count: Tensor | None = None
 
     def __post_init__(self) -> None:
         matrices = (
@@ -184,6 +193,69 @@ class CAGATMAPPOLossOutput:
             raise PPOObjectiveError("PPO objective outputs must be finite scalars")
         if not torch.allclose(self.actor_loss, -self.clipped_objective):
             raise PPOObjectiveError("actor_loss must equal -clipped_objective")
+        try:
+            ratio_mode = ActorRatioMode(self.actor_ratio_mode)
+        except (TypeError, ValueError) as exc:
+            raise PPOObjectiveError("actor_ratio_mode is invalid") from exc
+        branch_tensors = (
+            self.branch_log_ratio,
+            self.branch_ratio,
+            self.branch_clipped_ratio,
+            self.branch_unclipped_surrogate,
+            self.branch_clipped_surrogate,
+            self.branch_surrogate,
+        )
+        if ratio_mode is ActorRatioMode.JOINT:
+            if any(tensor is not None for tensor in branch_tensors) or any(
+                tensor is not None
+                for tensor in (
+                    self.active_branch_indicators,
+                    self.active_branch_count,
+                )
+            ):
+                raise PPOObjectiveError(
+                    "joint mode must not expose branch-specific objective tensors"
+                )
+            return
+        if any(not isinstance(tensor, Tensor) or tensor.ndim != 3 for tensor in branch_tensors):
+            raise PPOObjectiveError(
+                "branch-specific objective statistics must be [T,A,7] tensors"
+            )
+        branch_shape = branch_tensors[0].shape
+        if branch_shape[:2] != matrix_shape or branch_shape[-1] != 7:
+            raise PPOObjectiveError(
+                "branch-specific objective statistics must have shape [T,A,7]"
+            )
+        if any(tensor.shape != branch_shape for tensor in branch_tensors[1:]):
+            raise PPOObjectiveError("branch-specific statistics must share one shape")
+        if (
+            not isinstance(self.active_branch_indicators, Tensor)
+            or self.active_branch_indicators.shape != branch_shape
+            or self.active_branch_indicators.dtype != torch.bool
+        ):
+            raise PPOObjectiveError(
+                "active_branch_indicators must be boolean [T,A,7]"
+            )
+        if (
+            not isinstance(self.active_branch_count, Tensor)
+            or self.active_branch_count.shape != matrix_shape
+        ):
+            raise PPOObjectiveError("active_branch_count must have shape [T,A]")
+        if any(
+            not tensor.is_floating_point() or not torch.isfinite(tensor).all()
+            for tensor in branch_tensors
+        ):
+            raise PPOObjectiveError("branch-specific statistics contain NaN or Inf")
+        inactive = ~self.active_branch_indicators
+        for tensor in (
+            self.branch_unclipped_surrogate,
+            self.branch_clipped_surrogate,
+            self.branch_surrogate,
+        ):
+            if torch.any(tensor.masked_select(inactive) != 0.0):
+                raise PPOObjectiveError(
+                    "inactive branches must have zero surrogate contribution"
+                )
 
 
 def compute_ppo_objective_and_loss(
@@ -198,6 +270,10 @@ def compute_ppo_objective_and_loss(
     epsilon_clip: float,
     value_coefficient: float,
     entropy_coefficient: float,
+    actor_ratio_mode: str = ActorRatioMode.JOINT.value,
+    new_branch_log_probs: Tensor | None = None,
+    old_branch_log_probs: Tensor | None = None,
+    active_branch_indicators: Tensor | None = None,
 ) -> CAGATMAPPOLossOutput:
     """Compute the frozen PPO objective from proposal-policy statistics.
 
@@ -206,6 +282,13 @@ def compute_ppo_objective_and_loss(
     Rollout quantities are detached fixed targets; gradients remain connected
     only to current log-probabilities, current values, and current entropy.
     """
+
+    try:
+        ratio_mode = ActorRatioMode(actor_ratio_mode)
+    except (TypeError, ValueError) as exc:
+        raise PPOObjectiveError(
+            "actor_ratio_mode must be 'joint' or 'branch_specific'"
+        ) from exc
 
     epsilon = _finite_coefficient(
         epsilon_clip,
@@ -270,21 +353,128 @@ def compute_ppo_objective_and_loss(
     fixed_old_log_prob = old_log_prob.detach()
     fixed_advantage = raw_advantage.detach()
     fixed_return_target = targets.detach()
-    log_ratio = new_log_prob - fixed_old_log_prob
-    if not torch.isfinite(log_ratio).all():
-        raise PPOObjectiveError("new-old log-prob difference contains NaN or Inf")
-    ratio = torch.exp(log_ratio)
-    if not torch.isfinite(ratio).all():
-        raise PPOObjectiveError("exp(log-ratio) produced NaN or Inf")
-    clipped_ratio = torch.clamp(ratio, 1.0 - epsilon, 1.0 + epsilon)
-
     expanded_advantage = fixed_advantage.reshape(time_steps, 1).expand(
         time_steps,
         agent_count,
     )
-    unclipped_surrogate = ratio * expanded_advantage
-    clipped_surrogate = clipped_ratio * expanded_advantage
-    surrogate = torch.minimum(unclipped_surrogate, clipped_surrogate)
+    branch_log_ratio = None
+    branch_ratio = None
+    branch_clipped_ratio = None
+    branch_unclipped_surrogate = None
+    branch_clipped_surrogate = None
+    branch_surrogate = None
+    fixed_active_branches = None
+    active_branch_count = None
+    if ratio_mode is ActorRatioMode.JOINT:
+        # Keep this path operation-for-operation equivalent to the pre-Fix-4
+        # implementation.  Optional branch inputs are deliberately ignored.
+        log_ratio = new_log_prob - fixed_old_log_prob
+        if not torch.isfinite(log_ratio).all():
+            raise PPOObjectiveError("new-old log-prob difference contains NaN or Inf")
+        ratio = torch.exp(log_ratio)
+        if not torch.isfinite(ratio).all():
+            raise PPOObjectiveError("exp(log-ratio) produced NaN or Inf")
+        clipped_ratio = torch.clamp(ratio, 1.0 - epsilon, 1.0 + epsilon)
+        unclipped_surrogate = ratio * expanded_advantage
+        clipped_surrogate = clipped_ratio * expanded_advantage
+        surrogate = torch.minimum(unclipped_surrogate, clipped_surrogate)
+        actor_diagnostic_mask = actor_valid_mask
+    else:
+        for name, tensor in (
+            ("new_branch_log_probs", new_branch_log_probs),
+            ("old_branch_log_probs", old_branch_log_probs),
+        ):
+            if (
+                not isinstance(tensor, Tensor)
+                or not tensor.is_floating_point()
+                or tuple(tensor.shape) != (time_steps, agent_count, 7)
+            ):
+                raise PPOObjectiveError(f"{name} must have shape [T,A,7]")
+            if tensor.device != new_log_prob.device or tensor.dtype != new_log_prob.dtype:
+                raise PPOObjectiveError(
+                    f"{name} must share the PPO statistics device and dtype"
+                )
+            if not torch.isfinite(tensor).all():
+                raise PPOObjectiveError(f"{name} contains NaN or Inf")
+        if (
+            not isinstance(active_branch_indicators, Tensor)
+            or active_branch_indicators.dtype != torch.bool
+            or tuple(active_branch_indicators.shape)
+            != (time_steps, agent_count, 7)
+        ):
+            raise PPOObjectiveError(
+                "active_branch_indicators must be boolean [T,A,7]"
+            )
+        if active_branch_indicators.device != new_log_prob.device:
+            raise PPOObjectiveError(
+                "active_branch_indicators must share the PPO statistics device"
+            )
+        assert new_branch_log_probs is not None
+        assert old_branch_log_probs is not None
+        fixed_active_branches = active_branch_indicators.detach()
+        raw_branch_log_ratio = (
+            new_branch_log_probs - old_branch_log_probs.detach()
+        )
+        selected_log_ratio = raw_branch_log_ratio.masked_select(
+            fixed_active_branches
+        )
+        if selected_log_ratio.numel() == 0:
+            raise PPOObjectiveError("branch-specific objective has no active branches")
+        if not torch.isfinite(selected_log_ratio).all():
+            raise PPOObjectiveError("active branch log-ratio contains NaN or Inf")
+        selected_ratio = torch.exp(selected_log_ratio)
+        if not torch.isfinite(selected_ratio).all():
+            raise PPOObjectiveError("active branch exp(log-ratio) produced NaN or Inf")
+        branch_log_ratio = torch.zeros_like(raw_branch_log_ratio).masked_scatter(
+            fixed_active_branches,
+            selected_log_ratio,
+        )
+        branch_ratio = torch.ones_like(raw_branch_log_ratio).masked_scatter(
+            fixed_active_branches,
+            selected_ratio,
+        )
+        branch_clipped_ratio = torch.clamp(
+            branch_ratio,
+            1.0 - epsilon,
+            1.0 + epsilon,
+        )
+        branch_advantage = expanded_advantage.unsqueeze(-1).expand_as(
+            branch_ratio
+        )
+        branch_unclipped_surrogate = torch.where(
+            fixed_active_branches,
+            branch_ratio * branch_advantage,
+            torch.zeros_like(branch_ratio),
+        )
+        branch_clipped_surrogate = torch.where(
+            fixed_active_branches,
+            branch_clipped_ratio * branch_advantage,
+            torch.zeros_like(branch_ratio),
+        )
+        branch_surrogate = torch.minimum(
+            branch_unclipped_surrogate,
+            branch_clipped_surrogate,
+        )
+        active_branch_count = fixed_active_branches.sum(dim=-1)
+        denominator = active_branch_count.clamp_min(1).to(dtype=new_log_prob.dtype)
+        log_ratio = branch_log_ratio.sum(dim=-1) / denominator
+        ratio = (
+            branch_ratio.masked_fill(~fixed_active_branches, 0.0).sum(dim=-1)
+            / denominator
+        )
+        clipped_ratio = (
+            branch_clipped_ratio.masked_fill(
+                ~fixed_active_branches, 0.0
+            ).sum(dim=-1)
+            / denominator
+        )
+        unclipped_surrogate = branch_unclipped_surrogate.sum(dim=-1) / denominator
+        clipped_surrogate = branch_clipped_surrogate.sum(dim=-1) / denominator
+        surrogate = branch_surrogate.sum(dim=-1) / denominator
+        actor_diagnostic_mask = (
+            actor_valid_mask.unsqueeze(-1).expand_as(fixed_active_branches)
+            & fixed_active_branches
+        )
     if not torch.isfinite(unclipped_surrogate).all() or not torch.isfinite(
         clipped_surrogate
     ).all():
@@ -311,11 +501,25 @@ def compute_ppo_objective_and_loss(
     if not torch.isfinite(total_loss):
         raise PPOObjectiveError("total_loss produced NaN or Inf")
 
-    valid_ratios = ratio.masked_select(actor_valid_mask).detach()
-    valid_log_ratios = log_ratio.masked_select(actor_valid_mask).detach()
+    if ratio_mode is ActorRatioMode.JOINT:
+        valid_ratios = ratio.masked_select(actor_diagnostic_mask).detach()
+        valid_log_ratios = log_ratio.masked_select(actor_diagnostic_mask).detach()
+        clipped_positions = (ratio != clipped_ratio) & actor_diagnostic_mask
+        diagnostic_denominator = actor_diagnostic_mask.sum()
+    else:
+        assert branch_ratio is not None
+        assert branch_log_ratio is not None
+        assert branch_clipped_ratio is not None
+        valid_ratios = branch_ratio.masked_select(actor_diagnostic_mask).detach()
+        valid_log_ratios = branch_log_ratio.masked_select(
+            actor_diagnostic_mask
+        ).detach()
+        clipped_positions = (
+            (branch_ratio != branch_clipped_ratio) & actor_diagnostic_mask
+        )
+        diagnostic_denominator = actor_diagnostic_mask.sum()
     valid_surrogate = surrogate.masked_select(actor_valid_mask).detach()
     valid_value_error = value_squared_error.masked_select(critic_valid_mask).detach()
-    clipped_positions = (ratio != clipped_ratio) & actor_valid_mask
     diagnostics = PPOObjectiveDiagnostics(
         valid_timestep_count=int(critic_valid_mask.sum().item()),
         valid_actor_position_count=int(actor_valid_mask.sum().item()),
@@ -324,7 +528,7 @@ def compute_ppo_objective_and_loss(
         ratio_max=float(valid_ratios.max().cpu().item()),
         clipped_fraction=float(
             clipped_positions.sum().to(dtype=torch.float32).div(
-                actor_valid_mask.sum()
+                diagnostic_denominator
             ).cpu().item()
         ),
         approx_kl=float(
@@ -354,6 +558,15 @@ def compute_ppo_objective_and_loss(
         value_coefficient=value_weight,
         entropy_coefficient=entropy_weight,
         diagnostics=diagnostics,
+        actor_ratio_mode=ratio_mode.value,
+        branch_log_ratio=branch_log_ratio,
+        branch_ratio=branch_ratio,
+        branch_clipped_ratio=branch_clipped_ratio,
+        branch_unclipped_surrogate=branch_unclipped_surrogate,
+        branch_clipped_surrogate=branch_clipped_surrogate,
+        branch_surrogate=branch_surrogate,
+        active_branch_indicators=fixed_active_branches,
+        active_branch_count=active_branch_count,
     )
 
 
@@ -367,6 +580,9 @@ def compute_configured_ppo_objective_and_loss(
     entropy: Tensor,
     sequence_valid_mask: Tensor,
     config: RunConfig,
+    new_branch_log_probs: Tensor | None = None,
+    old_branch_log_probs: Tensor | None = None,
+    active_branch_indicators: Tensor | None = None,
 ) -> CAGATMAPPOLossOutput:
     """Use the Section 4 values already centralized in ``RunConfig``."""
 
@@ -385,6 +601,10 @@ def compute_configured_ppo_objective_and_loss(
         epsilon_clip=mappo.ppo_clip_epsilon,
         value_coefficient=mappo.value_coefficient,
         entropy_coefficient=mappo.entropy_coefficient,
+        actor_ratio_mode=mappo.actor_ratio_mode,
+        new_branch_log_probs=new_branch_log_probs,
+        old_branch_log_probs=old_branch_log_probs,
+        active_branch_indicators=active_branch_indicators,
     )
 
 

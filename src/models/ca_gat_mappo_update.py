@@ -16,7 +16,7 @@ import torch
 from torch import Tensor, nn
 from torch.optim import Adam
 
-from ..config import RunConfig
+from ..config import ActorRatioMode, RunConfig
 from ..env.actions import ActionProposal
 from .ca_gat_mappo import (
     ACTION_BRANCH_ORDER,
@@ -285,6 +285,14 @@ class BatchedCAGATMAPPOLossOutput:
     def _critic_view(self, tensor: Tensor) -> Tensor:
         return tensor.reshape(self.batch_size, self.sequence_length)
 
+    def _branch_view(self, tensor: Tensor) -> Tensor:
+        return tensor.reshape(
+            self.batch_size,
+            self.sequence_length,
+            self.agent_count,
+            len(ACTION_BRANCH_ORDER),
+        )
+
     @property
     def log_ratio(self) -> Tensor:
         return self._actor_view(self.flattened.log_ratio)
@@ -304,6 +312,26 @@ class BatchedCAGATMAPPOLossOutput:
     @property
     def surrogate(self) -> Tensor:
         return self._actor_view(self.flattened.surrogate)
+
+    @property
+    def branch_ratio(self) -> Tensor | None:
+        value = self.flattened.branch_ratio
+        return None if value is None else self._branch_view(value)
+
+    @property
+    def branch_surrogate(self) -> Tensor | None:
+        value = self.flattened.branch_surrogate
+        return None if value is None else self._branch_view(value)
+
+    @property
+    def active_branch_indicators(self) -> Tensor | None:
+        value = self.flattened.active_branch_indicators
+        return None if value is None else self._branch_view(value)
+
+    @property
+    def active_branch_count(self) -> Tensor | None:
+        value = self.flattened.active_branch_count
+        return None if value is None else self._actor_view(value)
 
     @property
     def actor_valid_mask(self) -> Tensor:
@@ -348,6 +376,9 @@ def compute_configured_batched_ppo_objective_and_loss(
     entropy: Tensor,
     sequence_valid_mask: Tensor,
     config: RunConfig,
+    new_branch_log_probs: Tensor | None = None,
+    old_branch_log_probs: Tensor | None = None,
+    active_branch_indicators: Tensor | None = None,
 ) -> BatchedCAGATMAPPOLossOutput:
     """Apply the passed PPO objective uniformly over all B-by-L positions."""
 
@@ -378,6 +409,45 @@ def compute_configured_batched_ppo_objective_and_loss(
     ):
         raise RecurrentPPOUpdateError("all 8x32 positions must be real and valid")
 
+    ratio_mode = ActorRatioMode(config.training.mappo.actor_ratio_mode)
+    flattened_new_branches = None
+    flattened_old_branches = None
+    flattened_active_branches = None
+    if ratio_mode is ActorRatioMode.BRANCH_SPECIFIC:
+        expected_branch_shape = (
+            8,
+            32,
+            agent_count,
+            len(ACTION_BRANCH_ORDER),
+        )
+        for name, tensor in (
+            ("new_branch_log_probs", new_branch_log_probs),
+            ("old_branch_log_probs", old_branch_log_probs),
+        ):
+            if not isinstance(tensor, Tensor) or tuple(tensor.shape) != expected_branch_shape:
+                raise RecurrentPPOUpdateError(
+                    f"{name} must have shape [8,32,A,7]"
+                )
+        if (
+            not isinstance(active_branch_indicators, Tensor)
+            or tuple(active_branch_indicators.shape) != expected_branch_shape
+            or active_branch_indicators.dtype != torch.bool
+        ):
+            raise RecurrentPPOUpdateError(
+                "active_branch_indicators must be boolean [8,32,A,7]"
+            )
+        assert new_branch_log_probs is not None
+        assert old_branch_log_probs is not None
+        flattened_new_branches = new_branch_log_probs.reshape(
+            256, agent_count, len(ACTION_BRANCH_ORDER)
+        )
+        flattened_old_branches = old_branch_log_probs.reshape(
+            256, agent_count, len(ACTION_BRANCH_ORDER)
+        )
+        flattened_active_branches = active_branch_indicators.reshape(
+            256, agent_count, len(ACTION_BRANCH_ORDER)
+        )
+
     flattened = compute_configured_ppo_objective_and_loss(
         new_joint_log_prob=new_joint_log_prob.reshape(256, agent_count),
         old_joint_log_prob=old_joint_log_prob.reshape(256, agent_count),
@@ -387,6 +457,9 @@ def compute_configured_batched_ppo_objective_and_loss(
         entropy=entropy.reshape(256, agent_count),
         sequence_valid_mask=sequence_valid_mask.reshape(256),
         config=config,
+        new_branch_log_probs=flattened_new_branches,
+        old_branch_log_probs=flattened_old_branches,
+        active_branch_indicators=flattened_active_branches,
     )
     return BatchedCAGATMAPPOLossOutput(
         flattened=flattened,
@@ -772,6 +845,15 @@ class CAGATMAPPORecurrentPPOUpdater:
                 set_to_none=mappo.zero_grad_set_to_none
             )
             evaluation = self._evaluate_prepared(prepared)
+            new_branch_log_probs = None
+            if ActorRatioMode(mappo.actor_ratio_mode) is ActorRatioMode.BRANCH_SPECIFIC:
+                new_branch_log_probs = torch.stack(
+                    [
+                        evaluation.policy.branch_log_probs[branch]
+                        for branch in ACTION_BRANCH_ORDER
+                    ],
+                    dim=-1,
+                )
             loss = compute_configured_batched_ppo_objective_and_loss(
                 new_joint_log_prob=evaluation.policy.joint_log_prob,
                 old_joint_log_prob=prepared.old_joint_log_prob,
@@ -781,6 +863,9 @@ class CAGATMAPPORecurrentPPOUpdater:
                 entropy=evaluation.policy.entropy,
                 sequence_valid_mask=prepared.sequence_valid_mask,
                 config=self.config,
+                new_branch_log_probs=new_branch_log_probs,
+                old_branch_log_probs=prepared.old_branch_log_probs,
+                active_branch_indicators=prepared.active_branch_indicators,
             )
             loss.total_loss.backward()
             route_telemetry = None
@@ -797,6 +882,7 @@ class CAGATMAPPORecurrentPPOUpdater:
                     td_residual=prepared.td_residual,
                     shared_trunk=self.actor,
                     epsilon_clip=self.config.training.mappo.ppo_clip_epsilon,
+                    actor_ratio_mode=mappo.actor_ratio_mode,
                 )
             actor_grad_norm = self._finite_grad_norm(
                 self.optimizers.actor_parameters,

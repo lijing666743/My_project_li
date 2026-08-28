@@ -16,7 +16,9 @@ from typing import Any, Iterable, Mapping, Sequence
 import torch
 from torch import Tensor, nn
 
+from ..config import ActorRatioMode
 from ..env.actions import ActionProposal
+from .ca_gat_mappo import ACTION_BRANCH_ORDER
 from .ca_gat_mappo_actions import (
     SequentialActionDistributionOutput,
     SequentialActionMaskBatch,
@@ -69,6 +71,21 @@ ROUTE_PPO_RECORD_FIELDS = (
     "defer_route_ppo_clip_indicator_fraction",
     "defer_route_ppo_clip_fraction",
 )
+BRANCH_PPO_STATISTIC_NAMES = (
+    "active_count",
+    "ratio_mean",
+    "ratio_median",
+    "ratio_std",
+    "approx_kl_mean",
+    "clip_fraction",
+    "surrogate_contribution_mean",
+    "advantage_mean",
+)
+BRANCH_PPO_RECORD_FIELDS = tuple(
+    f"{branch}_branch_ppo_{statistic}"
+    for branch in ACTION_BRANCH_ORDER
+    for statistic in BRANCH_PPO_STATISTIC_NAMES
+)
 
 
 class RouteTelemetryError(ValueError):
@@ -109,6 +126,71 @@ class RouteHeadGradientTelemetry:
     bias: GradientMeasurement
     total: GradientMeasurement
     rows: tuple[Any, ...] = ()
+
+
+@dataclass(frozen=True)
+class BranchPPODynamicsGroup:
+    """Detached statistics for one active action branch."""
+
+    active_count: int = 0
+    ratio_mean: float | None = None
+    ratio_median: float | None = None
+    ratio_std: float | None = None
+    approx_kl_mean: float | None = None
+    clip_fraction: float | None = None
+    surrogate_contribution_mean: float | None = None
+    advantage_mean: float | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.active_count, bool)
+            or not isinstance(self.active_count, int)
+            or self.active_count < 0
+        ):
+            raise RouteTelemetryError("branch PPO active_count is invalid")
+        values = tuple(
+            getattr(self, name)
+            for name in BRANCH_PPO_STATISTIC_NAMES
+            if name != "active_count"
+        )
+        if self.active_count == 0:
+            if any(value is not None for value in values):
+                raise RouteTelemetryError(
+                    "branch PPO statistics must be NA without active samples"
+                )
+            return
+        if any(value is None or not math.isfinite(value) for value in values):
+            raise RouteTelemetryError(
+                "branch PPO statistics must be finite with active samples"
+            )
+        if self.clip_fraction is None or not 0.0 <= self.clip_fraction <= 1.0:
+            raise RouteTelemetryError("branch PPO clip_fraction is outside [0, 1]")
+
+    def record(self, branch: str) -> dict[str, object]:
+        return {
+            f"{branch}_branch_ppo_{name}": getattr(self, name)
+            for name in BRANCH_PPO_STATISTIC_NAMES
+        }
+
+
+@dataclass(frozen=True)
+class BranchPPODynamics:
+    """All seven branch statistics from one existing PPO evaluation."""
+
+    epsilon_clip: float
+    groups: Mapping[str, BranchPPODynamicsGroup] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.epsilon_clip) or not 0.0 < self.epsilon_clip < 1.0:
+            raise RouteTelemetryError("branch PPO epsilon_clip is invalid")
+        if tuple(self.groups) != ACTION_BRANCH_ORDER:
+            raise RouteTelemetryError("branch PPO groups must use frozen branch order")
+
+    def record(self) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for branch in ACTION_BRANCH_ORDER:
+            result.update(self.groups[branch].record(branch))
+        return result
 
 
 @dataclass(frozen=True)
@@ -177,6 +259,9 @@ class RouteTelemetry:
     route_head_gradient_rows: tuple[Any, ...] = ()
     samples: tuple[RouteSampleTelemetry, ...] = ()
     route_ppo_dynamics: RoutePPODynamics | None = None
+    actor_ratio_mode: str = ActorRatioMode.JOINT.value
+    branch_ppo_dynamics: BranchPPODynamics | None = None
+    active_branch_matrix: tuple[tuple[tuple[bool, ...], ...], ...] = ()
     _advantage_distributions: Mapping[str, RouteDistributionSummary] = field(default_factory=dict, repr=False)
     _return_distributions: Mapping[str, RouteDistributionSummary] = field(default_factory=dict, repr=False)
     _td_residual_distributions: Mapping[str, RouteDistributionSummary] = field(default_factory=dict, repr=False)
@@ -184,6 +269,28 @@ class RouteTelemetry:
     def __post_init__(self) -> None:
         if self.schema_version != ROUTE_TELEMETRY_SCHEMA_VERSION:
             raise RouteTelemetryError("route telemetry schema version is invalid")
+        try:
+            ActorRatioMode(self.actor_ratio_mode)
+        except (TypeError, ValueError) as exc:
+            raise RouteTelemetryError("actor_ratio_mode is invalid") from exc
+        if self.branch_ppo_dynamics is not None and not isinstance(
+            self.branch_ppo_dynamics, BranchPPODynamics
+        ):
+            raise TypeError("branch_ppo_dynamics must be BranchPPODynamics or None")
+        if self.active_branch_matrix:
+            agent_count = len(self.active_branch_matrix[0])
+            if agent_count == 0 or any(
+                len(time_step) != agent_count
+                or any(
+                    len(agent_row) != len(ACTION_BRANCH_ORDER)
+                    or any(type(value) is not bool for value in agent_row)
+                    for agent_row in time_step
+                )
+                for time_step in self.active_branch_matrix
+            ):
+                raise RouteTelemetryError(
+                    "active_branch_matrix must have consistent [T,A,7] boolean rows"
+                )
         count_names = (
             item.name
             for item in fields(self)
@@ -265,7 +372,13 @@ class RouteTelemetry:
             item.name
             for item in fields(cls)
             if not item.name.startswith("_")
-            and item.name not in {"samples", "route_ppo_dynamics"}
+            and item.name not in {
+                "samples",
+                "route_ppo_dynamics",
+                "actor_ratio_mode",
+                "branch_ppo_dynamics",
+                "active_branch_matrix",
+            }
         )
         distribution_names = []
         for group in ROUTE_DISTRIBUTION_GROUPS:
@@ -308,7 +421,12 @@ class RouteTelemetry:
                     "negative_fraction",
                 )
             )
-        return names + tuple(ROUTE_PPO_RECORD_FIELDS) + tuple(distribution_names)
+        return (
+            names
+            + tuple(ROUTE_PPO_RECORD_FIELDS)
+            + tuple(BRANCH_PPO_RECORD_FIELDS)
+            + tuple(distribution_names)
+        )
 
     def record(self) -> dict[str, object]:
         """Return a deterministic field-ordered flat record for CSV/JSONL."""
@@ -320,6 +438,7 @@ class RouteTelemetry:
         }
         result["schema_version"] = self.schema_version
         result["route_telemetry_schema_version"] = ROUTE_TELEMETRY_SCHEMA_VERSION
+        result["actor_ratio_mode"] = self.actor_ratio_mode
         rows = []
         for row in self.route_head_gradient_rows or ():
             rows.append(row.record() if hasattr(row, "record") else row)
@@ -328,6 +447,10 @@ class RouteTelemetry:
             result.update(self.route_ppo_dynamics.record())
         else:
             result.update({name: None for name in ROUTE_PPO_RECORD_FIELDS})
+        if self.branch_ppo_dynamics is not None:
+            result.update(self.branch_ppo_dynamics.record())
+        else:
+            result.update({name: None for name in BRANCH_PPO_RECORD_FIELDS})
         for prefix, summaries, include_quantiles in (
             ("advantage", self._advantage_distributions, True),
             ("return_target", self._return_distributions, True),
@@ -504,6 +627,7 @@ def collect_route_telemetry(
     td_residual: Tensor | None = None,
     shared_trunk: Any = None,
     epsilon_clip: float = 0.2,
+    actor_ratio_mode: str = ActorRatioMode.JOINT.value,
 ) -> RouteTelemetry:
     """Aggregate route telemetry without changing the PPO algorithm state."""
 
@@ -511,6 +635,10 @@ def collect_route_telemetry(
         raise TypeError("policy must be SequentialActionDistributionOutput")
     if not isinstance(action_mask_batch, SequentialActionMaskBatch):
         raise TypeError("action_mask_batch must be SequentialActionMaskBatch")
+    try:
+        ratio_mode = ActorRatioMode(actor_ratio_mode)
+    except (TypeError, ValueError) as exc:
+        raise RouteTelemetryError("actor_ratio_mode is invalid") from exc
     route_active = policy.active_branches["route"]
     if route_active.dtype != torch.bool or route_active.ndim != 3:
         raise RouteTelemetryError("route activity must be boolean [B,T,A]")
@@ -642,6 +770,46 @@ def collect_route_telemetry(
 
         expanded_advantage = advantage.detach().to(device=device).unsqueeze(-1).expand_as(route_active)
         expanded_return = return_target.detach().to(device=device).unsqueeze(-1).expand_as(route_active)
+        raw_branch_active = torch.stack(
+            [
+                policy.active_branches[branch].detach().to(device=device)
+                for branch in ACTION_BRANCH_ORDER
+            ],
+            dim=-1,
+        )
+        if tuple(raw_branch_active.shape) != (
+            batch,
+            time,
+            agents,
+            len(ACTION_BRANCH_ORDER),
+        ):
+            raise RouteTelemetryError("active branch tensor must have shape [B,T,A,7]")
+        valid_branch_active = raw_branch_active & valid_actor.unsqueeze(-1)
+        new_branch_log_probs = torch.stack(
+            [
+                policy.branch_log_probs[branch].detach().to(device=device)
+                for branch in ACTION_BRANCH_ORDER
+            ],
+            dim=-1,
+        )
+        branch_ppo = compute_branch_ppo_dynamics(
+            old_branch_log_probs,
+            new_branch_log_probs,
+            valid_branch_active,
+            expanded_advantage.unsqueeze(-1).expand_as(new_branch_log_probs),
+            epsilon_clip,
+        )
+        active_branch_matrix = tuple(
+            tuple(
+                tuple(bool(value) for value in agent_row)
+                for agent_row in time_step
+            )
+            for time_step in raw_branch_active.reshape(
+                batch * time,
+                agents,
+                len(ACTION_BRANCH_ORDER),
+            ).detach().cpu().tolist()
+        )
         td_values = (
             td_residual.detach().to(device=device).unsqueeze(-1).expand_as(route_active)
             if td_residual is not None
@@ -876,6 +1044,9 @@ def collect_route_telemetry(
             remote_probability_destination_valid_samples=destination_count,
             route_head_gradient_rows=gradients.rows,
             route_ppo_dynamics=route_ppo,
+            actor_ratio_mode=ratio_mode.value,
+            branch_ppo_dynamics=branch_ppo,
+            active_branch_matrix=active_branch_matrix,
             _advantage_distributions=advantage_distributions,
             _return_distributions=return_distributions,
             _td_residual_distributions=td_distributions,
@@ -1070,6 +1241,97 @@ class RouteSampleTelemetry:
             "route_sample_return_target": self.return_target,
             "route_sample_td_residual": self.td_residual,
         }
+
+
+def _branch_ppo_group(
+    old: Tensor,
+    new: Tensor,
+    active: Tensor,
+    advantage: Tensor,
+    epsilon_clip: float,
+) -> BranchPPODynamicsGroup:
+    selected_old = old.masked_select(active)
+    selected_new = new.masked_select(active)
+    selected_advantage = advantage.masked_select(active)
+    if selected_old.numel() == 0:
+        return BranchPPODynamicsGroup()
+    log_ratio = selected_new - selected_old
+    ratio = torch.exp(log_ratio)
+    if not torch.isfinite(ratio).all():
+        raise RouteTelemetryError("branch PPO ratio contains NaN or Inf")
+    clipped_ratio = torch.clamp(
+        ratio,
+        1.0 - epsilon_clip,
+        1.0 + epsilon_clip,
+    )
+    surrogate = torch.minimum(
+        ratio * selected_advantage,
+        clipped_ratio * selected_advantage,
+    )
+    clipped = ratio != clipped_ratio
+    ratio_values = ratio.detach().cpu().tolist()
+    return BranchPPODynamicsGroup(
+        active_count=int(ratio.numel()),
+        ratio_mean=float(ratio.mean().cpu().item()),
+        ratio_median=float(median(ratio_values)),
+        ratio_std=float(ratio.std(unbiased=False).cpu().item()),
+        approx_kl_mean=float(
+            ((ratio - 1.0) - log_ratio).mean().cpu().item()
+        ),
+        clip_fraction=float(clipped.float().mean().cpu().item()),
+        surrogate_contribution_mean=float(surrogate.mean().cpu().item()),
+        advantage_mean=float(selected_advantage.mean().cpu().item()),
+    )
+
+
+def compute_branch_ppo_dynamics(
+    old_branch_log_probs: Tensor | None,
+    new_branch_log_probs: Tensor | None,
+    active_branch_indicators: Tensor,
+    expanded_advantage: Tensor,
+    epsilon_clip: float,
+) -> BranchPPODynamics | None:
+    """Summarize each branch from detached tensors already used by PPO."""
+
+    if old_branch_log_probs is None or new_branch_log_probs is None:
+        return None
+    if (
+        not isinstance(active_branch_indicators, Tensor)
+        or active_branch_indicators.dtype != torch.bool
+        or active_branch_indicators.ndim != 4
+        or active_branch_indicators.shape[-1] != len(ACTION_BRANCH_ORDER)
+    ):
+        raise RouteTelemetryError(
+            "active_branch_indicators must be boolean [B,T,A,7]"
+        )
+    expected_shape = active_branch_indicators.shape
+    for name, tensor in (
+        ("old_branch_log_probs", old_branch_log_probs),
+        ("new_branch_log_probs", new_branch_log_probs),
+        ("expanded_advantage", expanded_advantage),
+    ):
+        if not isinstance(tensor, Tensor) or tensor.shape != expected_shape:
+            raise RouteTelemetryError(f"{name} must have shape [B,T,A,7]")
+    new = new_branch_log_probs.detach().float()
+    old = old_branch_log_probs.detach().to(device=new.device, dtype=new.dtype)
+    advantage = expanded_advantage.detach().to(
+        device=new.device,
+        dtype=new.dtype,
+    )
+    active = active_branch_indicators.detach().to(device=new.device)
+    finite = torch.isfinite(old) & torch.isfinite(new) & torch.isfinite(advantage)
+    active = active & finite
+    groups = {
+        branch: _branch_ppo_group(
+            old[..., index],
+            new[..., index],
+            active[..., index],
+            advantage[..., index],
+            epsilon_clip,
+        )
+        for index, branch in enumerate(ACTION_BRANCH_ORDER)
+    }
+    return BranchPPODynamics(epsilon_clip=epsilon_clip, groups=groups)
 
 
 def _ppo_group(old: Tensor, new: Tensor, mask: Tensor, epsilon_clip: float) -> RoutePPODynamicsGroup:
@@ -1486,6 +1748,9 @@ def aggregate_route_outcomes(
     return result
 
 __all__ = [
+    "BRANCH_PPO_RECORD_FIELDS",
+    "BranchPPODynamics",
+    "BranchPPODynamicsGroup",
     "GradientMeasurement",
     "ROUTE_GRADIENT_STATUSES",
     "ROUTE_TELEMETRY_SCHEMA_VERSION",
@@ -1506,6 +1771,7 @@ __all__ = [
     "RouteSampleTelemetry",
     "aggregate_route_outcomes",
     "compute_route_only_ppo_dynamics",
+    "compute_branch_ppo_dynamics",
     "measure_route_head_gradient_rows",
     "measure_shared_trunk_gradients",
     "summarize_distribution",

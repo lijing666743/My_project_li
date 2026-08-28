@@ -209,6 +209,13 @@ class WorkloadTimingMode(str, Enum):
     ROUTE_SLOT_PRE_ROUTE = "route_slot_pre_route"
 
 
+class ActorRatioMode(str, Enum):
+    """Select the PPO importance-ratio credit boundary."""
+
+    JOINT = "joint"
+    BRANCH_SPECIFIC = "branch_specific"
+
+
 def _installed_distribution_version(name: str) -> str:
     try:
         return importlib.metadata.version(name)
@@ -479,6 +486,7 @@ class MAPPOConfig:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     ppo_clip_epsilon: float = 0.20
+    actor_ratio_mode: ActorRatioMode = ActorRatioMode.JOINT
     entropy_coefficient: float = 0.01
     value_coefficient: float = 0.50
     rollout_length_slots: int = 256
@@ -630,6 +638,16 @@ class RunConfig:
             # historical reward behavior.  The non-default mode remains part
             # of the canonical identity.
             environment.pop("workload_timing_mode")
+        training = resolved.get("training")
+        mappo = training.get("mappo") if isinstance(training, dict) else None
+        if (
+            isinstance(mappo, dict)
+            and mappo.get("actor_ratio_mode") == ActorRatioMode.JOINT.value
+        ):
+            # ``joint`` is the historical PPO behavior.  Omitting its new
+            # selector preserves pre-Fix-4 config hashes and Checkpoint V1
+            # identity, while ``branch_specific`` remains canonical.
+            mappo.pop("actor_ratio_mode")
         return resolved
 
     def to_dict(self) -> dict[str, Any]:
@@ -847,6 +865,14 @@ class RunConfig:
         if tuple(self.action.cpu_frequency_levels) != (0.0, 0.25, 0.5, 1.0):
             raise ConfigError("action.cpu_frequency_levels must be (0.0, 0.25, 0.5, 1.0)")
         mappo = self.training.mappo
+        try:
+            ActorRatioMode(mappo.actor_ratio_mode)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(
+                "training.mappo.actor_ratio_mode must be one of "
+                f"{tuple(mode.value for mode in ActorRatioMode)}, "
+                f"got {mappo.actor_ratio_mode!r}"
+            ) from exc
         if mappo.optimizer != "Adam":
             raise ConfigError("training.mappo.optimizer must be 'Adam'")
         if mappo.optimizer_topology != "separate_actor_critic":
@@ -1114,6 +1140,7 @@ def validate_mappo_checkpoint_resume_compatibility(
     config_hash: str,
     training_device: str,
     cuda_available: bool,
+    checkpoint_actor_ratio_mode: str | None = None,
 ) -> None:
     """Apply the fail-fast V1 metadata checks without loading checkpoint bytes."""
 
@@ -1134,6 +1161,20 @@ def validate_mappo_checkpoint_resume_compatibility(
         raise ConfigError("checkpoint method_id mismatch")
     if git_commit != config.git_commit:
         raise ConfigError("checkpoint git_commit mismatch")
+    try:
+        source_ratio_mode = ActorRatioMode(
+            ActorRatioMode.JOINT.value
+            if checkpoint_actor_ratio_mode is None
+            else checkpoint_actor_ratio_mode
+        )
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("checkpoint actor_ratio_mode is invalid") from exc
+    target_ratio_mode = ActorRatioMode(config.training.mappo.actor_ratio_mode)
+    if source_ratio_mode != target_ratio_mode:
+        raise ConfigError(
+            "checkpoint actor_ratio_mode mismatch; changing between joint and "
+            "branch_specific requires a new run"
+        )
     if config_hash != config.config_hash:
         raise ConfigError("checkpoint canonical config_hash mismatch")
     if training_device != config.training.mappo.training_device:
@@ -1610,6 +1651,7 @@ def _jsonable(value: Any, *, exclude: set[str] | None = None) -> Any:
 
 __all__ = [
     "ActionConfig",
+    "ActorRatioMode",
     "CHECKPOINT_KIND_FINAL_COMPLETED",
     "CHECKPOINT_KIND_PERIODIC_RESUME",
     "CHECKPOINT_SCHEMA_VERSION",

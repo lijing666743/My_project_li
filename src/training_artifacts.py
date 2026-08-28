@@ -68,6 +68,10 @@ _ROUTE_SAMPLE_COLUMNS = (
 _ROUTE_OUTCOME_COLUMNS = tuple(
     f"route_outcome_{item.name}" for item in fields(RouteOutcomeAssociation)
 )
+_BRANCH_ACTIVITY_COLUMNS = (
+    "branch_activity_rollout_timestep",
+    "branch_activity_matrix",
+)
 _ROUTE_ROLLING_FIELDS = (
     ("route_entropy_rolling_mean", "route_entropy_mean"),
     ("remote_selection_rate_rolling_mean", "remote_selection_rate_given_legal_remote"),
@@ -88,6 +92,7 @@ TRAINING_METRIC_COLUMNS = (
     "git_commit",
     "config_hash",
     "diagnostics_schema_version",
+    "actor_ratio_mode",
     "record_type",
     "telemetry_scope",
     "series_index",
@@ -129,6 +134,7 @@ TRAINING_METRIC_COLUMNS = (
     *_ROUTE_ROLLING_COLUMNS,
     *_ROUTE_SAMPLE_COLUMNS,
     *_ROUTE_OUTCOME_COLUMNS,
+    *_BRANCH_ACTIVITY_COLUMNS,
     "signal_gate_status",
 )
 
@@ -147,6 +153,8 @@ class TrainingArtifactOutcome:
 
 
 def _base_record(config: RunConfig, signal_gate_status: str) -> dict[str, Any]:
+    ratio_mode = config.training.mappo.actor_ratio_mode
+    actor_ratio_mode = getattr(ratio_mode, "value", ratio_mode)
     return {
         "run_id": config.run_id,
         "method_id": config.method_id,
@@ -155,6 +163,7 @@ def _base_record(config: RunConfig, signal_gate_status: str) -> dict[str, Any]:
         "git_commit": config.git_commit,
         "config_hash": config.config_hash,
         "diagnostics_schema_version": TRAINING_DIAGNOSTICS_SCHEMA_VERSION,
+        "actor_ratio_mode": actor_ratio_mode,
         "record_type": None,
         "telemetry_scope": None,
         "series_index": None,
@@ -196,6 +205,7 @@ def _base_record(config: RunConfig, signal_gate_status: str) -> dict[str, Any]:
         **{column: None for column in _ROUTE_ROLLING_COLUMNS},
         **{column: None for column in _ROUTE_SAMPLE_COLUMNS},
         **{column: None for column in _ROUTE_OUTCOME_COLUMNS},
+        **{column: None for column in _BRANCH_ACTIVITY_COLUMNS},
         "signal_gate_status": signal_gate_status,
     }
 
@@ -396,6 +406,46 @@ def _route_outcome_records(
     return records
 
 
+def _branch_activity_records(
+    config: RunConfig,
+    training: Any,
+    signal_gate_status: str,
+) -> list[dict[str, Any]]:
+    """Persist one complete [A,7] activity matrix per rollout timestep."""
+
+    records: list[dict[str, Any]] = []
+    series_index = 0
+    mappo = config.training.mappo
+    for update in training.updates:
+        telemetry = update.output.epoch_diagnostics[0].route_telemetry
+        if telemetry is None:
+            continue
+        environment_steps = min(
+            (update.update_index + 1) * mappo.rollout_length_slots,
+            training.total_environment_transitions,
+        )
+        for timestep, matrix in enumerate(telemetry.active_branch_matrix):
+            series_index += 1
+            record = _base_record(config, signal_gate_status)
+            record.update(
+                {
+                    "record_type": "branch_activity",
+                    "telemetry_scope": "per_rollout_timestep",
+                    "series_index": series_index,
+                    "environment_steps": environment_steps,
+                    "update_index": update.update_index,
+                    "policy_version_before": update.rollout_policy_version,
+                    "policy_version_after": update.policy_version_after_update,
+                    "route_telemetry_enabled": True,
+                    "route_telemetry_schema_version": telemetry.schema_version,
+                    "branch_activity_rollout_timestep": timestep,
+                    "branch_activity_matrix": [list(row) for row in matrix],
+                }
+            )
+            records.append(record)
+    return records
+
+
 def _diagnostic_checks(config: RunConfig, training: Any) -> dict[str, bool]:
     epoch_rewards = [episode.reward.reward.total for episode in training.episodes]
     ppo_epochs = [
@@ -497,7 +547,18 @@ def _csv_text(records: list[dict[str, Any]]) -> str:
         lineterminator="\n",
     )
     writer.writeheader()
-    writer.writerows(records)
+    csv_records = []
+    for record in records:
+        normalized = dict(record)
+        matrix = normalized.get("branch_activity_matrix")
+        if matrix is not None:
+            normalized["branch_activity_matrix"] = json.dumps(
+                matrix,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        csv_records.append(normalized)
+    writer.writerows(csv_records)
     return stream.getvalue()
 
 
@@ -590,6 +651,38 @@ def _route_telemetry_summary(training: Any) -> dict[str, Any]:
             "telemetry_scope": "per_route_active_sample",
             "present_count": sum(len(getattr(item, "samples", ()) or ()) for item in present),
         },
+        "per_branch_ppo": {
+            "branches": list(config_branch for config_branch in (
+                "route",
+                "tx_select",
+                "resource_group",
+                "resource_width",
+                "power_level",
+                "cpu_queue",
+                "cpu_frequency",
+            )),
+            "statistics": [
+                "active_count",
+                "ratio_mean",
+                "ratio_median",
+                "ratio_std",
+                "approx_kl_mean",
+                "clip_fraction",
+                "surrogate_contribution_mean",
+                "advantage_mean",
+            ],
+            "present_ppo_epoch_count": sum(
+                item.branch_ppo_dynamics is not None for item in present
+            ),
+        },
+        "branch_activity": {
+            "record_type": "branch_activity",
+            "telemetry_scope": "per_rollout_timestep",
+            "matrix_shape": "[A,7]",
+            "present_count": sum(
+                len(item.active_branch_matrix) for item in unique_rollouts
+            ),
+        },
         "route_outcomes": aggregate_route_outcomes(getattr(training, "route_outcomes", ()) or ()),
         "na_semantics": (
             "CSV blank and JSON null mean no valid sample or legacy checkpoint telemetry; "
@@ -629,6 +722,11 @@ def _training_summary(
         "checks": dict(checks),
         "training": {
             "training_device": config.training.mappo.training_device,
+            "actor_ratio_mode": getattr(
+                config.training.mappo.actor_ratio_mode,
+                "value",
+                config.training.mappo.actor_ratio_mode,
+            ),
             "total_environment_transitions": training.total_environment_transitions,
             "optimized_transitions": training.optimized_transitions,
             "unused_final_tail_transitions": training.unused_final_tail_transitions,
@@ -920,6 +1018,7 @@ def write_cagat_mappo_training_artifacts(
     records.extend(_ppo_epoch_records(config, training, signal_gate_status))
     records.extend(_route_sample_records(config, training, signal_gate_status))
     records.extend(_route_outcome_records(config, training, signal_gate_status))
+    records.extend(_branch_activity_records(config, training, signal_gate_status))
     csv_text = _csv_text(records)
 
     paths = config.artifact_paths()
