@@ -645,10 +645,17 @@ def collect_route_telemetry(
     batch, time, agents = route_active.shape
     if action_mask_batch.shape != (batch, time, agents):
         raise RouteTelemetryError("action-mask contracts differ from route axes")
-    if tuple(advantage.shape) != (batch, time):
-        raise RouteTelemetryError("advantage must have shape [B,T]")
-    if tuple(return_target.shape) != (batch, time):
-        raise RouteTelemetryError("return_target must have shape [B,T]")
+    valid_credit_shapes = {(batch, time), (batch, time, agents)}
+    if tuple(advantage.shape) not in valid_credit_shapes:
+        raise RouteTelemetryError("advantage must have shape [B,T] or [B,T,A]")
+    if tuple(return_target.shape) != tuple(advantage.shape):
+        raise RouteTelemetryError(
+            "return_target must share the scalar or per-agent advantage shape"
+        )
+    if td_residual is not None and tuple(td_residual.shape) != tuple(advantage.shape):
+        raise RouteTelemetryError(
+            "td_residual must share the scalar or per-agent advantage shape"
+        )
     if (
         tuple(sequence_valid_mask.shape) != (batch, time)
         or sequence_valid_mask.dtype != torch.bool
@@ -768,8 +775,11 @@ def collect_route_telemetry(
         if not torch.isfinite(best_remote_logit.masked_select(legal_remote)).all():
             raise RouteTelemetryError("best legal-remote logit is not finite")
 
-        expanded_advantage = advantage.detach().to(device=device).unsqueeze(-1).expand_as(route_active)
-        expanded_return = return_target.detach().to(device=device).unsqueeze(-1).expand_as(route_active)
+        expanded_advantage = advantage.detach().to(device=device)
+        expanded_return = return_target.detach().to(device=device)
+        if expanded_advantage.ndim == 2:
+            expanded_advantage = expanded_advantage.unsqueeze(-1).expand_as(route_active)
+            expanded_return = expanded_return.unsqueeze(-1).expand_as(route_active)
         raw_branch_active = torch.stack(
             [
                 policy.active_branches[branch].detach().to(device=device)
@@ -810,11 +820,9 @@ def collect_route_telemetry(
                 len(ACTION_BRANCH_ORDER),
             ).detach().cpu().tolist()
         )
-        td_values = (
-            td_residual.detach().to(device=device).unsqueeze(-1).expand_as(route_active)
-            if td_residual is not None
-            else None
-        )
+        td_values = td_residual.detach().to(device=device) if td_residual is not None else None
+        if td_values is not None and td_values.ndim == 2:
+            td_values = td_values.unsqueeze(-1).expand_as(route_active)
         local_group = active & selected_local
         remote_group = active & selected_remote
         defer_group = active & selected_defer

@@ -16,6 +16,9 @@ from typing import Iterable, Mapping
 from .tasks import Task, TaskOutcome
 
 
+AGENT_REWARD_CONSERVATION_TOLERANCE = 1.0e-9
+
+
 class RewardError(ValueError):
     """Raised when reward inputs violate the frozen timing or numeric contract."""
 
@@ -146,6 +149,122 @@ class RewardTerms:
         }
 
 
+@dataclass(frozen=True)
+class RemoteCompletionAttribution:
+    """Intrinsic-work split for one remotely completed task."""
+
+    task_id: int
+    source_uav: int
+    destination_uav: int
+    source_share: float
+    destination_share: float
+
+    def to_dict(self) -> dict[str, int | float]:
+        return {
+            "task_id": self.task_id,
+            "source_uav": self.source_uav,
+            "destination_uav": self.destination_uav,
+            "source_share": self.source_share,
+            "destination_share": self.destination_share,
+        }
+
+
+@dataclass(frozen=True)
+class AgentRewardTerms:
+    """Role-based per-agent accounting that exactly conserves team reward."""
+
+    slot: int
+    uav_count: int
+    team_reward: float
+    agent_reward: tuple[float, ...]
+    completion_credit: tuple[float, ...]
+    expiration_count: tuple[float, ...]
+    communication_workload_s: tuple[float, ...]
+    computation_workload_s: tuple[float, ...]
+    urgent_workload_s: tuple[float, ...]
+    transmit_energy_j: tuple[float, ...]
+    cpu_energy_j: tuple[float, ...]
+    actual_energy_j: tuple[float, ...]
+    completion_component: tuple[float, ...]
+    expiration_penalty: tuple[float, ...]
+    workload_penalty: tuple[float, ...]
+    energy_penalty: tuple[float, ...]
+    conservation_residual: float
+    remote_completions: tuple[RemoteCompletionAttribution, ...]
+
+    def __post_init__(self) -> None:
+        if isinstance(self.uav_count, bool) or not isinstance(self.uav_count, int):
+            raise RewardError("uav_count must be an integer")
+        if self.uav_count <= 0:
+            raise RewardError("uav_count must be positive")
+        vector_names = (
+            "agent_reward",
+            "completion_credit",
+            "expiration_count",
+            "communication_workload_s",
+            "computation_workload_s",
+            "urgent_workload_s",
+            "transmit_energy_j",
+            "cpu_energy_j",
+            "actual_energy_j",
+            "completion_component",
+            "expiration_penalty",
+            "workload_penalty",
+            "energy_penalty",
+        )
+        for name in vector_names:
+            values = getattr(self, name)
+            if len(values) != self.uav_count:
+                raise RewardError(f"{name} must have shape [A]")
+            if not all(math.isfinite(value) for value in values):
+                raise RewardError(f"{name} contains NaN or Inf")
+        if not math.isfinite(self.team_reward):
+            raise RewardError("team_reward must be finite")
+        if not math.isfinite(self.conservation_residual):
+            raise RewardError("conservation_residual must be finite")
+        if abs(self.conservation_residual) > AGENT_REWARD_CONSERVATION_TOLERANCE:
+            raise RewardError("per-agent reward violates team-reward conservation")
+
+    def to_dict(self) -> dict[str, object]:
+        """Return additive JSON-safe telemetry without replacing scalar reward."""
+
+        destination = [
+            {
+                "uav_id": uav_id,
+                "cpu_energy_j": self.cpu_energy_j[uav_id],
+                "agent_reward": self.agent_reward[uav_id],
+                "completion_credit": self.completion_credit[uav_id],
+            }
+            for uav_id in range(self.uav_count)
+        ]
+        return {
+            "team_reward": self.team_reward,
+            "agent_reward": list(self.agent_reward),
+            "components": {
+                "completion": list(self.completion_credit),
+                "expiration": list(self.expiration_count),
+                "workload": list(self.urgent_workload_s),
+                "energy": list(self.actual_energy_j),
+                "completion_component": list(self.completion_component),
+                "expiration_penalty": list(self.expiration_penalty),
+                "workload_penalty": list(self.workload_penalty),
+                "energy_penalty": list(self.energy_penalty),
+            },
+            "workload_attribution": {
+                "communication_s": list(self.communication_workload_s),
+                "computation_s": list(self.computation_workload_s),
+            },
+            "energy_attribution": {
+                "transmit_j": list(self.transmit_energy_j),
+                "cpu_j": list(self.cpu_energy_j),
+            },
+            "conservation_residual": self.conservation_residual,
+            "conservation_tolerance": AGENT_REWARD_CONSERVATION_TOLERANCE,
+            "remote_completions": [item.to_dict() for item in self.remote_completions],
+            "destination": destination,
+        }
+
+
 class RewardCalculator:
     """Evaluate the unique frozen reward with immutable normalization values."""
 
@@ -231,6 +350,211 @@ class RewardCalculator:
             reward=reward,
         )
 
+    def decompose_agent_credit(
+        self,
+        *,
+        slot: int,
+        uav_count: int,
+        all_tasks: Iterable[Task],
+        settled_tasks: Iterable[Task],
+        team_terms: RewardTerms,
+        agent_transmit_energy_j: Mapping[int, float],
+        agent_cpu_energy_j: Mapping[int, float],
+        workload_snapshots: Mapping[int, TaskWorkloadSnapshot] | None = None,
+    ) -> AgentRewardTerms:
+        """Decompose existing team accounting without redefining its formula."""
+
+        if isinstance(uav_count, bool) or not isinstance(uav_count, int) or uav_count <= 0:
+            raise RewardError("uav_count must be a positive integer")
+        if not isinstance(team_terms, RewardTerms) or team_terms.slot != slot:
+            raise RewardError("team_terms must describe the requested slot")
+        tasks = self._unique_tasks(all_tasks, "all_tasks")
+        settled = self._unique_tasks(settled_tasks, "settled_tasks")
+        by_id = {task.task_id: task for task in tasks}
+        snapshots = self._workload_snapshot_by_id(workload_snapshots, by_id)
+        for task in settled:
+            if by_id.get(task.task_id) is not task:
+                raise RewardError("settled_tasks must reference objects in all_tasks")
+            if task.outcome not in {TaskOutcome.DONE, TaskOutcome.EXPIRED}:
+                raise RewardError("settled_tasks may contain only done or expired tasks")
+
+        completion_parts: list[list[float]] = [[] for _ in range(uav_count)]
+        expiration_parts: list[list[float]] = [[] for _ in range(uav_count)]
+        communication_parts: list[list[float]] = [[] for _ in range(uav_count)]
+        computation_parts: list[list[float]] = [[] for _ in range(uav_count)]
+        remote_completions: list[RemoteCompletionAttribution] = []
+        refs = self.references
+
+        for task in settled:
+            source = self._agent_id(task.source_uav, uav_count, "task.source_uav")
+            if task.outcome is TaskOutcome.EXPIRED:
+                expiration_parts[source].append(1.0)
+                continue
+            destination = self._agent_id(
+                task.source_uav if task.destination is None else task.destination,
+                uav_count,
+                "task.destination",
+            )
+            if destination == source:
+                completion_parts[source].append(1.0)
+                continue
+            communication_reference = task.data_bits / refs.reference_rate_bps
+            computation_reference = task.cpu_cycles / refs.reference_cpu_frequency_hz
+            eta = communication_reference / (
+                communication_reference + computation_reference
+            )
+            completion_parts[source].append(eta)
+            completion_parts[destination].append(1.0 - eta)
+            remote_completions.append(
+                RemoteCompletionAttribution(
+                    task_id=task.task_id,
+                    source_uav=source,
+                    destination_uav=destination,
+                    source_share=eta,
+                    destination_share=1.0 - eta,
+                )
+            )
+
+        for task in tasks:
+            if task.is_terminal:
+                continue
+            source = self._agent_id(task.source_uav, uav_count, "task.source_uav")
+            owner = self._agent_id(
+                task.source_uav if task.destination is None else task.destination,
+                uav_count,
+                "task.destination",
+            )
+            workload_source = snapshots.get(task.task_id, task)
+            remaining_bits = _finite_nonnegative(
+                workload_source.remaining_bits, "task.remaining_bits"
+            )
+            remaining_cycles = _finite_nonnegative(
+                workload_source.remaining_cycles, "task.remaining_cycles"
+            )
+            denominator = max(1, task.deadline_slot - slot + 1)
+            communication_parts[source].append(
+                remaining_bits / refs.reference_rate_bps / denominator
+            )
+            computation_parts[owner].append(
+                remaining_cycles / refs.reference_cpu_frequency_hz / denominator
+            )
+
+        completion = tuple(math.fsum(parts) for parts in completion_parts)
+        expiration = tuple(math.fsum(parts) for parts in expiration_parts)
+        communication = tuple(math.fsum(parts) for parts in communication_parts)
+        computation = tuple(math.fsum(parts) for parts in computation_parts)
+        workload = tuple(
+            math.fsum((communication[index], computation[index]))
+            for index in range(uav_count)
+        )
+        tx_energy = self._agent_vector(
+            agent_transmit_energy_j, uav_count, "agent_transmit_energy_j"
+        )
+        cpu_energy = self._agent_vector(
+            agent_cpu_energy_j, uav_count, "agent_cpu_energy_j"
+        )
+        energy = tuple(
+            math.fsum((tx_energy[index], cpu_energy[index]))
+            for index in range(uav_count)
+        )
+
+        self._assert_conserved(completion, team_terms.completed_task_count, "completion")
+        self._assert_conserved(expiration, team_terms.expired_task_count, "expiration")
+        self._assert_conserved(workload, team_terms.urgent_workload_s, "workload")
+        self._assert_conserved(energy, team_terms.actual_energy_j, "energy")
+
+        weights = self.weights
+        completion_component = tuple(
+            weights.completion * value / refs.task_count_reference
+            for value in completion
+        )
+        expiration_penalty = tuple(
+            weights.expiration * value / refs.task_count_reference
+            for value in expiration
+        )
+        workload_penalty = tuple(
+            weights.workload * value / refs.workload_reference_s
+            for value in workload
+        )
+        energy_penalty = tuple(
+            weights.energy * value / refs.active_energy_reference_j
+            for value in energy
+        )
+        agent_reward = tuple(
+            completion_component[index]
+            - expiration_penalty[index]
+            - workload_penalty[index]
+            - energy_penalty[index]
+            for index in range(uav_count)
+        )
+        self._assert_conserved(
+            completion_component, team_terms.completion_component, "completion component"
+        )
+        self._assert_conserved(
+            expiration_penalty, team_terms.expiration_penalty, "expiration penalty"
+        )
+        self._assert_conserved(
+            workload_penalty, team_terms.workload_penalty, "workload penalty"
+        )
+        self._assert_conserved(
+            energy_penalty, team_terms.energy_penalty, "energy penalty"
+        )
+        residual = math.fsum(agent_reward) - team_terms.reward
+        if abs(residual) > AGENT_REWARD_CONSERVATION_TOLERANCE:
+            raise RewardError("per-agent reward violates team-reward conservation")
+        return AgentRewardTerms(
+            slot=slot,
+            uav_count=uav_count,
+            team_reward=team_terms.reward,
+            agent_reward=agent_reward,
+            completion_credit=completion,
+            expiration_count=expiration,
+            communication_workload_s=communication,
+            computation_workload_s=computation,
+            urgent_workload_s=workload,
+            transmit_energy_j=tx_energy,
+            cpu_energy_j=cpu_energy,
+            actual_energy_j=energy,
+            completion_component=completion_component,
+            expiration_penalty=expiration_penalty,
+            workload_penalty=workload_penalty,
+            energy_penalty=energy_penalty,
+            conservation_residual=residual,
+            remote_completions=tuple(remote_completions),
+        )
+
+    @staticmethod
+    def _agent_id(value: int, uav_count: int, name: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise RewardError(f"{name} must be an integer")
+        if value < 0 or value >= uav_count:
+            raise RewardError(f"{name} lies outside the agent axis")
+        return value
+
+    @classmethod
+    def _agent_vector(
+        cls,
+        values: Mapping[int, float],
+        uav_count: int,
+        name: str,
+    ) -> tuple[float, ...]:
+        if not isinstance(values, Mapping):
+            raise TypeError(f"{name} must be a mapping")
+        result = [0.0] * uav_count
+        for raw_id, raw_value in values.items():
+            agent_id = cls._agent_id(raw_id, uav_count, f"{name} key")
+            result[agent_id] = _finite_nonnegative(raw_value, f"{name}[{agent_id}]")
+        return tuple(result)
+
+    @staticmethod
+    def _assert_conserved(
+        values: tuple[float, ...],
+        team_value: float,
+        name: str,
+    ) -> None:
+        if abs(math.fsum(values) - float(team_value)) > AGENT_REWARD_CONSERVATION_TOLERANCE:
+            raise RewardError(f"per-agent {name} attribution is not conservative")
+
     def _urgent_workload_for_task(
         self,
         task: Task,
@@ -304,6 +628,9 @@ def compute_reward(
 
 
 __all__ = [
+    "AGENT_REWARD_CONSERVATION_TOLERANCE",
+    "AgentRewardTerms",
+    "RemoteCompletionAttribution",
     "RewardCalculator",
     "RewardError",
     "RewardReferences",

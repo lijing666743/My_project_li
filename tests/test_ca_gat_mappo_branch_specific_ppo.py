@@ -416,6 +416,7 @@ class Fix4LegacyAndIsolationTests(unittest.TestCase):
         self.assertTrue(torch.equal(output.actor_loss, reference_actor_loss.detach()))
         self.assertTrue(torch.equal(output.critic_loss, reference_critic_loss.detach()))
         self.assertTrue(torch.equal(output.entropy_mean, reference_entropy))
+        self.assertEqual(output.agent_credit_mode, "team")
         self.assertEqual(
             output.diagnostics.clipped_fraction,
             float((ratio != clipped_ratio).double().mean()),
@@ -431,9 +432,18 @@ class Fix4LegacyAndIsolationTests(unittest.TestCase):
         optimizer_reference = torch.optim.Adam(
             [actor_reference], lr=3.0e-4, betas=(0.9, 0.999), eps=1.0e-8
         )
+        critic_optimizer_new = torch.optim.Adam(
+            [critic_new], lr=3.0e-4, betas=(0.9, 0.999), eps=1.0e-8
+        )
+        critic_optimizer_reference = torch.optim.Adam(
+            [critic_reference], lr=3.0e-4, betas=(0.9, 0.999), eps=1.0e-8
+        )
         optimizer_new.step()
         optimizer_reference.step()
+        critic_optimizer_new.step()
+        critic_optimizer_reference.step()
         self.assertTrue(torch.equal(actor_new, actor_reference))
+        self.assertTrue(torch.equal(critic_new, critic_reference))
 
     def test_branch_specific_diff_is_actor_ratio_only_and_rng_neutral(self) -> None:
         old = torch.zeros((2, 1, 7))

@@ -15,7 +15,7 @@ from typing import Any
 
 import numpy as np
 
-from ..config import RunConfig, WorkloadTimingMode
+from ..config import AgentCreditMode, RunConfig, WorkloadTimingMode
 from .actions import ActionProposal
 from .action_history import PreviousActionSnapshot
 from .channel import ChannelSnapshot, PhysicalChannelModel
@@ -29,6 +29,7 @@ from .observation import ActorObservation, ObservationBuilder
 from .public_history import PublicMessageHistory, PublicMessageSnapshot
 from .randomness import rng_from_run_config
 from .reward import (
+    AgentRewardTerms,
     RewardCalculator,
     RewardReferences,
     RewardTerms,
@@ -355,18 +356,40 @@ class U2UMECEnvironment:
         )
 
         actual_energy_j = math.fsum(debit.total_energy_j for debit in physical.energy_debits)
+        reward_workload_snapshots = (
+            route_slot_workload_snapshots
+            if WorkloadTimingMode(self.config.environment.workload_timing_mode)
+            is WorkloadTimingMode.ROUTE_SLOT_PRE_ROUTE
+            else None
+        )
         reward_terms = self.reward_calculator.calculate(
             slot=slot,
             all_tasks=self.lifecycle.tasks.values(),
             settled_tasks=settled,
             actual_energy_j=actual_energy_j,
-            workload_snapshots=(
-                route_slot_workload_snapshots
-                if WorkloadTimingMode(self.config.environment.workload_timing_mode)
-                is WorkloadTimingMode.ROUTE_SLOT_PRE_ROUTE
-                else None
-            ),
+            workload_snapshots=reward_workload_snapshots,
         )
+        agent_reward_terms = None
+        if (
+            AgentCreditMode(self.config.training.mappo.agent_credit_mode)
+            is AgentCreditMode.ROLE_DECOMPOSED
+        ):
+            agent_reward_terms = self.reward_calculator.decompose_agent_credit(
+                slot=slot,
+                uav_count=self.config.environment.uav_count,
+                all_tasks=self.lifecycle.tasks.values(),
+                settled_tasks=settled,
+                team_terms=reward_terms,
+                agent_transmit_energy_j={
+                    debit.uav_id: debit.transmit_energy_j
+                    for debit in physical.energy_debits
+                },
+                agent_cpu_energy_j={
+                    debit.uav_id: debit.cpu_energy_j
+                    for debit in physical.energy_debits
+                },
+                workload_snapshots=reward_workload_snapshots,
+            )
         slot_outage = self._update_rate_and_outage_history(physical)
         self.channel_history.update_with_measurement(
             slot,
@@ -426,6 +449,7 @@ class U2UMECEnvironment:
                 routing_records,
                 settled,
                 reward_terms,
+                agent_reward_terms,
                 arrival_snapshot,
                 slot_outage,
                 conservation,
@@ -449,6 +473,7 @@ class U2UMECEnvironment:
             routing_records,
             settled,
             reward_terms,
+            agent_reward_terms,
             arrival_snapshot,
             slot_outage,
             conservation,
@@ -879,6 +904,7 @@ class U2UMECEnvironment:
         routing_records: list[dict[str, Any]],
         settled: tuple[Task, ...],
         reward_terms: RewardTerms,
+        agent_reward_terms: AgentRewardTerms | None,
         arrival_snapshot: dict[str, Any],
         outage_snapshot: dict[str, Any],
         conservation: ConservationSnapshot,
@@ -913,7 +939,7 @@ class U2UMECEnvironment:
             for action in execution.actions
             if action.communication.canonicalization_reason is not None
         ]
-        return {
+        info = {
             "slot": execution.slot,
             "run_id": self.config.run_id,
             "config_hash": self.config.config_hash,
@@ -958,6 +984,11 @@ class U2UMECEnvironment:
             "metrics": self.metrics.snapshot(),
             "conservation": conservation.to_dict(),
         }
+        if agent_reward_terms is not None:
+            agent_credit = agent_reward_terms.to_dict()
+            info["agent_reward"] = list(agent_reward_terms.agent_reward)
+            info["agent_credit"] = agent_credit
+        return info
 
     @staticmethod
     def _proposal_snapshot(proposal: ActionProposal) -> dict[str, Any]:

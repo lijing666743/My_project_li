@@ -6,6 +6,7 @@ import csv
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from src.config import load_run_config
@@ -18,6 +19,7 @@ from src.models.ca_gat_mappo_trainer import (
     ScalarTrainingDiagnostics,
 )
 from src.models.ca_gat_mappo_update import (
+    AgentCreditPPOEpochTelemetry,
     RecurrentPPOEpochDiagnostics,
     RecurrentPPOUpdateOutput,
 )
@@ -161,10 +163,104 @@ class CAGATMAPPOTrainingArtifactTests(unittest.TestCase):
             self.assertEqual(len(rows), 12)
             self.assertEqual(sum(row["record_type"] == "episode" for row in rows), 8)
             self.assertEqual(sum(row["record_type"] == "ppo_epoch" for row in rows), 4)
+            self.assertTrue(all(row["agent_credit_mode"] == "team" for row in rows))
+            self.assertTrue(
+                all(
+                    row["agent_value_mean"] == ""
+                    for row in rows
+                    if row["record_type"] == "ppo_epoch"
+                )
+            )
             self.assertTrue(all(row["signal_gate_status"] == "insufficient-horizon" for row in rows))
             self.assertEqual(
                 Path(paths["dashboard_png"]).read_bytes()[:8],
                 b"\x89PNG\r\n\x1a\n",
+            )
+
+    def test_role_credit_telemetry_is_additive_under_schema_v3(self) -> None:
+        telemetry = AgentCreditPPOEpochTelemetry(
+            per_agent_value_mean=(0.1, 0.2, 0.3, 0.4),
+            per_agent_td_residual_mean=(1.1, 1.2, 1.3, 1.4),
+            per_agent_advantage_mean=(2.1, 2.2, 2.3, 2.4),
+            per_agent_return_mean=(3.1, 3.2, 3.3, 3.4),
+            same_timestep_advantage_equality_rate=0.25,
+            route_category_agent_advantage_mean={
+                "local": (1.0, None, 3.0, 4.0),
+                "remote": (None, 2.0, None, 4.0),
+                "defer": (1.0, 2.0, 3.0, None),
+            },
+            per_head_critic_loss=(0.5, 0.6, 0.7, 0.8),
+        )
+        original = training_result()
+        update = original.updates[0]
+        epoch_rows = tuple(
+            replace(epoch, agent_credit_telemetry=telemetry)
+            for epoch in update.output.epoch_diagnostics
+        )
+        role_result = replace(
+            original,
+            updates=(
+                replace(
+                    update,
+                    output=replace(
+                        update.output,
+                        epoch_diagnostics=epoch_rows,
+                    ),
+                ),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = load_run_config(
+                cli_overrides={
+                    "mode": "rl",
+                    "method_id": "ca_gat_mappo",
+                    "training.formal_rl_enabled": True,
+                    "training.mappo.training_device": "cpu",
+                    "training.mappo.agent_credit_mode": "role_decomposed",
+                    "environment.episode_horizon": 32,
+                    "training.mappo.max_training_episodes": 8,
+                    "training.mappo.max_training_environment_steps": 256,
+                    "training.mappo.evaluation_interval_steps": 256,
+                    "training.mappo.checkpoint_interval_steps": 128,
+                    "output.logs_dir": str(root / "logs"),
+                    "output.dashboard_logs_dir": str(root / "dashboard_logs"),
+                    "output.plots_dir": str(root / "plots"),
+                }
+            )
+            write_cagat_mappo_training_artifacts(config, role_result)
+            paths = config.artifact_paths()
+            with Path(paths["dashboard_csv"]).open(
+                encoding="utf-8",
+                newline="",
+            ) as handle:
+                rows = [
+                    row
+                    for row in csv.DictReader(handle)
+                    if row["record_type"] == "ppo_epoch"
+                ]
+            self.assertEqual(len(rows), 4)
+            self.assertTrue(
+                all(row["agent_credit_mode"] == "role_decomposed" for row in rows)
+            )
+            self.assertEqual(
+                json.loads(rows[-1]["agent_value_mean"]),
+                [0.1, 0.2, 0.3, 0.4],
+            )
+            self.assertEqual(
+                json.loads(rows[-1]["per_head_critic_loss"]),
+                [0.5, 0.6, 0.7, 0.8],
+            )
+            summary = json.loads(
+                Path(paths["aggregate_metrics"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                summary["training"]["agent_credit_mode"],
+                "role_decomposed",
+            )
+            self.assertEqual(
+                summary["ppo"]["agent_credit_latest"]["per_agent_return_mean"],
+                [3.1, 3.2, 3.3, 3.4],
             )
 
 

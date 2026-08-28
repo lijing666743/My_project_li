@@ -14,7 +14,7 @@ from typing import Any, Mapping, Sequence
 import torch
 from torch import Tensor
 
-from ..config import RunConfig
+from ..config import AgentCreditMode, RunConfig
 from ..env.actions import ActionProposal
 from ..env.observation import ActionMasks
 from .ca_gat_mappo import (
@@ -63,6 +63,18 @@ def _cpu_scalar(value: Tensor | float | int, name: str) -> Tensor:
     if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
         raise RolloutStorageError(f"{name} must be a finite scalar")
     return torch.tensor(float(value), dtype=torch.float32)
+
+
+def _cpu_credit_tensor(
+    value: Tensor | float | int,
+    name: str,
+    agent_count: int,
+) -> Tensor:
+    """Store either one legacy scalar or one explicit [A] credit vector."""
+
+    if isinstance(value, Tensor) and tuple(value.shape) == (agent_count,):
+        return _cpu_float_tensor(value, name)
+    return _cpu_scalar(value, name)
 
 
 def _validate_metadata(value: Any, path: str) -> None:
@@ -244,10 +256,22 @@ class CAGATMAPPORolloutTransition:
         )
         contracts = copy.deepcopy(action_mask_batch.contracts[0][0])
         proposals = copy.deepcopy(action_output.proposals[0][0])
+        resolved_old_value = _cpu_credit_tensor(
+            old_value, "old_value", spec.uav_count
+        )
+        resolved_reward = _cpu_credit_tensor(
+            reward, "reward", spec.uav_count
+        )
+        if resolved_old_value.shape != resolved_reward.shape:
+            raise RolloutStorageError(
+                "old_value and reward must share scalar or [A] credit shape"
+            )
         resolved_bootstrap = (
             None
             if bootstrap_value is None
-            else _cpu_scalar(bootstrap_value, "bootstrap_value")
+            else _cpu_credit_tensor(
+                bootstrap_value, "bootstrap_value", spec.uav_count
+            )
         )
         return cls(
             spec=spec,
@@ -283,8 +307,8 @@ class CAGATMAPPORolloutTransition:
             centralized_state=_cpu_float_tensor(
                 centralized_state.features[0, 0], "centralized_state"
             ),
-            old_value=_cpu_scalar(old_value, "old_value"),
-            reward=_cpu_scalar(reward, "reward"),
+            old_value=resolved_old_value,
+            reward=resolved_reward,
             terminated=_require_bool(terminated, "terminated"),
             truncated=_require_bool(truncated, "truncated"),
             episode_boundary=_require_bool(episode_boundary, "episode_boundary"),
@@ -312,6 +336,11 @@ class CAGATMAPPORolloutTransition:
                 "episode_start must identify exactly the slot-zero transition"
             )
         agents = self.spec.uav_count
+        credit_shape = tuple(self.reward.shape)
+        if credit_shape not in {(), (agents,)}:
+            raise RolloutStorageError("reward must be scalar or have shape [A]")
+        if tuple(self.old_value.shape) != credit_shape:
+            raise RolloutStorageError("old_value and reward credit shapes differ")
         expected_shapes = {
             "self_features": (agents, self.spec.self_feature_dim),
             "neighbor_public_features": (
@@ -326,6 +355,8 @@ class CAGATMAPPORolloutTransition:
             "action_indices": (agents, len(ACTION_BRANCH_ORDER)),
             "active_branch_indicators": (agents, len(ACTION_BRANCH_ORDER)),
             "old_branch_log_probs": (agents, len(ACTION_BRANCH_ORDER)),
+            "old_value": credit_shape,
+            "reward": credit_shape,
         }
         float_names = (
             "self_features",
@@ -460,13 +491,13 @@ class CAGATMAPPORolloutTransition:
                     "non-boundary transition requires V(s_t+1)"
                 )
             if (
-                tuple(self.bootstrap_value.shape) != ()
+                tuple(self.bootstrap_value.shape) != credit_shape
                 or self.bootstrap_value.device.type != "cpu"
                 or self.bootstrap_value.dtype != torch.float32
-                or not torch.isfinite(self.bootstrap_value)
+                or not torch.isfinite(self.bootstrap_value).all()
             ):
                 raise RolloutStorageError(
-                    "bootstrap_value must be one finite CPU float32 scalar"
+                    "bootstrap_value must match the scalar or [A] credit shape"
                 )
         elif self.bootstrap_value is not None:
             raise RolloutStorageError(
@@ -745,6 +776,9 @@ class CAGATMAPPORolloutBuffer:
         if isinstance(resolved, bool) or not isinstance(resolved, int) or resolved <= 0:
             raise RolloutStorageError("capacity must be a positive integer")
         self.spec = MAPPOTensorSpec.from_config(config)
+        self.agent_credit_mode = AgentCreditMode(
+            config.training.mappo.agent_credit_mode
+        )
         self.capacity = resolved
         self._transitions: list[CAGATMAPPORolloutTransition] = []
         self._finalized = False
@@ -770,6 +804,19 @@ class CAGATMAPPORolloutBuffer:
         if transition.spec != self.spec:
             raise RolloutStorageError("transition tensor spec differs from the buffer")
         transition.validate()
+        expected_credit_shape = (
+            ()
+            if self.agent_credit_mode is AgentCreditMode.TEAM
+            else (self.spec.uav_count,)
+        )
+        if tuple(transition.reward.shape) != expected_credit_shape:
+            raise RolloutStorageError(
+                "transition reward shape differs from agent_credit_mode"
+            )
+        if tuple(transition.old_value.shape) != expected_credit_shape:
+            raise RolloutStorageError(
+                "transition value shape differs from agent_credit_mode"
+            )
         if self._transitions:
             _validate_transition_order((self._transitions[-1], transition))
         elif transition.episode_start and transition.slot != 0:

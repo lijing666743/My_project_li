@@ -18,6 +18,7 @@ from src.cli import (
 )
 from src.config import (
     ActorRatioMode,
+    AgentCreditMode,
     CHECKPOINT_KIND_FINAL_COMPLETED,
     CHECKPOINT_KIND_PERIODIC_RESUME,
     ConfigError,
@@ -41,6 +42,7 @@ def make_evaluation_fixture(
     arrivals: tuple[float, ...] | None = None,
     kind: str = CHECKPOINT_KIND_FINAL_COMPLETED,
     actor_ratio_mode: ActorRatioMode = ActorRatioMode.JOINT,
+    agent_credit_mode: AgentCreditMode = AgentCreditMode.TEAM,
 ):
     source = make_checkpoint_config(root, horizon=4, interval=4, budget=8)
     source = replace(
@@ -50,6 +52,7 @@ def make_evaluation_fixture(
             mappo=replace(
                 source.training.mappo,
                 actor_ratio_mode=actor_ratio_mode,
+                agent_credit_mode=agent_credit_mode,
             ),
         ),
     )
@@ -217,6 +220,7 @@ class TestFinalActorOnlyLoader(unittest.TestCase):
             self.assertFalse(loaded.actor.training)
             self.assertEqual(loaded.source_checkpoint_kind, "FINAL_COMPLETED")
             self.assertEqual(loaded.source_training_actor_ratio_mode, "joint")
+            self.assertEqual(loaded.source_training_agent_credit_mode, "team")
             self.assertEqual(loaded.source_training_device, "cpu")
             self.assertEqual(loaded.evaluation_device, "cpu")
             for name, value in source_actor.state_dict().items():
@@ -241,6 +245,27 @@ class TestFinalActorOnlyLoader(unittest.TestCase):
             self.assertEqual(
                 result.manifest["source_training_actor_ratio_mode"],
                 "branch_specific",
+            )
+
+    def test_role_credit_training_provenance_reaches_formal_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _source, config, checkpoint, _actor = make_evaluation_fixture(
+                Path(directory),
+                agent_credit_mode=AgentCreditMode.ROLE_DECOMPOSED,
+            )
+            runner = FormalEvaluationRunner(
+                config,
+                checkpoint,
+                evaluation_device="cpu",
+            )
+            self.assertEqual(
+                runner.loaded_actor.source_training_agent_credit_mode,
+                "role_decomposed",
+            )
+            result = runner.run(write_artifacts=False)
+            self.assertEqual(
+                result.manifest["source_training_agent_credit_mode"],
+                "role_decomposed",
             )
 
     def test_periodic_resume_is_rejected_for_formal_evaluation(self) -> None:
@@ -419,6 +444,7 @@ class TestFormalEvaluationRunner(unittest.TestCase):
             self.assertIn("source_checkpoint_sha256", manifest)
             self.assertIn("source_training_config_hash", manifest)
             self.assertEqual(manifest["source_training_actor_ratio_mode"], "joint")
+            self.assertEqual(manifest["source_training_agent_credit_mode"], "team")
             self.assertIn("shared_external_trace_by_seed", manifest)
             self.assertIn("/evaluations/", first.artifacts[0].replace("\\", "/"))
 

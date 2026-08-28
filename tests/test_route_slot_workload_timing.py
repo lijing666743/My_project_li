@@ -153,6 +153,7 @@ class RouteSlotWorkloadTimingTests(unittest.TestCase):
             historical.pop(field_name)
         historical["environment"].pop("workload_timing_mode")
         historical["training"]["mappo"].pop("actor_ratio_mode")
+        historical["training"]["mappo"].pop("agent_credit_mode")
         historical = json.loads(json.dumps(historical))
         self.assertEqual(legacy.resolved_dict(), historical)
         payload = json.dumps(historical, sort_keys=True, separators=(",", ":"))

@@ -16,7 +16,7 @@ import torch
 from torch import Tensor, nn
 from torch.optim import Adam
 
-from ..config import ActorRatioMode, RunConfig
+from ..config import ActorRatioMode, AgentCreditMode, RunConfig
 from ..env.actions import ActionProposal
 from .ca_gat_mappo import (
     ACTION_BRANCH_ORDER,
@@ -106,6 +106,7 @@ class RecurrentPPOMinibatch:
     advantage: Tensor
     return_target: Tensor
     sequence_valid_mask: Tensor
+    agent_credit_mode: str
     old_branch_log_probs: Tensor | None = None
     td_residual: Tensor | None = None
 
@@ -118,6 +119,15 @@ class RecurrentPPOMinibatch:
         self.action_mask_batch.validate(shape)
         if self.centralized_batch.validate(self.spec) != (8, 32):
             raise RecurrentPPOUpdateError("critic minibatch must have shape [8,32,F]")
+        try:
+            credit_mode = AgentCreditMode(self.agent_credit_mode)
+        except (TypeError, ValueError) as exc:
+            raise RecurrentPPOUpdateError("agent_credit_mode is invalid") from exc
+        credit_shape = (
+            (8, 32)
+            if credit_mode is AgentCreditMode.TEAM
+            else (8, 32, self.spec.uav_count)
+        )
         expected = {
             "rollout_indices": (8, 32),
             "initial_hidden": (8, self.spec.uav_count, self.spec.gru_hidden_dimension),
@@ -134,9 +144,9 @@ class RecurrentPPOMinibatch:
                 len(ACTION_BRANCH_ORDER),
             ),
             "old_joint_log_prob": (8, 32, self.spec.uav_count),
-            "old_value": (8, 32),
-            "advantage": (8, 32),
-            "return_target": (8, 32),
+            "old_value": credit_shape,
+            "advantage": credit_shape,
+            "return_target": credit_shape,
             "sequence_valid_mask": (8, 32),
         }
         for name, expected_shape in expected.items():
@@ -147,7 +157,7 @@ class RecurrentPPOMinibatch:
                 raise RecurrentPPOUpdateError(f"{name} must remain a CPU snapshot")
         optional = {
             "old_branch_log_probs": (8, 32, self.spec.uav_count, len(ACTION_BRANCH_ORDER)),
-            "td_residual": (8, 32),
+            "td_residual": credit_shape,
         }
         for name, expected_shape in optional.items():
             tensor = getattr(self, name)
@@ -252,11 +262,20 @@ def build_recurrent_ppo_minibatch(
             [chunk.old_joint_log_prob for chunk in chunks], dim=0
         ),
         old_value=torch.stack([chunk.old_value for chunk in chunks], dim=0),
-        advantage=gae.advantage.reshape(8, 32).clone(),
-        return_target=gae.return_target.reshape(8, 32).clone(),
+        advantage=gae.advantage.reshape(
+            (8, 32) + tuple(gae.advantage.shape[1:])
+        ).clone(),
+        return_target=gae.return_target.reshape(
+            (8, 32) + tuple(gae.return_target.shape[1:])
+        ).clone(),
         sequence_valid_mask=gae.sequence_mask.reshape(8, 32).clone(),
+        agent_credit_mode=AgentCreditMode(
+            config.training.mappo.agent_credit_mode
+        ).value,
         old_branch_log_probs=torch.stack([chunk.old_branch_log_probs for chunk in chunks], dim=0),
-        td_residual=gae.td_residual.reshape(8, 32).clone(),
+        td_residual=gae.td_residual.reshape(
+            (8, 32) + tuple(gae.td_residual.shape[1:])
+        ).clone(),
     )
     return result
 
@@ -283,7 +302,9 @@ class BatchedCAGATMAPPOLossOutput:
         return tensor.reshape(self.batch_size, self.sequence_length, self.agent_count)
 
     def _critic_view(self, tensor: Tensor) -> Tensor:
-        return tensor.reshape(self.batch_size, self.sequence_length)
+        return tensor.reshape(
+            (self.batch_size, self.sequence_length) + tuple(tensor.shape[1:])
+        )
 
     def _branch_view(self, tensor: Tensor) -> Tensor:
         return tensor.reshape(
@@ -394,13 +415,21 @@ def compute_configured_batched_ppo_objective_and_loss(
     ):
         if not isinstance(tensor, Tensor) or tensor.shape != new_joint_log_prob.shape:
             raise RecurrentPPOUpdateError(f"{name} must have shape [8,32,A]")
+    credit_mode = AgentCreditMode(config.training.mappo.agent_credit_mode)
+    expected_credit_shape = (
+        (8, 32)
+        if credit_mode is AgentCreditMode.TEAM
+        else (8, 32, agent_count)
+    )
     for name, tensor in (
         ("advantage", advantage),
         ("current_value", current_value),
         ("return_target", return_target),
     ):
-        if not isinstance(tensor, Tensor) or tensor.shape != (8, 32):
-            raise RecurrentPPOUpdateError(f"{name} must have shape [8,32]")
+        if not isinstance(tensor, Tensor) or tensor.shape != expected_credit_shape:
+            raise RecurrentPPOUpdateError(
+                f"{name} shape differs from agent_credit_mode"
+            )
     if (
         not isinstance(sequence_valid_mask, Tensor)
         or sequence_valid_mask.shape != (8, 32)
@@ -451,9 +480,15 @@ def compute_configured_batched_ppo_objective_and_loss(
     flattened = compute_configured_ppo_objective_and_loss(
         new_joint_log_prob=new_joint_log_prob.reshape(256, agent_count),
         old_joint_log_prob=old_joint_log_prob.reshape(256, agent_count),
-        advantage=advantage.reshape(256),
-        current_value=current_value.reshape(256),
-        return_target=return_target.reshape(256),
+        advantage=advantage.reshape(
+            (256,) if credit_mode is AgentCreditMode.TEAM else (256, agent_count)
+        ),
+        current_value=current_value.reshape(
+            (256,) if credit_mode is AgentCreditMode.TEAM else (256, agent_count)
+        ),
+        return_target=return_target.reshape(
+            (256,) if credit_mode is AgentCreditMode.TEAM else (256, agent_count)
+        ),
         entropy=entropy.reshape(256, agent_count),
         sequence_valid_mask=sequence_valid_mask.reshape(256),
         config=config,
@@ -594,14 +629,27 @@ class RecurrentPPOEvaluation:
 
     policy: SequentialActionDistributionOutput
     current_value: Tensor
+    agent_credit_mode: str
 
     def __post_init__(self) -> None:
         if self.policy.mode != "evaluation":
             raise RecurrentPPOUpdateError("PPO update must re-evaluate stored proposals")
         if tuple(self.policy.joint_log_prob.shape[:2]) != (8, 32):
             raise RecurrentPPOUpdateError("policy evaluation must retain [8,32,A] axes")
-        if tuple(self.current_value.shape) != (8, 32):
-            raise RecurrentPPOUpdateError("current critic value must have shape [8,32]")
+        try:
+            credit_mode = AgentCreditMode(self.agent_credit_mode)
+        except (TypeError, ValueError) as exc:
+            raise RecurrentPPOUpdateError("agent_credit_mode is invalid") from exc
+        agent_count = self.policy.joint_log_prob.shape[-1]
+        expected = (
+            (8, 32)
+            if credit_mode is AgentCreditMode.TEAM
+            else (8, 32, agent_count)
+        )
+        if tuple(self.current_value.shape) != expected:
+            raise RecurrentPPOUpdateError(
+                "current critic value shape differs from agent_credit_mode"
+            )
 
 
 @dataclass(frozen=True)
@@ -646,6 +694,121 @@ def _prepare_device_minibatch(
 
 
 @dataclass(frozen=True)
+class AgentCreditPPOEpochTelemetry:
+    """Detached Fix-5 statistics derived from an existing PPO evaluation."""
+
+    per_agent_value_mean: tuple[float, ...]
+    per_agent_td_residual_mean: tuple[float, ...]
+    per_agent_advantage_mean: tuple[float, ...]
+    per_agent_return_mean: tuple[float, ...]
+    same_timestep_advantage_equality_rate: float
+    route_category_agent_advantage_mean: Mapping[
+        str, tuple[float | None, ...]
+    ]
+    per_head_critic_loss: tuple[float, ...]
+
+    def __post_init__(self) -> None:
+        agent_count = len(self.per_agent_value_mean)
+        if agent_count == 0:
+            raise RecurrentPPOUpdateError("agent credit telemetry cannot be empty")
+        vectors = (
+            self.per_agent_value_mean,
+            self.per_agent_td_residual_mean,
+            self.per_agent_advantage_mean,
+            self.per_agent_return_mean,
+            self.per_head_critic_loss,
+        )
+        if any(len(values) != agent_count for values in vectors):
+            raise RecurrentPPOUpdateError("agent credit telemetry axes disagree")
+        if any(not math.isfinite(value) for values in vectors for value in values):
+            raise RecurrentPPOUpdateError("agent credit telemetry contains NaN or Inf")
+        if not 0.0 <= self.same_timestep_advantage_equality_rate <= 1.0:
+            raise RecurrentPPOUpdateError(
+                "same-timestep advantage equality rate must lie in [0, 1]"
+            )
+        if set(self.route_category_agent_advantage_mean) != {
+            "local", "remote", "defer"
+        }:
+            raise RecurrentPPOUpdateError("route category telemetry is incomplete")
+        for values in self.route_category_agent_advantage_mean.values():
+            if len(values) != agent_count or any(
+                value is not None and not math.isfinite(value) for value in values
+            ):
+                raise RecurrentPPOUpdateError(
+                    "route category per-agent advantage telemetry is invalid"
+                )
+
+
+def _collect_agent_credit_epoch_telemetry(
+    *,
+    current_value: Tensor,
+    td_residual: Tensor,
+    advantage: Tensor,
+    return_target: Tensor,
+    sequence_valid_mask: Tensor,
+    route_telemetry: RouteTelemetry | None,
+    per_head_critic_loss: tuple[float, ...],
+    same_timestep_advantage_equality_rate: float | None,
+) -> AgentCreditPPOEpochTelemetry:
+    tensors = (current_value, td_residual, advantage, return_target)
+    if any(not isinstance(tensor, Tensor) or tensor.ndim != 3 for tensor in tensors):
+        raise RecurrentPPOUpdateError(
+            "role-decomposed telemetry requires [B,L,A] values"
+        )
+    shape = current_value.shape
+    if any(tensor.shape != shape for tensor in tensors[1:]):
+        raise RecurrentPPOUpdateError("agent credit telemetry value axes disagree")
+    if sequence_valid_mask.shape != shape[:2] or sequence_valid_mask.dtype != torch.bool:
+        raise RecurrentPPOUpdateError("agent credit telemetry mask is invalid")
+    agent_count = shape[-1]
+
+    def per_agent_mean(tensor: Tensor) -> tuple[float, ...]:
+        detached = tensor.detach()
+        return tuple(
+            float(
+                detached[..., agent_index]
+                .masked_select(sequence_valid_mask)
+                .mean()
+                .cpu()
+                .item()
+            )
+            for agent_index in range(agent_count)
+        )
+
+    category_values: dict[str, list[list[float]]] = {
+        category: [[] for _ in range(agent_count)]
+        for category in ("local", "remote", "defer")
+    }
+    if route_telemetry is not None:
+        for sample in route_telemetry.samples:
+            category_values[sample.category][sample.agent_index].append(
+                sample.advantage
+            )
+    category_means = {
+        category: tuple(
+            None if not values else math.fsum(values) / len(values)
+            for values in rows
+        )
+        for category, rows in category_values.items()
+    }
+    if same_timestep_advantage_equality_rate is None:
+        raise RecurrentPPOUpdateError(
+            "role-decomposed objective did not report advantage equality"
+        )
+    return AgentCreditPPOEpochTelemetry(
+        per_agent_value_mean=per_agent_mean(current_value),
+        per_agent_td_residual_mean=per_agent_mean(td_residual),
+        per_agent_advantage_mean=per_agent_mean(advantage),
+        per_agent_return_mean=per_agent_mean(return_target),
+        same_timestep_advantage_equality_rate=(
+            same_timestep_advantage_equality_rate
+        ),
+        route_category_agent_advantage_mean=category_means,
+        per_head_critic_loss=per_head_critic_loss,
+    )
+
+
+@dataclass(frozen=True)
 class RecurrentPPOEpochDiagnostics:
     """Detached diagnostics for one of the four fixed PPO epochs."""
 
@@ -661,6 +824,7 @@ class RecurrentPPOEpochDiagnostics:
     approx_kl: float | None = None
     clip_fraction: float | None = None
     route_telemetry: RouteTelemetry | None = None
+    agent_credit_telemetry: AgentCreditPPOEpochTelemetry | None = None
 
     def __post_init__(self) -> None:
         if self.epoch_index not in range(4):
@@ -687,6 +851,12 @@ class RecurrentPPOEpochDiagnostics:
             self.route_telemetry, RouteTelemetry
         ):
             raise TypeError("route_telemetry must be RouteTelemetry or None")
+        if self.agent_credit_telemetry is not None and not isinstance(
+            self.agent_credit_telemetry, AgentCreditPPOEpochTelemetry
+        ):
+            raise TypeError(
+                "agent_credit_telemetry must be AgentCreditPPOEpochTelemetry or None"
+            )
 
 
 @dataclass(frozen=True)
@@ -789,8 +959,20 @@ class CAGATMAPPORecurrentPPOUpdater:
             )
         if policy.proposals != minibatch.proposals:
             raise RecurrentPPOUpdateError("proposal re-evaluation changed stored proposals")
-        current_value = self.critic(minibatch.centralized_batch).squeeze(-1)
-        return RecurrentPPOEvaluation(policy=policy, current_value=current_value)
+        raw_value = self.critic(minibatch.centralized_batch)
+        credit_mode = AgentCreditMode(
+            self.config.training.mappo.agent_credit_mode
+        )
+        current_value = (
+            raw_value.squeeze(-1)
+            if credit_mode is AgentCreditMode.TEAM
+            else raw_value
+        )
+        return RecurrentPPOEvaluation(
+            policy=policy,
+            current_value=current_value,
+            agent_credit_mode=credit_mode.value,
+        )
 
     def evaluate_minibatch(
         self,
@@ -884,6 +1066,27 @@ class CAGATMAPPORecurrentPPOUpdater:
                     epsilon_clip=self.config.training.mappo.ppo_clip_epsilon,
                     actor_ratio_mode=mappo.actor_ratio_mode,
                 )
+            agent_credit_telemetry = None
+            if (
+                AgentCreditMode(mappo.agent_credit_mode)
+                is AgentCreditMode.ROLE_DECOMPOSED
+            ):
+                if prepared.td_residual is None:
+                    raise RecurrentPPOUpdateError(
+                        "role-decomposed update requires per-agent TD residual"
+                    )
+                agent_credit_telemetry = _collect_agent_credit_epoch_telemetry(
+                    current_value=evaluation.current_value,
+                    td_residual=prepared.td_residual,
+                    advantage=prepared.advantage,
+                    return_target=prepared.return_target,
+                    sequence_valid_mask=prepared.sequence_valid_mask,
+                    route_telemetry=route_telemetry,
+                    per_head_critic_loss=loss.diagnostics.per_head_critic_loss,
+                    same_timestep_advantage_equality_rate=(
+                        loss.diagnostics.same_timestep_advantage_equality_rate
+                    ),
+                )
             actor_grad_norm = self._finite_grad_norm(
                 self.optimizers.actor_parameters,
                 mappo.gradient_clip_norm,
@@ -915,6 +1118,7 @@ class CAGATMAPPORecurrentPPOUpdater:
                     approx_kl=loss.diagnostics.approx_kl,
                     clip_fraction=loss.diagnostics.clipped_fraction,
                     route_telemetry=route_telemetry,
+                    agent_credit_telemetry=agent_credit_telemetry,
                 )
             )
         return RecurrentPPOUpdateOutput(
@@ -927,6 +1131,7 @@ class CAGATMAPPORecurrentPPOUpdater:
 
 
 __all__ = [
+    "AgentCreditPPOEpochTelemetry",
     "BatchedCAGATMAPPOLossOutput",
     "CAGATMAPPOOptimizerBundle",
     "CAGATMAPPORecurrentPPOUpdater",

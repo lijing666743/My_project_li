@@ -763,6 +763,11 @@ def validate_periodic_checkpoint_compatibility(
         if isinstance(source_mappo, Mapping)
         else None
     )
+    source_agent_credit_mode = (
+        source_mappo.get("agent_credit_mode")
+        if isinstance(source_mappo, Mapping)
+        else None
+    )
     try:
         validate_mappo_checkpoint_resume_compatibility(
             config,
@@ -774,6 +779,7 @@ def validate_periodic_checkpoint_compatibility(
             training_device=runtime["device_type"],
             cuda_available=cuda_available,
             checkpoint_actor_ratio_mode=source_actor_ratio_mode,
+            checkpoint_agent_credit_mode=source_agent_credit_mode,
         )
     except ConfigError as exc:
         raise CheckpointError(str(exc)) from exc

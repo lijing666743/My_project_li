@@ -72,6 +72,15 @@ _BRANCH_ACTIVITY_COLUMNS = (
     "branch_activity_rollout_timestep",
     "branch_activity_matrix",
 )
+_AGENT_CREDIT_COLUMNS = (
+    "agent_value_mean",
+    "agent_td_residual_mean",
+    "agent_advantage_mean",
+    "agent_return_mean",
+    "same_timestep_advantage_equality_rate",
+    "route_category_agent_advantage_mean",
+    "per_head_critic_loss",
+)
 _ROUTE_ROLLING_FIELDS = (
     ("route_entropy_rolling_mean", "route_entropy_mean"),
     ("remote_selection_rate_rolling_mean", "remote_selection_rate_given_legal_remote"),
@@ -93,6 +102,7 @@ TRAINING_METRIC_COLUMNS = (
     "config_hash",
     "diagnostics_schema_version",
     "actor_ratio_mode",
+    "agent_credit_mode",
     "record_type",
     "telemetry_scope",
     "series_index",
@@ -135,6 +145,7 @@ TRAINING_METRIC_COLUMNS = (
     *_ROUTE_SAMPLE_COLUMNS,
     *_ROUTE_OUTCOME_COLUMNS,
     *_BRANCH_ACTIVITY_COLUMNS,
+    *_AGENT_CREDIT_COLUMNS,
     "signal_gate_status",
 )
 
@@ -155,6 +166,8 @@ class TrainingArtifactOutcome:
 def _base_record(config: RunConfig, signal_gate_status: str) -> dict[str, Any]:
     ratio_mode = config.training.mappo.actor_ratio_mode
     actor_ratio_mode = getattr(ratio_mode, "value", ratio_mode)
+    credit_mode = config.training.mappo.agent_credit_mode
+    agent_credit_mode = getattr(credit_mode, "value", credit_mode)
     return {
         "run_id": config.run_id,
         "method_id": config.method_id,
@@ -164,6 +177,7 @@ def _base_record(config: RunConfig, signal_gate_status: str) -> dict[str, Any]:
         "config_hash": config.config_hash,
         "diagnostics_schema_version": TRAINING_DIAGNOSTICS_SCHEMA_VERSION,
         "actor_ratio_mode": actor_ratio_mode,
+        "agent_credit_mode": agent_credit_mode,
         "record_type": None,
         "telemetry_scope": None,
         "series_index": None,
@@ -206,6 +220,7 @@ def _base_record(config: RunConfig, signal_gate_status: str) -> dict[str, Any]:
         **{column: None for column in _ROUTE_SAMPLE_COLUMNS},
         **{column: None for column in _ROUTE_OUTCOME_COLUMNS},
         **{column: None for column in _BRANCH_ACTIVITY_COLUMNS},
+        **{column: None for column in _AGENT_CREDIT_COLUMNS},
         "signal_gate_status": signal_gate_status,
     }
 
@@ -336,6 +351,32 @@ def _ppo_epoch_records(
                     telemetry_record.pop("schema_version")
                 )
                 record.update(telemetry_record)
+            if epoch.agent_credit_telemetry is not None:
+                credit = epoch.agent_credit_telemetry
+                record.update(
+                    {
+                        "agent_value_mean": list(credit.per_agent_value_mean),
+                        "agent_td_residual_mean": list(
+                            credit.per_agent_td_residual_mean
+                        ),
+                        "agent_advantage_mean": list(
+                            credit.per_agent_advantage_mean
+                        ),
+                        "agent_return_mean": list(credit.per_agent_return_mean),
+                        "same_timestep_advantage_equality_rate": (
+                            credit.same_timestep_advantage_equality_rate
+                        ),
+                        "route_category_agent_advantage_mean": {
+                            key: list(values)
+                            for key, values in (
+                                credit.route_category_agent_advantage_mean.items()
+                            )
+                        },
+                        "per_head_critic_loss": list(
+                            credit.per_head_critic_loss
+                        ),
+                    }
+                )
             records.append(record)
     return _add_route_rolling_aggregates(records)
 
@@ -550,13 +591,22 @@ def _csv_text(records: list[dict[str, Any]]) -> str:
     csv_records = []
     for record in records:
         normalized = dict(record)
-        matrix = normalized.get("branch_activity_matrix")
-        if matrix is not None:
-            normalized["branch_activity_matrix"] = json.dumps(
-                matrix,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
+        for name in (
+            "branch_activity_matrix",
+            "agent_value_mean",
+            "agent_td_residual_mean",
+            "agent_advantage_mean",
+            "agent_return_mean",
+            "route_category_agent_advantage_mean",
+            "per_head_critic_loss",
+        ):
+            value = normalized.get(name)
+            if value is not None:
+                normalized[name] = json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
         csv_records.append(normalized)
     writer.writerows(csv_records)
     return stream.getvalue()
@@ -727,6 +777,11 @@ def _training_summary(
                 "value",
                 config.training.mappo.actor_ratio_mode,
             ),
+            "agent_credit_mode": getattr(
+                config.training.mappo.agent_credit_mode,
+                "value",
+                config.training.mappo.agent_credit_mode,
+            ),
             "total_environment_transitions": training.total_environment_transitions,
             "optimized_transitions": training.optimized_transitions,
             "unused_final_tail_transitions": training.unused_final_tail_transitions,
@@ -762,6 +817,41 @@ def _training_summary(
             "clip_fraction_mean": _mean_present(epoch.clip_fraction for epoch in ppo_epochs),
             "actor_grad_norm_before_clip_mean": ppo.actor_grad_norm_before_clip.mean,
             "critic_grad_norm_before_clip_mean": ppo.critic_grad_norm_before_clip.mean,
+            "agent_credit_latest": (
+                None
+                if not ppo_epochs
+                or ppo_epochs[-1].agent_credit_telemetry is None
+                else {
+                    "per_agent_value_mean": list(
+                        ppo_epochs[-1].agent_credit_telemetry.per_agent_value_mean
+                    ),
+                    "per_agent_td_residual_mean": list(
+                        ppo_epochs[-1].agent_credit_telemetry.per_agent_td_residual_mean
+                    ),
+                    "per_agent_advantage_mean": list(
+                        ppo_epochs[-1].agent_credit_telemetry.per_agent_advantage_mean
+                    ),
+                    "per_agent_return_mean": list(
+                        ppo_epochs[-1].agent_credit_telemetry.per_agent_return_mean
+                    ),
+                    "same_timestep_advantage_equality_rate": (
+                        ppo_epochs[-1]
+                        .agent_credit_telemetry
+                        .same_timestep_advantage_equality_rate
+                    ),
+                    "route_category_agent_advantage_mean": {
+                        key: list(values)
+                        for key, values in (
+                            ppo_epochs[-1]
+                            .agent_credit_telemetry
+                            .route_category_agent_advantage_mean.items()
+                        )
+                    },
+                    "per_head_critic_loss": list(
+                        ppo_epochs[-1].agent_credit_telemetry.per_head_critic_loss
+                    ),
+                }
+            ),
         },
         "route_telemetry": _route_telemetry_summary(training),
         "dashboard": {

@@ -22,7 +22,7 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
-from ..config import RunConfig, STREAM_IDS
+from ..config import AgentCreditMode, RunConfig, STREAM_IDS
 from ..env.actions import ActionProposal
 from ..env.observation import ActorObservation, BRANCH_ORDER, QueueSummary
 from ..env.state import CentralizedState
@@ -1154,11 +1154,19 @@ class CAGATMAPPOActor(nn.Module):
 
 
 class MAPPOCentralizedCritic(nn.Module):
-    """Scalar value network over the decision-time global state encoding."""
+    """Centralized value network with a legacy scalar or per-agent head."""
 
     def __init__(self, config: RunConfig) -> None:
         super().__init__()
         self.spec = MAPPOTensorSpec.from_config(config)
+        self.agent_credit_mode = AgentCreditMode(
+            config.training.mappo.agent_credit_mode
+        )
+        self.output_dimension = (
+            1
+            if self.agent_credit_mode is AgentCreditMode.TEAM
+            else self.spec.uav_count
+        )
         hidden = self.spec.encoder_hidden_dimension
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(_derived_torch_seed(config.seed))
@@ -1166,15 +1174,17 @@ class MAPPOCentralizedCritic(nn.Module):
                 nn.Linear(self.spec.centralized_state_dim, hidden),
                 nn.LeakyReLU(),
                 nn.LayerNorm(hidden),
-                nn.Linear(hidden, 1),
+                nn.Linear(hidden, self.output_dimension),
             )
 
     def forward(self, batch: CentralizedStateTensorBatch | Tensor) -> Tensor:
         features = batch.features if isinstance(batch, CentralizedStateTensorBatch) else batch
         CentralizedStateTensorBatch(features).validate(self.spec)
         values = self.value_network(features)
-        if values.shape != (*features.shape[:2], 1):
-            raise MAPPONetworkError("critic output must be [batch,time,1]")
+        if values.shape != (*features.shape[:2], self.output_dimension):
+            raise MAPPONetworkError(
+                "critic output head count differs from agent_credit_mode"
+            )
         if not torch.isfinite(values).all():
             raise MAPPONetworkError("critic value contains NaN or Inf")
         return values

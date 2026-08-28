@@ -17,6 +17,7 @@ import torch
 from torch import Tensor
 
 from ..config import (
+    AgentCreditMode,
     CHECKPOINT_KIND_FINAL_COMPLETED,
     CHECKPOINT_KIND_PERIODIC_RESUME,
     CHECKPOINT_V1_DIAGNOSTICS_STATE_FIELDS,
@@ -32,6 +33,7 @@ from ..config import (
 )
 from ..env.environment import ResetResult, StepResult, U2UMECEnvironment
 from ..env.randomness import derive_training_episode_seed
+from ..env.reward import AGENT_REWARD_CONSERVATION_TOLERANCE
 from .ca_gat_mappo import (
     ActorObservationTensorizer,
     CAGATMAPPOActor,
@@ -828,7 +830,48 @@ class CAGATMAPPOTrainer:
             raise CAGATMAPPOTrainerError(
                 "non-boundary transition requires the real next state"
             )
+        if (
+            AgentCreditMode(self.config.training.mappo.agent_credit_mode)
+            is AgentCreditMode.ROLE_DECOMPOSED
+        ):
+            self._agent_reward_from_step(result)
         return boundary
+
+    def _agent_reward_from_step(self, result: StepResult) -> Tensor:
+        raw = result.info.get("agent_reward")
+        if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+            raise CAGATMAPPOTrainerError(
+                "role_decomposed StepResult.info requires agent_reward[A]"
+            )
+        if len(raw) != self.actor.spec.uav_count:
+            raise CAGATMAPPOTrainerError(
+                "StepResult agent_reward shape differs from the agent count"
+            )
+        values = tuple(
+            _finite(value, f"StepResult.info.agent_reward[{index}]")
+            for index, value in enumerate(raw)
+        )
+        residual = math.fsum(values) - _finite(
+            result.reward, "StepResult.reward"
+        )
+        if abs(residual) > AGENT_REWARD_CONSERVATION_TOLERANCE:
+            raise CAGATMAPPOTrainerError(
+                "StepResult agent_reward violates team-reward conservation"
+            )
+        credit = result.info.get("agent_credit")
+        if not isinstance(credit, Mapping):
+            raise CAGATMAPPOTrainerError(
+                "role_decomposed StepResult.info requires agent_credit telemetry"
+            )
+        declared_residual = _finite(
+            credit.get("conservation_residual"),
+            "StepResult.info.agent_credit.conservation_residual",
+        )
+        if abs(declared_residual) > AGENT_REWARD_CONSERVATION_TOLERANCE:
+            raise CAGATMAPPOTrainerError(
+                "agent credit telemetry reports a conservation violation"
+            )
+        return torch.tensor(values, dtype=self.dtype, device=self.device)
 
     @staticmethod
     def _execution_metadata(
@@ -1224,7 +1267,15 @@ class CAGATMAPPOTrainer:
                     hidden_in,
                     generator=self.policy_generator,
                 )
-                old_value: Tensor = self.critic(state_batch)[0, 0, 0]
+                raw_old_value = self.critic(state_batch)
+                credit_mode = AgentCreditMode(
+                    self.config.training.mappo.agent_credit_mode
+                )
+                old_value: Tensor = (
+                    raw_old_value[0, 0, 0]
+                    if credit_mode is AgentCreditMode.TEAM
+                    else raw_old_value[0, 0]
+                )
 
             proposals = tuple(action_output.proposals[0][0])
             step_result = environment.step(proposals)
@@ -1254,12 +1305,20 @@ class CAGATMAPPOTrainer:
                     dtype=self.dtype,
                 )
                 with torch.no_grad():
-                    bootstrap_value = self.critic(next_state_batch)[
-                        0, 0, 0
-                    ]
+                    raw_bootstrap = self.critic(next_state_batch)
+                    bootstrap_value = (
+                        raw_bootstrap[0, 0, 0]
+                        if credit_mode is AgentCreditMode.TEAM
+                        else raw_bootstrap[0, 0]
+                    )
 
             executed, rejections = self._execution_metadata(
                 step_result.info
+            )
+            rollout_reward: Tensor | float = (
+                step_result.reward
+                if credit_mode is AgentCreditMode.TEAM
+                else self._agent_reward_from_step(step_result)
             )
             self.rollout_buffer.append_step(
                 slot=slot,
@@ -1269,7 +1328,7 @@ class CAGATMAPPOTrainer:
                 hidden_in=hidden_in,
                 centralized_state=state_batch,
                 old_value=old_value,
-                reward=step_result.reward,
+                reward=rollout_reward,
                 terminated=step_result.terminated,
                 truncated=step_result.truncated,
                 episode_boundary=boundary,

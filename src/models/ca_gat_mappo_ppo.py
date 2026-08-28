@@ -13,7 +13,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from ..config import ActorRatioMode, RunConfig
+from ..config import ActorRatioMode, AgentCreditMode, RunConfig
 
 
 class PPOObjectiveError(ValueError):
@@ -99,6 +99,8 @@ class PPOObjectiveDiagnostics:
     surrogate_mean: float
     value_squared_error_mean: float
     entropy_mean: float
+    per_head_critic_loss: tuple[float, ...] = ()
+    same_timestep_advantage_equality_rate: float | None = None
 
     def __post_init__(self) -> None:
         if self.valid_timestep_count <= 0 or self.valid_actor_position_count <= 0:
@@ -117,6 +119,18 @@ class PPOObjectiveDiagnostics:
             raise PPOObjectiveError("PPO diagnostics contain NaN or Inf")
         if not 0.0 <= self.clipped_fraction <= 1.0:
             raise PPOObjectiveError("clipped_fraction must lie in [0, 1]")
+        if any(
+            not math.isfinite(value) or value < 0.0
+            for value in self.per_head_critic_loss
+        ):
+            raise PPOObjectiveError("per_head_critic_loss must be finite and non-negative")
+        if self.same_timestep_advantage_equality_rate is not None and not (
+            math.isfinite(self.same_timestep_advantage_equality_rate)
+            and 0.0 <= self.same_timestep_advantage_equality_rate <= 1.0
+        ):
+            raise PPOObjectiveError(
+                "same_timestep_advantage_equality_rate must lie in [0, 1]"
+            )
 
 
 @dataclass(frozen=True)
@@ -142,6 +156,7 @@ class CAGATMAPPOLossOutput:
     entropy_coefficient: float
     diagnostics: PPOObjectiveDiagnostics
     actor_ratio_mode: str = ActorRatioMode.JOINT.value
+    agent_credit_mode: str = AgentCreditMode.TEAM.value
     branch_log_ratio: Tensor | None = None
     branch_ratio: Tensor | None = None
     branch_clipped_ratio: Tensor | None = None
@@ -197,6 +212,10 @@ class CAGATMAPPOLossOutput:
             ratio_mode = ActorRatioMode(self.actor_ratio_mode)
         except (TypeError, ValueError) as exc:
             raise PPOObjectiveError("actor_ratio_mode is invalid") from exc
+        try:
+            AgentCreditMode(self.agent_credit_mode)
+        except (TypeError, ValueError) as exc:
+            raise PPOObjectiveError("agent_credit_mode is invalid") from exc
         branch_tensors = (
             self.branch_log_ratio,
             self.branch_ratio,
@@ -271,6 +290,7 @@ def compute_ppo_objective_and_loss(
     value_coefficient: float,
     entropy_coefficient: float,
     actor_ratio_mode: str = ActorRatioMode.JOINT.value,
+    agent_credit_mode: str = AgentCreditMode.TEAM.value,
     new_branch_log_probs: Tensor | None = None,
     old_branch_log_probs: Tensor | None = None,
     active_branch_indicators: Tensor | None = None,
@@ -288,6 +308,12 @@ def compute_ppo_objective_and_loss(
     except (TypeError, ValueError) as exc:
         raise PPOObjectiveError(
             "actor_ratio_mode must be 'joint' or 'branch_specific'"
+        ) from exc
+    try:
+        credit_mode = AgentCreditMode(agent_credit_mode)
+    except (TypeError, ValueError) as exc:
+        raise PPOObjectiveError(
+            "agent_credit_mode must be 'team' or 'role_decomposed'"
         ) from exc
 
     epsilon = _finite_coefficient(
@@ -309,9 +335,10 @@ def compute_ppo_objective_and_loss(
 
     new_log_prob = _floating_tensor(new_joint_log_prob, "new_joint_log_prob", 2)
     old_log_prob = _floating_tensor(old_joint_log_prob, "old_joint_log_prob", 2)
-    raw_advantage = _floating_tensor(advantage, "advantage", 1)
-    values = _floating_tensor(current_value, "current_value", 1)
-    targets = _floating_tensor(return_target, "return_target", 1)
+    credit_rank = 1 if credit_mode is AgentCreditMode.TEAM else 2
+    raw_advantage = _floating_tensor(advantage, "advantage", credit_rank)
+    values = _floating_tensor(current_value, "current_value", credit_rank)
+    targets = _floating_tensor(return_target, "return_target", credit_rank)
     active_entropy = _floating_tensor(entropy, "entropy", 2)
 
     time_steps, agent_count = new_log_prob.shape
@@ -321,13 +348,20 @@ def compute_ppo_objective_and_loss(
         raise PPOObjectiveError("new and old joint log-prob must share shape [T,A]")
     if active_entropy.shape != new_log_prob.shape:
         raise PPOObjectiveError("entropy must share the policy shape [T,A]")
+    expected_credit_shape = (
+        (time_steps,)
+        if credit_mode is AgentCreditMode.TEAM
+        else (time_steps, agent_count)
+    )
     for name, tensor in (
         ("advantage", raw_advantage),
         ("current_value", values),
         ("return_target", targets),
     ):
-        if tensor.shape != (time_steps,):
-            raise PPOObjectiveError(f"{name} must align with the policy time axis [T]")
+        if tensor.shape != expected_credit_shape:
+            raise PPOObjectiveError(
+                f"{name} shape differs from agent_credit_mode"
+            )
     floating_inputs = (
         old_log_prob,
         raw_advantage,
@@ -353,9 +387,10 @@ def compute_ppo_objective_and_loss(
     fixed_old_log_prob = old_log_prob.detach()
     fixed_advantage = raw_advantage.detach()
     fixed_return_target = targets.detach()
-    expanded_advantage = fixed_advantage.reshape(time_steps, 1).expand(
-        time_steps,
-        agent_count,
+    expanded_advantage = (
+        fixed_advantage.reshape(time_steps, 1).expand(time_steps, agent_count)
+        if credit_mode is AgentCreditMode.TEAM
+        else fixed_advantage
     )
     branch_log_ratio = None
     branch_ratio = None
@@ -487,9 +522,16 @@ def compute_ppo_objective_and_loss(
     actor_loss = -clipped_objective
 
     value_squared_error = (values - fixed_return_target).square()
+    critic_element_mask = (
+        critic_valid_mask
+        if credit_mode is AgentCreditMode.TEAM
+        else critic_valid_mask.reshape(time_steps, 1).expand(
+            time_steps, agent_count
+        )
+    )
     critic_loss = 0.5 * _masked_mean(
         value_squared_error,
-        critic_valid_mask,
+        critic_element_mask,
         "critic_loss",
     )
     entropy_mean = _masked_mean(active_entropy, actor_valid_mask, "entropy_mean")
@@ -519,7 +561,34 @@ def compute_ppo_objective_and_loss(
         )
         diagnostic_denominator = actor_diagnostic_mask.sum()
     valid_surrogate = surrogate.masked_select(actor_valid_mask).detach()
-    valid_value_error = value_squared_error.masked_select(critic_valid_mask).detach()
+    valid_value_error = value_squared_error.masked_select(critic_element_mask).detach()
+    per_head_critic_loss: tuple[float, ...] = ()
+    advantage_equality_rate = None
+    if credit_mode is AgentCreditMode.ROLE_DECOMPOSED:
+        per_head_critic_loss = tuple(
+            float(
+                (
+                    0.5
+                    * value_squared_error[:, agent_index]
+                    .masked_select(critic_valid_mask)
+                    .mean()
+                )
+                .detach()
+                .cpu()
+                .item()
+            )
+            for agent_index in range(agent_count)
+        )
+        valid_advantage = fixed_advantage[critic_valid_mask]
+        equality = torch.isclose(
+            valid_advantage,
+            valid_advantage[:, :1],
+            rtol=0.0,
+            atol=1.0e-7,
+        ).all(dim=-1)
+        advantage_equality_rate = float(
+            equality.to(dtype=torch.float32).mean().cpu().item()
+        )
     diagnostics = PPOObjectiveDiagnostics(
         valid_timestep_count=int(critic_valid_mask.sum().item()),
         valid_actor_position_count=int(actor_valid_mask.sum().item()),
@@ -537,6 +606,8 @@ def compute_ppo_objective_and_loss(
         surrogate_mean=float(valid_surrogate.mean().cpu().item()),
         value_squared_error_mean=float(valid_value_error.mean().cpu().item()),
         entropy_mean=float(entropy_mean.detach().cpu().item()),
+        per_head_critic_loss=per_head_critic_loss,
+        same_timestep_advantage_equality_rate=advantage_equality_rate,
     )
 
     return CAGATMAPPOLossOutput(
@@ -559,6 +630,7 @@ def compute_ppo_objective_and_loss(
         entropy_coefficient=entropy_weight,
         diagnostics=diagnostics,
         actor_ratio_mode=ratio_mode.value,
+        agent_credit_mode=credit_mode.value,
         branch_log_ratio=branch_log_ratio,
         branch_ratio=branch_ratio,
         branch_clipped_ratio=branch_clipped_ratio,
@@ -602,6 +674,7 @@ def compute_configured_ppo_objective_and_loss(
         value_coefficient=mappo.value_coefficient,
         entropy_coefficient=mappo.entropy_coefficient,
         actor_ratio_mode=mappo.actor_ratio_mode,
+        agent_credit_mode=mappo.agent_credit_mode,
         new_branch_log_probs=new_branch_log_probs,
         old_branch_log_probs=old_branch_log_probs,
         active_branch_indicators=active_branch_indicators,

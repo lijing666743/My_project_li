@@ -216,6 +216,13 @@ class ActorRatioMode(str, Enum):
     BRANCH_SPECIFIC = "branch_specific"
 
 
+class AgentCreditMode(str, Enum):
+    """Select scalar team credit or conservation-preserving role credit."""
+
+    TEAM = "team"
+    ROLE_DECOMPOSED = "role_decomposed"
+
+
 def _installed_distribution_version(name: str) -> str:
     try:
         return importlib.metadata.version(name)
@@ -487,6 +494,7 @@ class MAPPOConfig:
     gae_lambda: float = 0.95
     ppo_clip_epsilon: float = 0.20
     actor_ratio_mode: ActorRatioMode = ActorRatioMode.JOINT
+    agent_credit_mode: AgentCreditMode = AgentCreditMode.TEAM
     entropy_coefficient: float = 0.01
     value_coefficient: float = 0.50
     rollout_length_slots: int = 256
@@ -648,6 +656,14 @@ class RunConfig:
             # selector preserves pre-Fix-4 config hashes and Checkpoint V1
             # identity, while ``branch_specific`` remains canonical.
             mappo.pop("actor_ratio_mode")
+        if (
+            isinstance(mappo, dict)
+            and mappo.get("agent_credit_mode") == AgentCreditMode.TEAM.value
+        ):
+            # ``team`` is the historical scalar reward/value/GAE behavior.
+            # Keep old config hashes and Checkpoint V1 identities unchanged;
+            # role-decomposed credit remains part of the canonical identity.
+            mappo.pop("agent_credit_mode")
         return resolved
 
     def to_dict(self) -> dict[str, Any]:
@@ -872,6 +888,14 @@ class RunConfig:
                 "training.mappo.actor_ratio_mode must be one of "
                 f"{tuple(mode.value for mode in ActorRatioMode)}, "
                 f"got {mappo.actor_ratio_mode!r}"
+            ) from exc
+        try:
+            AgentCreditMode(mappo.agent_credit_mode)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(
+                "training.mappo.agent_credit_mode must be one of "
+                f"{tuple(mode.value for mode in AgentCreditMode)}, "
+                f"got {mappo.agent_credit_mode!r}"
             ) from exc
         if mappo.optimizer != "Adam":
             raise ConfigError("training.mappo.optimizer must be 'Adam'")
@@ -1141,6 +1165,7 @@ def validate_mappo_checkpoint_resume_compatibility(
     training_device: str,
     cuda_available: bool,
     checkpoint_actor_ratio_mode: str | None = None,
+    checkpoint_agent_credit_mode: str | None = None,
 ) -> None:
     """Apply the fail-fast V1 metadata checks without loading checkpoint bytes."""
 
@@ -1174,6 +1199,20 @@ def validate_mappo_checkpoint_resume_compatibility(
         raise ConfigError(
             "checkpoint actor_ratio_mode mismatch; changing between joint and "
             "branch_specific requires a new run"
+        )
+    try:
+        source_credit_mode = AgentCreditMode(
+            AgentCreditMode.TEAM.value
+            if checkpoint_agent_credit_mode is None
+            else checkpoint_agent_credit_mode
+        )
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("checkpoint agent_credit_mode is invalid") from exc
+    target_credit_mode = AgentCreditMode(config.training.mappo.agent_credit_mode)
+    if source_credit_mode != target_credit_mode:
+        raise ConfigError(
+            "checkpoint agent_credit_mode mismatch; changing between team and "
+            "role_decomposed requires a new run"
         )
     if config_hash != config.config_hash:
         raise ConfigError("checkpoint canonical config_hash mismatch")
@@ -1651,6 +1690,7 @@ def _jsonable(value: Any, *, exclude: set[str] | None = None) -> Any:
 
 __all__ = [
     "ActionConfig",
+    "AgentCreditMode",
     "ActorRatioMode",
     "CHECKPOINT_KIND_FINAL_COMPLETED",
     "CHECKPOINT_KIND_PERIODIC_RESUME",

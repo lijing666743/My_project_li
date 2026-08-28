@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from ..config import RunConfig
+from ..config import AgentCreditMode, RunConfig
 from .ca_gat_mappo_rollout import CAGATMAPPORolloutChunk
 
 
@@ -56,6 +56,18 @@ def _bool_vector(tensor: Tensor, name: str) -> Tensor:
     return tensor.detach().to(device="cpu").clone().contiguous()
 
 
+def _float_matrix(tensor: Tensor, name: str) -> Tensor:
+    if not isinstance(tensor, Tensor) or not tensor.is_floating_point():
+        raise GAEComputationError(f"{name} must be a floating tensor")
+    if tensor.ndim != 2:
+        raise GAEComputationError(f"{name} must have shape [T,A]")
+    if tensor.shape[0] == 0 or tensor.shape[1] == 0:
+        raise GAEComputationError("rollout cannot have empty time or agent axes")
+    if not torch.isfinite(tensor).all():
+        raise GAEComputationError(f"{name} contains NaN or Inf")
+    return tensor.detach().to(device="cpu", dtype=torch.float32).clone().contiguous()
+
+
 @dataclass(frozen=True)
 class CAGATMAPPOGAEOutput:
     """Raw shared-team GAE statistics with one scalar per rollout position."""
@@ -89,6 +101,47 @@ class CAGATMAPPOGAEOutput:
                 raise GAEComputationError(f"{name} must use CPU float32 storage")
             if not torch.isfinite(tensor).all():
                 raise GAEComputationError(f"{name} contains NaN or Inf")
+        if torch.any(self.bootstrap_mask & ~self.sequence_mask):
+            raise GAEComputationError("padding positions cannot enable bootstrap")
+
+
+@dataclass(frozen=True)
+class CAGATMAPPOPerAgentGAEOutput:
+    """Role-decomposed GAE with shared [T] boundary masks and [T,A] values."""
+
+    bootstrap_mask: Tensor
+    td_residual: Tensor
+    advantage: Tensor
+    return_target: Tensor
+    sequence_mask: Tensor
+
+    def __post_init__(self) -> None:
+        for name in ("bootstrap_mask", "sequence_mask"):
+            tensor = getattr(self, name)
+            if (
+                not isinstance(tensor, Tensor)
+                or tensor.ndim != 1
+                or tensor.dtype != torch.bool
+                or tensor.device.type != "cpu"
+            ):
+                raise GAEComputationError(f"{name} must be CPU bool [T]")
+        numeric_shape = None
+        for name in ("td_residual", "advantage", "return_target"):
+            tensor = getattr(self, name)
+            if (
+                not isinstance(tensor, Tensor)
+                or tensor.ndim != 2
+                or tensor.dtype != torch.float32
+                or tensor.device.type != "cpu"
+                or not torch.isfinite(tensor).all()
+            ):
+                raise GAEComputationError(f"{name} must be finite CPU float32 [T,A]")
+            numeric_shape = tuple(tensor.shape) if numeric_shape is None else numeric_shape
+            if tuple(tensor.shape) != numeric_shape:
+                raise GAEComputationError("per-agent GAE values must share [T,A]")
+        assert numeric_shape is not None
+        if numeric_shape[0] != self.sequence_mask.shape[0]:
+            raise GAEComputationError("GAE mask and value time axes differ")
         if torch.any(self.bootstrap_mask & ~self.sequence_mask):
             raise GAEComputationError("padding positions cannot enable bootstrap")
 
@@ -208,10 +261,100 @@ def compute_gae_and_returns(
     )
 
 
+def compute_per_agent_gae_and_returns(
+    *,
+    reward: Tensor,
+    old_value: Tensor,
+    bootstrap_value: Tensor,
+    terminated: Tensor,
+    truncated: Tensor,
+    episode_boundary: Tensor,
+    bootstrap_allowed: Tensor,
+    gamma: float,
+    gae_lambda: float,
+    sequence_mask: Tensor | None = None,
+) -> CAGATMAPPOPerAgentGAEOutput:
+    """Compute deterministic per-agent GAE without silent broadcasting."""
+
+    resolved_gamma = _coefficient(gamma, "gamma", include_zero=False)
+    resolved_lambda = _coefficient(gae_lambda, "gae_lambda", include_zero=True)
+    rewards = _float_matrix(reward, "reward")
+    values = _float_matrix(old_value, "old_value")
+    next_values = _float_matrix(bootstrap_value, "bootstrap_value")
+    if values.shape != rewards.shape or next_values.shape != rewards.shape:
+        raise GAEComputationError(
+            "reward, old_value, and bootstrap_value must share [T,A]"
+        )
+    terminated_mask = _bool_vector(terminated, "terminated")
+    truncated_mask = _bool_vector(truncated, "truncated")
+    boundaries = _bool_vector(episode_boundary, "episode_boundary")
+    allowed = _bool_vector(bootstrap_allowed, "bootstrap_allowed")
+    valid = (
+        torch.ones_like(boundaries)
+        if sequence_mask is None
+        else _bool_vector(sequence_mask, "sequence_mask")
+    )
+    time_steps = rewards.shape[0]
+    flags = (terminated_mask, truncated_mask, boundaries, allowed, valid)
+    if any(tensor.shape != (time_steps,) for tensor in flags):
+        raise GAEComputationError("boundary inputs must align with the [T,A] time axis")
+    valid_length = int(valid.sum().item())
+    if valid_length == 0:
+        raise GAEComputationError("rollout sequence has no valid positions")
+    expected_valid = torch.arange(time_steps) < valid_length
+    if not torch.equal(valid, expected_valid):
+        raise GAEComputationError("sequence_mask must describe one contiguous prefix")
+    padding = ~valid
+    combined_flags = terminated_mask | truncated_mask | boundaries | allowed
+    if torch.any(combined_flags & padding):
+        raise GAEComputationError("padding positions must not carry boundary flags")
+    if torch.any(terminated_mask & truncated_mask & valid):
+        raise GAEComputationError("terminated and truncated must remain distinct")
+    if not torch.equal(boundaries[valid], (terminated_mask | truncated_mask)[valid]):
+        raise GAEComputationError("episode_boundary must equal terminated or truncated")
+    if not torch.equal(allowed[valid], ~boundaries[valid]):
+        raise GAEComputationError(
+            "bootstrap is allowed exactly on non-boundary transitions"
+        )
+
+    bootstrap_mask = valid & allowed & ~boundaries
+    bootstrap_float = bootstrap_mask.to(dtype=torch.float32).unsqueeze(-1)
+    raw_residual = rewards + resolved_gamma * bootstrap_float * next_values - values
+    td_residual = torch.where(
+        valid.unsqueeze(-1), raw_residual, torch.zeros_like(raw_residual)
+    )
+    advantage = torch.zeros_like(td_residual)
+    next_advantage = torch.zeros(rewards.shape[1], dtype=torch.float32)
+    recurrence_scale = resolved_gamma * resolved_lambda
+    for index in range(valid_length - 1, -1, -1):
+        advantage[index] = (
+            td_residual[index]
+            + recurrence_scale * bootstrap_float[index] * next_advantage
+        )
+        next_advantage = advantage[index]
+    return_target = torch.where(
+        valid.unsqueeze(-1), advantage + values, torch.zeros_like(advantage)
+    )
+    for name, tensor in (
+        ("td_residual", td_residual),
+        ("advantage", advantage),
+        ("return_target", return_target),
+    ):
+        if not torch.isfinite(tensor).all():
+            raise GAEComputationError(f"{name} contains NaN or Inf")
+    return CAGATMAPPOPerAgentGAEOutput(
+        bootstrap_mask=bootstrap_mask,
+        td_residual=td_residual,
+        advantage=advantage,
+        return_target=return_target,
+        sequence_mask=valid,
+    )
+
+
 def compute_rollout_gae(
     chunk: CAGATMAPPORolloutChunk,
     config: RunConfig,
-) -> CAGATMAPPOGAEOutput:
+) -> CAGATMAPPOGAEOutput | CAGATMAPPOPerAgentGAEOutput:
     """Adapt one validated rollout chunk to the frozen GAE computation."""
 
     if not isinstance(chunk, CAGATMAPPORolloutChunk):
@@ -228,6 +371,19 @@ def compute_rollout_gae(
                 "the fixed-horizon final service slot must be a no-bootstrap boundary"
             )
     mappo = config.training.mappo
+    if AgentCreditMode(mappo.agent_credit_mode) is AgentCreditMode.ROLE_DECOMPOSED:
+        return compute_per_agent_gae_and_returns(
+            reward=chunk.reward,
+            old_value=chunk.old_value,
+            bootstrap_value=chunk.bootstrap_values,
+            terminated=chunk.terminated,
+            truncated=chunk.truncated,
+            episode_boundary=chunk.episode_boundary,
+            bootstrap_allowed=chunk.bootstrap_allowed,
+            gamma=mappo.gamma,
+            gae_lambda=mappo.gae_lambda,
+            sequence_mask=chunk.sequence_mask,
+        )
     return compute_gae_and_returns(
         reward=chunk.reward,
         old_value=chunk.old_value,
@@ -244,7 +400,9 @@ def compute_rollout_gae(
 
 __all__ = [
     "CAGATMAPPOGAEOutput",
+    "CAGATMAPPOPerAgentGAEOutput",
     "GAEComputationError",
     "compute_gae_and_returns",
+    "compute_per_agent_gae_and_returns",
     "compute_rollout_gae",
 ]
