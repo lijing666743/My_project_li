@@ -214,7 +214,7 @@ def _validate_source_compatibility(
 ) -> None:
     if source.get("scenario_id") != config.scenario_id:
         raise EvaluationCheckpointError("checkpoint scenario_id mismatch")
-    current_environment = _jsonable(asdict(config.environment))
+    current_environment = config.resolved_dict()["environment"]
     current_action = _jsonable(asdict(config.action))
     if source.get("environment") != current_environment:
         raise EvaluationCheckpointError(

@@ -15,7 +15,7 @@ from typing import Any
 
 import numpy as np
 
-from ..config import RunConfig
+from ..config import RunConfig, WorkloadTimingMode
 from .actions import ActionProposal
 from .action_history import PreviousActionSnapshot
 from .channel import ChannelSnapshot, PhysicalChannelModel
@@ -28,7 +28,13 @@ from .mobility import MobilityModel, MobilityState
 from .observation import ActorObservation, ObservationBuilder
 from .public_history import PublicMessageHistory, PublicMessageSnapshot
 from .randomness import rng_from_run_config
-from .reward import RewardCalculator, RewardReferences, RewardTerms, RewardWeights
+from .reward import (
+    RewardCalculator,
+    RewardReferences,
+    RewardTerms,
+    RewardWeights,
+    TaskWorkloadSnapshot,
+)
 from .service import PhysicalService, SlotPhysicalResult
 from .state import CentralizedState, CentralizedStateBuilder
 from .tasks import Task, TaskOutcome
@@ -327,7 +333,11 @@ class U2UMECEnvironment:
             settle_deadlines=False,
         )
 
-        routing_records, local_bindings = self._apply_slot_end_routes(
+        (
+            routing_records,
+            local_bindings,
+            route_slot_workload_snapshots,
+        ) = self._apply_slot_end_routes(
             joint,
             slot_start_heads,
         )
@@ -350,6 +360,12 @@ class U2UMECEnvironment:
             all_tasks=self.lifecycle.tasks.values(),
             settled_tasks=settled,
             actual_energy_j=actual_energy_j,
+            workload_snapshots=(
+                route_slot_workload_snapshots
+                if WorkloadTimingMode(self.config.environment.workload_timing_mode)
+                is WorkloadTimingMode.ROUTE_SLOT_PRE_ROUTE
+                else None
+            ),
         )
         slot_outage = self._update_rate_and_outage_history(physical)
         self.channel_history.update_with_measurement(
@@ -747,11 +763,16 @@ class U2UMECEnvironment:
         self,
         proposals: tuple[ActionProposal, ...],
         slot_start_heads: dict[int, Task | None],
-    ) -> tuple[list[dict[str, Any]], tuple[Task, ...]]:
+    ) -> tuple[
+        list[dict[str, Any]],
+        tuple[Task, ...],
+        dict[int, TaskWorkloadSnapshot],
+    ]:
         assert self.lifecycle is not None
         assert self.topology is not None
         records: list[dict[str, Any]] = []
         local_bindings: list[Task] = []
+        workload_snapshots: dict[int, TaskWorkloadSnapshot] = {}
         for proposal in proposals:
             task = slot_start_heads[proposal.uav_id]
             if task is None:
@@ -766,6 +787,9 @@ class U2UMECEnvironment:
                 )
                 continue
             before_bits = float(task.remaining_bits)
+            workload_snapshot = None
+            if proposal.route not in {"idle", "defer"}:
+                workload_snapshot = TaskWorkloadSnapshot.from_task(task)
             self.lifecycle.route_task(
                 task,
                 slot=self.slot,
@@ -774,6 +798,9 @@ class U2UMECEnvironment:
             )
             if proposal.route == "local":
                 local_bindings.append(task)
+            if proposal.route not in {"idle", "defer"}:
+                assert workload_snapshot is not None
+                workload_snapshots[task.task_id] = workload_snapshot
             records.append(
                 {
                     "uav_id": proposal.uav_id,
@@ -787,7 +814,7 @@ class U2UMECEnvironment:
                     "status": task.status.value,
                 }
             )
-        return records, tuple(local_bindings)
+        return records, tuple(local_bindings), workload_snapshots
 
     def _update_rate_and_outage_history(
         self,

@@ -20,6 +20,7 @@ import re
 import subprocess
 import sys
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
+from enum import Enum
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping, Sequence, TypeVar, get_args, get_origin, get_type_hints
@@ -201,6 +202,13 @@ class ConfigError(ValueError):
     """Raised when a config file or CLI override violates the schema."""
 
 
+class WorkloadTimingMode(str, Enum):
+    """Select which task state supplies route-slot workload accounting."""
+
+    LEGACY_POST_ROUTE = "legacy_post_route"
+    ROUTE_SLOT_PRE_ROUTE = "route_slot_pre_route"
+
+
 def _installed_distribution_version(name: str) -> str:
     try:
         return importlib.metadata.version(name)
@@ -323,6 +331,7 @@ class EnvironmentConfig:
     task_deadline_factor_min: float = 1.5
     task_deadline_factor_max: float = 3.0
     arrival_history_window_slots: int = 500
+    workload_timing_mode: WorkloadTimingMode = WorkloadTimingMode.LEGACY_POST_ROUTE
     reward_workload_reference_s: float = 1.0
     reward_task_count_reference: float = 1.0
     reward_completion_weight: float = 1.0
@@ -602,7 +611,7 @@ class RunConfig:
     def resolved_dict(self) -> dict[str, Any]:
         """Return only typed final values used to compute ``config_hash``."""
 
-        return _jsonable(asdict(self), exclude={
+        resolved = _jsonable(asdict(self), exclude={
             "source_config_path",
             "cli_overrides",
             "interactive_overrides",
@@ -610,6 +619,18 @@ class RunConfig:
             "git_commit",
             "git_dirty",
         })
+        environment = resolved.get("environment")
+        if (
+            isinstance(environment, dict)
+            and environment.get("workload_timing_mode")
+            == WorkloadTimingMode.LEGACY_POST_ROUTE.value
+        ):
+            # Preserve the exact pre-Fix-Package-3 canonical payload/hash so an
+            # omitted field in an old config or checkpoint still denotes the
+            # historical reward behavior.  The non-default mode remains part
+            # of the canonical identity.
+            environment.pop("workload_timing_mode")
+        return resolved
 
     def to_dict(self) -> dict[str, Any]:
         """Alias used by callers that need the canonical resolved mapping."""
@@ -713,6 +734,14 @@ class RunConfig:
             if self.method_id not in SUPPORTED_METHODS:
                 raise ConfigError(f"unsupported method for mode {self.mode!r}")
         env = self.environment
+        try:
+            WorkloadTimingMode(env.workload_timing_mode)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(
+                "environment.workload_timing_mode must be one of "
+                f"{tuple(mode.value for mode in WorkloadTimingMode)}, "
+                f"got {env.workload_timing_mode!r}"
+            ) from exc
         if env.episode_horizon <= 0 or env.slot_duration_s <= 0:
             raise ConfigError("episode_horizon and slot_duration_s must be positive")
         if env.uav_count <= 0 or env.height_m <= 0:
@@ -1348,6 +1377,11 @@ def _coerce_dataclass_mapping(mapping: Mapping[str, Any], cls: type[_T], *, path
 
 
 def _coerce_value(value: Any, annotation: Any, path: str) -> Any:
+    if isinstance(annotation, type) and issubclass(annotation, Enum):
+        try:
+            return annotation(value)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"{path} is not a valid {annotation.__name__}") from exc
     nested = _nested_dataclass_type(annotation)
     if nested is not None:
         if not isinstance(value, Mapping):
@@ -1563,6 +1597,8 @@ def _git_metadata() -> tuple[str, str, bool]:
 
 def _jsonable(value: Any, *, exclude: set[str] | None = None) -> Any:
     exclude = exclude or set()
+    if isinstance(value, Enum):
+        return value.value
     if isinstance(value, Mapping):
         return {str(key): _jsonable(item, exclude=exclude) for key, item in value.items() if str(key) not in exclude}
     if isinstance(value, (list, tuple)):
@@ -1608,6 +1644,7 @@ __all__ = [
     "SUPPORTED_MODES",
     "SUPPORTED_SCENARIOS",
     "TrainingConfig",
+    "WorkloadTimingMode",
     "compute_mappo_checkpoint_active_rollout_length",
     "compute_mappo_periodic_checkpoint_steps",
     "mappo_checkpoint_kind_at",
