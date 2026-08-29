@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 
 import torch
 
-from src.config import RunConfig
+from src.config import AgentCreditMode, RunConfig
 from src.env.environment import StepResult, U2UMECEnvironment
 from src.models.ca_gat_mappo import (
     ACTION_BRANCH_ORDER,
@@ -26,6 +26,7 @@ from src.models.ca_gat_mappo_rollout import (
     CAGATMAPPORolloutTransition,
     RolloutStorageError,
 )
+from src.models.ca_gat_mappo_update import build_recurrent_ppo_minibatch
 
 
 def make_rollout_config(
@@ -33,6 +34,7 @@ def make_rollout_config(
     uav_count: int = 4,
     horizon: int = 4,
     arrival_probability: float = 1.0,
+    agent_credit_mode: AgentCreditMode = AgentCreditMode.TEAM,
 ) -> RunConfig:
     base = RunConfig()
     environment = replace(
@@ -49,7 +51,9 @@ def make_rollout_config(
         csi_error_std_db=0.0,
         fixed_csi_aoi_slots=1,
     )
-    config = replace(base, environment=environment)
+    mappo = replace(base.training.mappo, agent_credit_mode=agent_credit_mode)
+    training = replace(base.training, mappo=mappo)
+    config = replace(base, environment=environment, training=training)
     config.validate()
     return config
 
@@ -112,7 +116,15 @@ class RolloutCollectorFixture:
                 mask_batch,
                 hidden_before,
             )
-            old_value = self.critic(critic_batch)[0, 0, 0]
+            raw_old_value = self.critic(critic_batch)
+            credit_mode = AgentCreditMode(
+                self.config.training.mappo.agent_credit_mode
+            )
+            old_value = (
+                raw_old_value[0, 0, 0]
+                if credit_mode is AgentCreditMode.TEAM
+                else raw_old_value[0, 0]
+            )
         slot = self.observations[0].slot
         step = self.environment.step(output.proposals[0][0])
         bootstrap_value = None
@@ -120,7 +132,12 @@ class RolloutCollectorFixture:
             assert step.centralized_state is not None
             next_critic_batch = self.critic_tensorizer.encode_step(step.centralized_state)
             with torch.no_grad():
-                bootstrap_value = self.critic(next_critic_batch)[0, 0, 0]
+                raw_bootstrap = self.critic(next_critic_batch)
+                bootstrap_value = (
+                    raw_bootstrap[0, 0, 0]
+                    if credit_mode is AgentCreditMode.TEAM
+                    else raw_bootstrap[0, 0]
+                )
         transition = CAGATMAPPORolloutTransition.from_step(
             spec=self.actor.spec,
             slot=slot,
@@ -130,7 +147,11 @@ class RolloutCollectorFixture:
             hidden_in=hidden_before,
             centralized_state=critic_batch,
             old_value=old_value,
-            reward=step.reward,
+            reward=(
+                step.reward
+                if credit_mode is AgentCreditMode.TEAM
+                else torch.tensor(step.info["agent_reward"], dtype=torch.float32)
+            ),
             terminated=step.terminated,
             truncated=step.truncated,
             episode_boundary=step.terminated or step.truncated,
@@ -326,6 +347,72 @@ class CAGATMAPPORolloutBufferTests(unittest.TestCase):
         self.assertIsNone(boundary.bootstrap_value)
         with self.assertRaises(RolloutStorageError):
             replace(boundary, bootstrap_value=torch.tensor(1.0))
+
+    def test_role_terminal_in_second_256_chunk_preserves_agent_bootstrap_axis(self) -> None:
+        config = make_rollout_config(
+            horizon=500,
+            agent_credit_mode=AgentCreditMode.ROLE_DECOMPOSED,
+        )
+        first_episode = RolloutCollectorFixture(config)
+        first_transitions = [
+            first_episode.collect().transition
+            for _ in range(config.environment.episode_horizon)
+        ]
+        next_episode = RolloutCollectorFixture(config)
+        transitions = first_transitions[256:] + [
+            next_episode.collect().transition for _ in range(12)
+        ]
+
+        buffer = CAGATMAPPORolloutBuffer(config, capacity=256)
+        for transition in transitions:
+            buffer.append(transition)
+        chunk = buffer.finalize()
+
+        agents = config.environment.uav_count
+        self.assertEqual(chunk.length, 256)
+        self.assertTrue(bool(chunk.episode_boundary[243]))
+        self.assertTrue(bool(chunk.episode_starts[244]))
+        self.assertEqual(tuple(chunk.transitions[243].reward.shape), (agents,))
+        self.assertEqual(tuple(chunk.transitions[243].old_value.shape), (agents,))
+        self.assertIsNone(chunk.transitions[243].bootstrap_value)
+        self.assertEqual(tuple(chunk.bootstrap_values.shape), (256, agents))
+        self.assertTrue(torch.equal(chunk.bootstrap_values[243], torch.zeros(agents)))
+
+        minibatch = build_recurrent_ppo_minibatch(buffer, config)
+        self.assertEqual(tuple(minibatch.advantage.shape), (8, 32, agents))
+        self.assertEqual(tuple(minibatch.return_target.shape), (8, 32, agents))
+
+    def test_short_role_episode_boundary_keeps_terminal_vectors(self) -> None:
+        config = make_rollout_config(
+            horizon=5,
+            agent_credit_mode=AgentCreditMode.ROLE_DECOMPOSED,
+        )
+        collector = RolloutCollectorFixture(config)
+        transitions = [collector.collect().transition for _ in range(5)]
+        buffer = CAGATMAPPORolloutBuffer(config, capacity=5)
+        for transition in transitions:
+            buffer.append(transition)
+        chunk = buffer.finalize()
+
+        agents = config.environment.uav_count
+        self.assertEqual(tuple(chunk.reward.shape), (5, agents))
+        self.assertEqual(tuple(chunk.old_value.shape), (5, agents))
+        self.assertEqual(tuple(chunk.bootstrap_values.shape), (5, agents))
+        self.assertTrue(torch.equal(chunk.bootstrap_values[-1], torch.zeros(agents)))
+
+    def test_team_terminal_boundary_keeps_legacy_scalar_contract(self) -> None:
+        config = make_rollout_config(horizon=5, agent_credit_mode=AgentCreditMode.TEAM)
+        collector = RolloutCollectorFixture(config)
+        transitions = [collector.collect().transition for _ in range(5)]
+        buffer = CAGATMAPPORolloutBuffer(config, capacity=5)
+        for transition in transitions:
+            buffer.append(transition)
+        chunk = buffer.finalize()
+
+        self.assertEqual(tuple(chunk.reward.shape), (5,))
+        self.assertEqual(tuple(chunk.old_value.shape), (5,))
+        self.assertEqual(tuple(chunk.bootstrap_values.shape), (5,))
+        self.assertEqual(chunk.bootstrap_values[-1].shape, torch.Size([]))
 
     def test_non_boundary_requires_finite_bootstrap_value(self) -> None:
         config = make_rollout_config(horizon=2)

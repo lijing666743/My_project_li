@@ -713,13 +713,13 @@ class CAGATMAPPORolloutChunk:
 
     @property
     def bootstrap_values(self) -> Tensor:
-        """Return [T] values with zero placeholders masked by bootstrap_allowed."""
+        """Return [T] or [T,A] values with shape-preserving zero placeholders."""
 
         return torch.stack(
             [
                 item.bootstrap_value
                 if item.bootstrap_value is not None
-                else torch.zeros((), dtype=torch.float32)
+                else torch.zeros_like(item.old_value)
                 for item in self.transitions
             ],
             dim=0,
