@@ -681,6 +681,7 @@ d_{ij}(t)\le R_{\mathrm{cand}}
 $$
 
 其中 $R_{\mathrm{cand}}$ 是候选通信半径，初始值为 500 m，正式实验前结合链路预算校准。主场景不启用 distance hysteresis；每个时隙只依据当前槽初距离直接重算 $\mathcal N_i(t)$，不保存 enter/leave 阈值或邻居成员状态。滞回只能作为主模型之外的扩展，后续实现不得将其作为可选主规则。
+本项目中，上述 500 m 仅表示全局/历史默认参考值；当前 resolved config 将 Small Scenario 的新任务候选邻居图阈值修订为 525 m，Medium/Large 保持 500 m。该阈值不等价于最大通信范围、SINR/rate/outage 阈值或物理链路预算硬截断；已绑定 service-edge 的可用性仍由 channel、SINR、rate、outage 与 executor 语义共同决定。
 
 新任务边只用于决定未绑定任务当前可选的目的 UAV。服务边则保存已经锁定的 $i\rightarrow j$ 关系；即使锁定任务因移动暂时超出新任务候选范围，仍保留其传输队列和剩余 bit，等待链路恢复或按过期规则结算，链路 outage、移动或超出候选范围均不触发目的地变更。outage 不删除已绑定服务边。所有邻居、建筑物路径和信道计算均以 $\mathbf q_i(t)$ 的三维位置为输入。
 

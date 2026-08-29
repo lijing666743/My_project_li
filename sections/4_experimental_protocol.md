@@ -102,6 +102,9 @@ interactive CLI 和 argparse/direct CLI 的区别只在输入方式：
 | minimum task slack clip | 10 slot | Section 2 deadline formula |
 | maximum task slack clip | 150 slot | Section 2 deadline formula |
 
+
+表中 500 m 的候选邻居阈值行表示全局/历史实现默认值。`environment.candidate_neighbor_radius_m` 按场景解析：Small 使用 525 m，Medium 和 Large 保持 500 m；显式 CLI/配置覆盖具有更高优先级。
+
 $F=10^{F_{\mathrm{dB}}/10}$，$P_{\mathrm{noise,RU}}=N_0B_{\mathrm{RU}}F$。所有噪声、功率、SINR 和 rate 计算在同一功率域中完成；不得将 dB 值直接代入线性公式。
 
 ### 4.3.2 三个场景

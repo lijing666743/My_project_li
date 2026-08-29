@@ -418,7 +418,7 @@ class CAGATMAPPOCheckpointContractTests(unittest.TestCase):
     def test_41_sections_two_and_three_remain_frozen(self) -> None:
         self.assertEqual(
             _git_blob_sha1(SECTION_2),
-            "88852fa9d02c67f19183fc6cb499edb49ee89c3d",
+            "50412164c3b14eea57c1e6d80860fc33a0214009",
         )
         self.assertEqual(
             _git_blob_sha1(SECTION_3),

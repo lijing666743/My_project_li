@@ -1256,6 +1256,7 @@ def require_formal_rl_enabled(config: RunConfig) -> None:
 SCENARIO_DEFAULTS: dict[str, dict[str, Any]] = {
     "small": {
         "uav_count": 4,
+        "candidate_neighbor_radius_m": 525.0,
         "arrival_probabilities": [0.04, 0.05, 0.06, 0.05],
         "profile_assignment": ["Balanced", "Resource-poor", "Compute-rich", "Energy-limited"],
         "profile_perturbations": [
@@ -1267,6 +1268,7 @@ SCENARIO_DEFAULTS: dict[str, dict[str, Any]] = {
     },
     "medium": {
         "uav_count": 6,
+        "candidate_neighbor_radius_m": 500.0,
         "arrival_probabilities": [0.03, 0.04, 0.05, 0.06, 0.05, 0.07],
         "profile_assignment": [
             "Balanced", "Resource-poor", "Compute-rich", "Energy-limited", "Communication-rich", "Balanced"
@@ -1282,6 +1284,7 @@ SCENARIO_DEFAULTS: dict[str, dict[str, Any]] = {
     },
     "large": {
         "uav_count": 8,
+        "candidate_neighbor_radius_m": 500.0,
         "arrival_probabilities": [0.02, 0.04, 0.06, 0.08, 0.02, 0.04, 0.06, 0.08],
         "profile_assignment": [
             "Resource-poor", "Balanced", "Compute-rich", "Energy-limited", "Communication-rich",
