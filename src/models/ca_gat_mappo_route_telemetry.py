@@ -11,13 +11,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field, fields
 import math
 from statistics import median
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import torch
 from torch import Tensor, nn
 
-from ..config import ActorRatioMode
+from ..config import ActorRatioMode, RunConfig, WorkloadTimingMode
 from ..env.actions import ActionProposal
+from ..env.reward import TaskWorkloadSnapshot
+from ..env.tasks import Task, TaskOutcome
 from .ca_gat_mappo import ACTION_BRANCH_ORDER
 from .ca_gat_mappo_actions import (
     SequentialActionDistributionOutput,
@@ -26,6 +28,9 @@ from .ca_gat_mappo_actions import (
 
 
 ROUTE_TELEMETRY_SCHEMA_VERSION = 3
+TRAJECTORY_CREDIT_SCHEMA_VERSION = 1
+TRAJECTORY_CREDIT_EVENT_TYPES = ("route", "terminal", "credit")
+TRAJECTORY_LEDGER_TOLERANCE = 1.0e-9
 ROUTE_GRADIENT_STATUSES = ("none", "zero", "finite_nonzero", "nonfinite")
 ROUTE_ACTION_CATEGORIES = ("local", "remote", "defer")
 ROUTE_DISTRIBUTION_GROUPS = (
@@ -1719,6 +1724,909 @@ class RouteOutcomeTracker:
         return tuple(result)
 
 
+@dataclass(frozen=True)
+class TrajectoryPreStepCapture:
+    """Actor-safe route context captured before one environment transition."""
+
+    episode_id: int
+    route_step: int
+    rollout_index: int
+    route_candidates: Mapping[int, Mapping[str, Any]]
+    workload_snapshots: Mapping[int, TaskWorkloadSnapshot]
+
+    def __post_init__(self) -> None:
+        for name in ("episode_id", "route_step", "rollout_index"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise RouteTelemetryError(f"{name} must be a non-negative integer")
+
+
+@dataclass
+class _TrajectoryTaskLedger:
+    episode_id: int
+    task_id: int
+    source_uav: int
+    initial_task_snapshot: dict[str, Any]
+    latest_task_snapshot: dict[str, Any]
+    route_event_key: tuple[int, int, int] | None = None
+    route_event: dict[str, Any] | None = None
+    cumulative_workload_raw: float = 0.0
+    cumulative_workload_penalty: float = 0.0
+    workload_residual_raw: float = 0.0
+    workload_residual_penalty: float = 0.0
+    completion_component: float = 0.0
+    expiration_penalty: float = 0.0
+    cumulative_tx_bits: float = 0.0
+    cumulative_cpu_cycles: float = 0.0
+    allocated_task_tx_energy: float = 0.0
+    exact_task_cpu_energy: float = 0.0
+    first_tx_step: int | None = None
+    last_tx_step: int | None = None
+    first_cpu_step: int | None = None
+    last_cpu_step: int | None = None
+    terminal_emitted: bool = False
+
+
+class TrajectoryCreditTracker:
+    """Fresh-run-only task/route/reward/PPO sidecar with no control influence."""
+
+    def __init__(
+        self,
+        config: RunConfig,
+        emit: Callable[[Mapping[str, Any]], None],
+    ) -> None:
+        if not isinstance(config, RunConfig):
+            raise TypeError("config must be a RunConfig")
+        if not config.training.mappo.trajectory_credit_telemetry_enabled:
+            raise RouteTelemetryError("trajectory credit tracker requires enabled telemetry")
+        if not callable(emit):
+            raise TypeError("emit must be callable")
+        self.config = config
+        self._emit = emit
+        self._tasks: dict[tuple[int, int], _TrajectoryTaskLedger] = {}
+        self._route_events: dict[tuple[int, int, int], dict[str, Any]] = {}
+        self._route_by_transition_agent: dict[tuple[int, int], tuple[int, int, int]] = {}
+        self._terminal_task_keys: set[tuple[int, int]] = set()
+        self._credit_route_keys: set[tuple[int, int, int]] = set()
+        self._event_counts = {name: 0 for name in TRAJECTORY_CREDIT_EVENT_TYPES}
+        self._team_workload_raw = 0.0
+        self._team_workload_penalty = 0.0
+        self._team_completion_component = 0.0
+        self._team_expiration_penalty = 0.0
+        self._workload_numeric_residual_raw = 0.0
+        self._workload_numeric_residual_penalty = 0.0
+        self._measured_tx_energy = 0.0
+        self._allocated_tx_energy = 0.0
+        self._unattributed_tx_energy = 0.0
+        self._measured_cpu_energy = 0.0
+        self._attributed_cpu_energy = 0.0
+        self._unattributed_cpu_energy = 0.0
+        self._production_measured_energy = 0.0
+        self._energy_numeric_residual = 0.0
+
+    def _common(
+        self,
+        event_type: str,
+        episode_id: int,
+        task_id: int,
+        route_event_key: tuple[int, int, int] | None,
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": TRAJECTORY_CREDIT_SCHEMA_VERSION,
+            "event_type": event_type,
+            "run_id": self.config.run_id,
+            "config_hash": self.config.config_hash,
+            "git_commit": self.config.git_commit,
+            "episode_id": episode_id,
+            "task_id": task_id,
+            "route_event_key": None if route_event_key is None else list(route_event_key),
+        }
+
+    def _write(self, record: Mapping[str, Any]) -> None:
+        event_type = record.get("event_type")
+        if event_type not in TRAJECTORY_CREDIT_EVENT_TYPES:
+            raise RouteTelemetryError("unknown trajectory-credit event type")
+        self._emit(record)
+        self._event_counts[str(event_type)] += 1
+
+    def _ledger_for_task(self, episode_id: int, task: Task) -> _TrajectoryTaskLedger:
+        key = (episode_id, task.task_id)
+        snapshot = task.snapshot()
+        ledger = self._tasks.get(key)
+        if ledger is None:
+            ledger = _TrajectoryTaskLedger(
+                episode_id=episode_id,
+                task_id=task.task_id,
+                source_uav=task.source_uav,
+                initial_task_snapshot=dict(snapshot),
+                latest_task_snapshot=dict(snapshot),
+            )
+            self._tasks[key] = ledger
+        else:
+            ledger.latest_task_snapshot = dict(snapshot)
+        return ledger
+
+    @staticmethod
+    def _selected_link_proxy(observation: Any, destination: int) -> dict[str, Any]:
+        edge = observation.edge_history
+        quality_values = edge.historical_quality[destination]
+        quality_mask = edge.quality_valid_mask[destination]
+        valid_quality = [
+            float(value)
+            for value, valid in zip(quality_values, quality_mask)
+            if bool(valid)
+        ]
+        return {
+            "candidate_neighbor": bool(observation.candidate_neighbor_mask[destination]),
+            "visible": bool(edge.visible_mask[destination]),
+            "estimated_distance_m": float(edge.estimated_distance_m[destination]),
+            "historical_quality_mean": (
+                math.fsum(valid_quality) / len(valid_quality) if valid_quality else None
+            ),
+            "historical_quality_valid_count": len(valid_quality),
+            "csi_valid": bool(edge.csi_valid_mask[destination]),
+            "csi_aoi_slots": (
+                int(edge.csi_aoi_slots[destination])
+                if bool(edge.csi_valid_mask[destination]) else None
+            ),
+            "message_aoi_slots": (
+                int(edge.message_aoi_slots[destination])
+                if bool(edge.message_aoi_valid_mask[destination]) else None
+            ),
+            "message_aoi_valid": bool(edge.message_aoi_valid_mask[destination]),
+            "last_effective_rate_bps": (
+                float(edge.last_effective_rate_bps[destination])
+                if bool(edge.last_rate_valid_mask[destination]) else None
+            ),
+            "last_rate_valid": bool(edge.last_rate_valid_mask[destination]),
+            "outage_rate": (
+                float(edge.outage_rate[destination])
+                if bool(edge.outage_valid_mask[destination]) else None
+            ),
+            "outage_valid": bool(edge.outage_valid_mask[destination]),
+        }
+
+    @staticmethod
+    def _helper_queue_proxy(observation: Any, destination: int) -> dict[str, Any]:
+        public = observation.neighbor_public
+        return {
+            "valid": bool(public.valid_mask[destination]),
+            "task_count": int(public.cpu_load_task_count[destination]),
+            "remaining_cycles": float(public.cpu_load_remaining_cycles[destination]),
+            "message_aoi_slots": (
+                int(public.message_aoi_slots[destination])
+                if bool(public.message_aoi_valid_mask[destination]) else None
+            ),
+            "message_aoi_valid": bool(public.message_aoi_valid_mask[destination]),
+        }
+
+    def capture_pre_step(
+        self,
+        *,
+        episode_id: int,
+        rollout_index: int,
+        observations: Sequence[Any],
+        proposals: Sequence[ActionProposal],
+        route_action_indices: Mapping[int, int],
+        environment: Any,
+    ) -> TrajectoryPreStepCapture:
+        if not observations:
+            raise RouteTelemetryError("trajectory capture requires observations")
+        route_step = int(observations[0].slot)
+        lifecycle = getattr(environment, "lifecycle", None)
+        tasks = getattr(lifecycle, "tasks", None)
+        if not isinstance(tasks, Mapping):
+            raise RouteTelemetryError("telemetry requires environment lifecycle tasks")
+        for task in tasks.values():
+            self._ledger_for_task(episode_id, task)
+        proposal_by_uav = {proposal.uav_id: proposal for proposal in proposals}
+        candidates: dict[int, Mapping[str, Any]] = {}
+        workload_snapshots: dict[int, TaskWorkloadSnapshot] = {}
+        for observation in observations:
+            proposal = proposal_by_uav.get(observation.uav_id)
+            if proposal is None:
+                raise RouteTelemetryError("missing proposal for trajectory capture")
+            destination = proposal.route
+            is_remote = isinstance(destination, int) and not isinstance(destination, bool)
+            if destination != "local" and not is_remote:
+                continue
+            queue = observation.private_queues.unbound
+            if not queue.head_valid_mask:
+                continue
+            task_id = int(queue.head_task_id)
+            task = tasks.get(task_id)
+            if not isinstance(task, Task):
+                raise RouteTelemetryError("route head task is absent from lifecycle")
+            route_domain = tuple(observation.action_masks.route_domain)
+            route_mask = tuple(bool(value) for value in observation.action_masks.route_mask)
+            legal_remote = [
+                value
+                for value, legal in zip(route_domain, route_mask)
+                if legal and isinstance(value, int) and not isinstance(value, bool)
+            ]
+            selected_destination = int(destination) if is_remote else observation.uav_id
+            candidates[observation.uav_id] = {
+                "task_id": task_id,
+                "source_uav": observation.uav_id,
+                "route_category": "remote" if is_remote else "local",
+                "selected_destination_uav": selected_destination,
+                "route_action_index": int(route_action_indices[observation.uav_id]),
+                "task_snapshot": task.snapshot(),
+                "source_queue_proxy": queue.snapshot(),
+                "legal_remote_destinations": list(legal_remote),
+                "legal_route_mask": list(route_mask),
+                "selected_link_proxy_status": "observed" if is_remote else "not_applicable_local",
+                "selected_link_proxy": (
+                    self._selected_link_proxy(observation, selected_destination)
+                    if is_remote else None
+                ),
+                "helper_queue_proxy_status": "observed" if is_remote else "not_applicable_local",
+                "helper_queue_proxy": (
+                    self._helper_queue_proxy(observation, selected_destination)
+                    if is_remote else None
+                ),
+            }
+            workload_snapshots[task_id] = TaskWorkloadSnapshot.from_task(task)
+        return TrajectoryPreStepCapture(
+            episode_id=episode_id,
+            route_step=route_step,
+            rollout_index=rollout_index,
+            route_candidates=candidates,
+            workload_snapshots=workload_snapshots,
+        )
+
+    @staticmethod
+    def _mapping_items(value: Any) -> tuple[Mapping[str, Any], ...]:
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+            return ()
+        return tuple(item for item in value if isinstance(item, Mapping))
+
+    def _observe_routes(
+        self,
+        capture: TrajectoryPreStepCapture,
+        tasks: Mapping[int, Task],
+        service: Mapping[str, Any],
+    ) -> None:
+        for route in self._mapping_items(service.get("routing")):
+            if route.get("applied") is not True:
+                continue
+            source_uav = route.get("uav_id", route.get("source_uav"))
+            if isinstance(source_uav, bool) or not isinstance(source_uav, int):
+                raise RouteTelemetryError("applied route lacks source_uav")
+            candidate = capture.route_candidates.get(source_uav)
+            if candidate is None:
+                raise RouteTelemetryError("applied route lacks pre-step candidate")
+            task_id = route.get("task_id")
+            if task_id != candidate["task_id"]:
+                raise RouteTelemetryError("applied route task differs from pre-step head")
+            task = tasks.get(int(task_id))
+            if not isinstance(task, Task):
+                raise RouteTelemetryError("applied route task is absent after step")
+            key = (capture.episode_id, int(task_id), capture.route_step)
+            ledger = self._ledger_for_task(capture.episode_id, task)
+            if ledger.route_event_key is not None or key in self._route_events:
+                raise RouteTelemetryError("task produced more than one formal route event")
+            task_before = candidate["task_snapshot"]
+            task_after = task.snapshot()
+            event = self._common("route", capture.episode_id, int(task_id), key)
+            event.update({
+                "route_step": capture.route_step,
+                "rollout_index": capture.rollout_index,
+                "source_uav": source_uav,
+                "route_category": candidate["route_category"],
+                "selected_destination_uav": candidate["selected_destination_uav"],
+                "route_action_index": candidate["route_action_index"],
+                "route_status": "applied",
+                "task_arrival_slot": task_before["arrival_slot"],
+                "task_deadline_slot": task_before["deadline_slot"],
+                "task_data_bits_initial": task_before["data_bits"],
+                "task_cpu_cycles_initial": task_before["cpu_cycles"],
+                "remaining_bits_at_route": task_before["remaining_bits"],
+                "remaining_cycles_at_route": task_before["remaining_cycles"],
+                "deadline_slack_slots_at_route": (
+                    int(task_before["deadline_slot"]) - capture.route_step + 1
+                ),
+                "binding_slot": task_after["binding_slot"],
+                "service_eligible_slot": task_after["service_eligible_slot"],
+                "task_status_after_route": task_after["status"],
+                "source_queue_proxy": candidate["source_queue_proxy"],
+                "legal_remote_destinations": candidate["legal_remote_destinations"],
+                "legal_route_mask": candidate["legal_route_mask"],
+                "selected_link_proxy_status": candidate["selected_link_proxy_status"],
+                "selected_link_proxy": candidate["selected_link_proxy"],
+                "helper_queue_proxy_status": candidate["helper_queue_proxy_status"],
+                "helper_queue_proxy": candidate["helper_queue_proxy"],
+                "capture_source": "pre_step_observation_plus_post_step_routing",
+            })
+            ledger.route_event_key = key
+            ledger.route_event = dict(event)
+            self._route_events[key] = dict(event)
+            transition_agent = (capture.rollout_index, source_uav)
+            if transition_agent in self._route_by_transition_agent:
+                raise RouteTelemetryError("transition agent produced duplicate route identity")
+            self._route_by_transition_agent[transition_agent] = key
+            self._write(event)
+
+    def _observe_workload(
+        self,
+        capture: TrajectoryPreStepCapture,
+        environment: Any,
+        info: Mapping[str, Any],
+        tasks: Mapping[int, Task],
+        service: Mapping[str, Any],
+    ) -> None:
+        calculator = getattr(environment, "reward_calculator", None)
+        primitive = getattr(calculator, "_urgent_workload_for_task", None)
+        if not callable(primitive):
+            raise RouteTelemetryError("production workload primitive is unavailable")
+        reward = info.get("reward")
+        if not isinstance(reward, Mapping):
+            raise RouteTelemetryError("trajectory ledger requires reward terms")
+        team_raw = _safe_float(reward.get("urgent_workload_s"))
+        team_penalty = _safe_float(reward.get("workload_penalty"))
+        team_completion = _safe_float(reward.get("completion_component"))
+        team_expiration = _safe_float(reward.get("expiration_penalty"))
+        if any(
+            value is None
+            for value in (
+                team_raw,
+                team_penalty,
+                team_completion,
+                team_expiration,
+            )
+        ):
+            raise RouteTelemetryError("production workload terms are unavailable")
+        arrival = info.get("arrival")
+        arrival_items = (
+            self._mapping_items(arrival.get("tasks"))
+            if isinstance(arrival, Mapping) else ()
+        )
+        arrival_ids = {item.get("task_id") for item in arrival_items}
+        truncated_ids = {
+            item.get("task_id")
+            for item in self._mapping_items(service.get("truncated_tasks"))
+        }
+        route_pre_mode = (
+            WorkloadTimingMode(self.config.environment.workload_timing_mode)
+            is WorkloadTimingMode.ROUTE_SLOT_PRE_ROUTE
+        )
+        coefficient = (
+            calculator.weights.workload
+            / calculator.references.workload_reference_s
+        )
+        task_raw_parts: list[float] = []
+        task_penalty_parts: list[float] = []
+        for task_id in sorted(tasks):
+            task = tasks[task_id]
+            if task_id in arrival_ids:
+                continue
+            if task.outcome is not TaskOutcome.NONE and task_id not in truncated_ids:
+                continue
+            ledger = self._ledger_for_task(capture.episode_id, task)
+            snapshot = (
+                capture.workload_snapshots.get(task_id)
+                if route_pre_mode
+                and ledger.route_event_key
+                == (capture.episode_id, task_id, capture.route_step)
+                else None
+            )
+            raw = float(primitive(task, capture.route_step, snapshot))
+            penalty = coefficient * raw
+            task_raw_parts.append(raw)
+            task_penalty_parts.append(penalty)
+            if ledger.route_event_key is None:
+                ledger.workload_residual_raw += raw
+                ledger.workload_residual_penalty += penalty
+            else:
+                ledger.cumulative_workload_raw += raw
+                ledger.cumulative_workload_penalty += penalty
+        task_raw = math.fsum(task_raw_parts)
+        task_penalty = math.fsum(task_penalty_parts)
+        self._team_workload_raw += team_raw
+        self._team_workload_penalty += team_penalty
+        self._team_completion_component += team_completion
+        self._team_expiration_penalty += team_expiration
+        self._workload_numeric_residual_raw += team_raw - task_raw
+        self._workload_numeric_residual_penalty += team_penalty - task_penalty
+
+    def _observe_energy_and_service(
+        self,
+        capture: TrajectoryPreStepCapture,
+        info: Mapping[str, Any],
+        tasks: Mapping[int, Task],
+        service: Mapping[str, Any],
+    ) -> None:
+        slot_tx = 0.0
+        slot_cpu = 0.0
+        for link in self._mapping_items(service.get("links")):
+            energy = _safe_float(link.get("transmit_energy_j"))
+            if energy is None or energy < 0.0:
+                raise RouteTelemetryError("link TX energy must be finite and non-negative")
+            slot_tx += energy
+            positive: list[tuple[int, float]] = []
+            for item in self._mapping_items(link.get("task_services")):
+                amount = _safe_float(item.get("amount"))
+                task_id = item.get("task_id")
+                if amount is None or amount < 0.0:
+                    raise RouteTelemetryError("TX task service must be non-negative")
+                if amount <= 0.0:
+                    continue
+                task = tasks.get(int(task_id))
+                if not isinstance(task, Task):
+                    raise RouteTelemetryError("TX service task is absent")
+                positive.append((int(task_id), amount))
+                ledger = self._ledger_for_task(capture.episode_id, task)
+                ledger.cumulative_tx_bits += amount
+                if ledger.first_tx_step is None:
+                    ledger.first_tx_step = capture.route_step
+                ledger.last_tx_step = capture.route_step
+            total_bits = math.fsum(amount for _task_id, amount in positive)
+            allocated_parts: list[float] = []
+            if total_bits > 0.0:
+                for task_id, amount in positive:
+                    allocation = energy * amount / total_bits
+                    allocated_parts.append(allocation)
+                    self._tasks[(capture.episode_id, task_id)].allocated_task_tx_energy += allocation
+            allocated = math.fsum(allocated_parts)
+            self._measured_tx_energy += energy
+            self._allocated_tx_energy += allocated
+            self._unattributed_tx_energy += energy - allocated
+        for item in self._mapping_items(service.get("cpu")):
+            energy = _safe_float(item.get("cpu_energy_j"))
+            cycles = _safe_float(item.get("service_cycles"))
+            if energy is None or energy < 0.0 or cycles is None or cycles < 0.0:
+                raise RouteTelemetryError("CPU service telemetry must be non-negative")
+            slot_cpu += energy
+            task_id = item.get("task_id")
+            self._measured_cpu_energy += energy
+            if task_id is None:
+                self._unattributed_cpu_energy += energy
+                continue
+            task = tasks.get(int(task_id))
+            if not isinstance(task, Task):
+                raise RouteTelemetryError("CPU service task is absent")
+            ledger = self._ledger_for_task(capture.episode_id, task)
+            ledger.exact_task_cpu_energy += energy
+            ledger.cumulative_cpu_cycles += cycles
+            self._attributed_cpu_energy += energy
+            if cycles > 0.0:
+                if ledger.first_cpu_step is None:
+                    ledger.first_cpu_step = capture.route_step
+                ledger.last_cpu_step = capture.route_step
+        reward = info.get("reward")
+        production_energy = (
+            _safe_float(reward.get("actual_energy_j"))
+            if isinstance(reward, Mapping) else None
+        )
+        if production_energy is None:
+            raise RouteTelemetryError("production energy term is unavailable")
+        self._production_measured_energy += production_energy
+        self._energy_numeric_residual += production_energy - slot_tx - slot_cpu
+
+    def _workload_ledger_snapshot(self) -> dict[str, Any]:
+        routed_raw = math.fsum(
+            item.cumulative_workload_raw for item in self._tasks.values()
+        )
+        routed_penalty = math.fsum(
+            item.cumulative_workload_penalty for item in self._tasks.values()
+        )
+        residual_raw = math.fsum(
+            item.workload_residual_raw for item in self._tasks.values()
+        )
+        residual_penalty = math.fsum(
+            item.workload_residual_penalty for item in self._tasks.values()
+        )
+        raw_conservation = self._team_workload_raw - math.fsum((
+            routed_raw,
+            residual_raw,
+            self._workload_numeric_residual_raw,
+        ))
+        penalty_conservation = self._team_workload_penalty - math.fsum((
+            routed_penalty,
+            residual_penalty,
+            self._workload_numeric_residual_penalty,
+        ))
+        return {
+            "cumulative_team_workload_raw": self._team_workload_raw,
+            "cumulative_routed_task_workload_raw": routed_raw,
+            "cumulative_workload_residual_raw": residual_raw,
+            "cumulative_numeric_residual_raw": self._workload_numeric_residual_raw,
+            "raw_conservation_residual": raw_conservation,
+            "cumulative_team_workload_penalty": self._team_workload_penalty,
+            "cumulative_routed_task_workload_penalty": routed_penalty,
+            "cumulative_workload_residual_penalty": residual_penalty,
+            "cumulative_numeric_residual_penalty": self._workload_numeric_residual_penalty,
+            "penalty_conservation_residual": penalty_conservation,
+            "status": (
+                "pass"
+                if abs(raw_conservation) <= TRAJECTORY_LEDGER_TOLERANCE
+                and abs(penalty_conservation) <= TRAJECTORY_LEDGER_TOLERANCE
+                else "residual"
+            ),
+        }
+
+    def _energy_ledger_snapshot(self) -> dict[str, Any]:
+        tx_residual = self._measured_tx_energy - math.fsum((
+            self._allocated_tx_energy,
+            self._unattributed_tx_energy,
+        ))
+        cpu_residual = self._measured_cpu_energy - math.fsum((
+            self._attributed_cpu_energy,
+            self._unattributed_cpu_energy,
+        ))
+        production_residual = self._production_measured_energy - math.fsum((
+            self._measured_tx_energy,
+            self._measured_cpu_energy,
+            self._energy_numeric_residual,
+        ))
+        return {
+            "tx_energy_attribution_method": "bits_pro_rata",
+            "tx_energy_attribution_status": "diagnostic_allocation",
+            "production_measured_tx_energy": self._measured_tx_energy,
+            "allocated_task_tx_energy": self._allocated_tx_energy,
+            "unattributed_tx_energy": self._unattributed_tx_energy,
+            "tx_conservation_residual": tx_residual,
+            "cpu_energy_attribution_status": "exact_task_id",
+            "production_measured_cpu_energy": self._measured_cpu_energy,
+            "attributed_task_cpu_energy": self._attributed_cpu_energy,
+            "unattributed_cpu_energy": self._unattributed_cpu_energy,
+            "cpu_conservation_residual": cpu_residual,
+            "production_measured_total_energy": self._production_measured_energy,
+            "production_energy_numeric_residual": self._energy_numeric_residual,
+            "total_conservation_residual": production_residual,
+            "status": (
+                "pass"
+                if max(abs(tx_residual), abs(cpu_residual), abs(production_residual))
+                <= TRAJECTORY_LEDGER_TOLERANCE
+                else "residual"
+            ),
+        }
+
+    def _reward_ledger_snapshot(self) -> dict[str, Any]:
+        task_completion = math.fsum(
+            item.completion_component for item in self._tasks.values()
+        )
+        task_expiration = math.fsum(
+            item.expiration_penalty for item in self._tasks.values()
+        )
+        completion_residual = self._team_completion_component - task_completion
+        expiration_residual = self._team_expiration_penalty - task_expiration
+        return {
+            "cumulative_team_completion_component": self._team_completion_component,
+            "cumulative_task_completion_component": task_completion,
+            "completion_conservation_residual": completion_residual,
+            "cumulative_team_expiration_penalty": self._team_expiration_penalty,
+            "cumulative_task_expiration_penalty": task_expiration,
+            "expiration_conservation_residual": expiration_residual,
+            "status": (
+                "pass"
+                if max(abs(completion_residual), abs(expiration_residual))
+                <= TRAJECTORY_LEDGER_TOLERANCE
+                else "residual"
+            ),
+        }
+
+    def _emit_terminal(
+        self,
+        *,
+        ledger: _TrajectoryTaskLedger,
+        task_snapshot: Mapping[str, Any],
+        observed_transition_step: int,
+        terminal_kind: str,
+        terminal_step: int | None,
+        outcome: str | None,
+        calculator: Any,
+    ) -> None:
+        task_key = (ledger.episode_id, ledger.task_id)
+        if ledger.terminal_emitted or task_key in self._terminal_task_keys:
+            raise RouteTelemetryError("task produced more than one terminal event")
+        completion_component = (
+            calculator.weights.completion / calculator.references.task_count_reference
+            if outcome == TaskOutcome.DONE.value else 0.0
+        )
+        expiration_penalty = (
+            calculator.weights.expiration / calculator.references.task_count_reference
+            if outcome == TaskOutcome.EXPIRED.value else 0.0
+        )
+        energy_scale = (
+            calculator.weights.energy / calculator.references.active_energy_reference_j
+        )
+        route = ledger.route_event or {}
+        ledger.completion_component = completion_component
+        ledger.expiration_penalty = expiration_penalty
+        completion_slot = task_snapshot.get("completion_slot")
+        latency_slots = (
+            int(completion_slot) - int(task_snapshot["arrival_slot"])
+            if outcome == TaskOutcome.DONE.value and completion_slot is not None
+            else None
+        )
+        event = self._common(
+            "terminal", ledger.episode_id, ledger.task_id, ledger.route_event_key
+        )
+        event.update({
+            "route_status": "routed" if ledger.route_event_key is not None else "never_routed",
+            "terminal_kind": terminal_kind,
+            "outcome": outcome,
+            "observed_transition_step": observed_transition_step,
+            "terminal_step": terminal_step,
+            "source_uav": ledger.source_uav,
+            "destination_uav": task_snapshot.get("destination"),
+            "route_category": route.get("route_category"),
+            "route_step": route.get("route_step"),
+            "task_arrival_slot": task_snapshot.get("arrival_slot"),
+            "task_deadline_slot": task_snapshot.get("deadline_slot"),
+            "binding_slot": task_snapshot.get("binding_slot"),
+            "service_eligible_slot": task_snapshot.get("service_eligible_slot"),
+            "cpu_entry_slot": task_snapshot.get("cpu_entry_slot"),
+            "completion_slot": completion_slot,
+            "e2e_delay_slots": latency_slots,
+            "e2e_delay_s": (
+                latency_slots * self.config.environment.slot_duration_s
+                if latency_slots is not None else None
+            ),
+            "first_tx_step": ledger.first_tx_step,
+            "last_tx_step": ledger.last_tx_step,
+            "tx_complete_step": (
+                task_snapshot.get("cpu_entry_slot")
+                if route.get("route_category") == "remote" else None
+            ),
+            "first_cpu_step": ledger.first_cpu_step,
+            "last_cpu_step": ledger.last_cpu_step,
+            "final_remaining_bits": task_snapshot.get("remaining_bits"),
+            "final_remaining_cycles": task_snapshot.get("remaining_cycles"),
+            "cumulative_tx_bits": ledger.cumulative_tx_bits,
+            "cumulative_cpu_cycles": ledger.cumulative_cpu_cycles,
+            "reward_decomposition": {
+                "completion_component": completion_component,
+                "completion_component_signed": completion_component,
+                "expiration_penalty": expiration_penalty,
+                "expiration_component_signed": -expiration_penalty,
+                "cumulative_workload_raw": ledger.cumulative_workload_raw,
+                "cumulative_workload_penalty": ledger.cumulative_workload_penalty,
+                "workload_residual_raw": ledger.workload_residual_raw,
+                "workload_residual_penalty": ledger.workload_residual_penalty,
+                "workload_attribution_status": (
+                    "task_decomposed_with_pre_route_residual"
+                    if ledger.route_event_key is not None else "unrouted_residual"
+                ),
+                "exact_task_cpu_energy": ledger.exact_task_cpu_energy,
+                "cpu_energy_penalty": energy_scale * ledger.exact_task_cpu_energy,
+                "allocated_task_tx_energy": ledger.allocated_task_tx_energy,
+                "tx_energy_penalty_diagnostic": (
+                    energy_scale * ledger.allocated_task_tx_energy
+                ),
+                "tx_energy_attribution_method": "bits_pro_rata",
+                "tx_energy_attribution_status": "diagnostic_allocation",
+            },
+            "workload_ledger": self._workload_ledger_snapshot(),
+            "energy_ledger": self._energy_ledger_snapshot(),
+            "reward_ledger": self._reward_ledger_snapshot(),
+        })
+        ledger.terminal_emitted = True
+        ledger.latest_task_snapshot = dict(task_snapshot)
+        self._terminal_task_keys.add(task_key)
+        self._write(event)
+
+    def _observe_terminals(
+        self,
+        capture: TrajectoryPreStepCapture,
+        environment: Any,
+        info: Mapping[str, Any],
+        tasks: Mapping[int, Task],
+        service: Mapping[str, Any],
+    ) -> None:
+        calculator = environment.reward_calculator
+        for section in ("settled_tasks", "truncated_tasks"):
+            for task_snapshot in self._mapping_items(service.get(section)):
+                task_id = int(task_snapshot["task_id"])
+                task = tasks.get(task_id)
+                if not isinstance(task, Task):
+                    raise RouteTelemetryError("terminal task is absent from lifecycle")
+                ledger = self._ledger_for_task(capture.episode_id, task)
+                outcome = str(task_snapshot.get("outcome"))
+                terminal_step = (
+                    int(info.get("boundary_slot"))
+                    if outcome == TaskOutcome.TRUNCATED.value
+                    else int(task_snapshot["completion_slot"])
+                    if outcome == TaskOutcome.DONE.value
+                    and task_snapshot.get("completion_slot") is not None
+                    else capture.route_step
+                )
+                self._emit_terminal(
+                    ledger=ledger,
+                    task_snapshot=task_snapshot,
+                    observed_transition_step=capture.route_step,
+                    terminal_kind="lifecycle",
+                    terminal_step=terminal_step,
+                    outcome=outcome,
+                    calculator=calculator,
+                )
+
+    def observe_step(
+        self,
+        capture: TrajectoryPreStepCapture,
+        environment: Any,
+        info: Mapping[str, Any],
+    ) -> None:
+        if not isinstance(capture, TrajectoryPreStepCapture):
+            raise TypeError("capture must be TrajectoryPreStepCapture")
+        if not isinstance(info, Mapping) or info.get("slot") != capture.route_step:
+            raise RouteTelemetryError("trajectory step info differs from pre-step capture")
+        lifecycle = getattr(environment, "lifecycle", None)
+        tasks = getattr(lifecycle, "tasks", None)
+        if not isinstance(tasks, Mapping):
+            raise RouteTelemetryError("telemetry requires environment lifecycle tasks")
+        typed_tasks = {
+            int(task_id): task
+            for task_id, task in tasks.items()
+            if isinstance(task, Task)
+        }
+        for task in typed_tasks.values():
+            self._ledger_for_task(capture.episode_id, task)
+        service = info.get("service")
+        if not isinstance(service, Mapping):
+            raise RouteTelemetryError("trajectory step requires service telemetry")
+        self._observe_routes(capture, typed_tasks, service)
+        self._observe_workload(capture, environment, info, typed_tasks, service)
+        self._observe_energy_and_service(capture, info, typed_tasks, service)
+        self._observe_terminals(capture, environment, info, typed_tasks, service)
+
+    def observe_ppo_update(
+        self,
+        output: Any,
+        *,
+        update_index: int,
+        policy_version_before: int,
+        policy_version_after: int,
+        rollout_start_index: int,
+        rollout_length: int,
+    ) -> None:
+        epochs = getattr(output, "epoch_diagnostics", ())
+        if not epochs or getattr(epochs[0], "epoch_index", None) != 0:
+            raise RouteTelemetryError("canonical PPO epoch 0 telemetry is unavailable")
+        route_telemetry = getattr(epochs[0], "route_telemetry", None)
+        samples = (
+            getattr(route_telemetry, "samples", ())
+            if route_telemetry is not None else ()
+        )
+        expected = {
+            key
+            for key, event in self._route_events.items()
+            if rollout_start_index
+            <= int(event["rollout_index"])
+            < rollout_start_index + rollout_length
+        }
+        emitted: set[tuple[int, int, int]] = set()
+        chunk_length = self.config.training.mappo.recurrent_chunk_length_slots
+        for sample in samples:
+            local_index = (
+                int(sample.batch_index) * chunk_length + int(sample.time_index)
+            )
+            global_index = rollout_start_index + local_index
+            key = self._route_by_transition_agent.get(
+                (global_index, int(sample.agent_index))
+            )
+            if key is None:
+                continue
+            route = self._route_events[key]
+            if (
+                sample.category != route["route_category"]
+                or sample.selected_destination_uav
+                != route["selected_destination_uav"]
+                or sample.selected_route_action_index != route["route_action_index"]
+            ):
+                raise RouteTelemetryError("PPO route sample differs from route identity")
+            if key in self._credit_route_keys or key in emitted:
+                raise RouteTelemetryError("route transition produced duplicate PPO credit")
+            event = self._common("credit", key[0], key[1], key)
+            event.update({
+                "route_step": key[2],
+                "rollout_index": route["rollout_index"],
+                "source_uav": route["source_uav"],
+                "route_category": route["route_category"],
+                "selected_destination_uav": route["selected_destination_uav"],
+                "route_action_index": route["route_action_index"],
+                "credit_status": "linked",
+                "ppo_update_index": update_index,
+                "ppo_epoch_index": 0,
+                "policy_version_before": policy_version_before,
+                "policy_version_after": policy_version_after,
+                "advantage": sample.advantage,
+                "td_residual": sample.td_residual,
+                "return_target": sample.return_target,
+                "old_route_log_prob": sample.old_route_log_prob,
+                "new_route_log_prob": sample.new_route_log_prob,
+                "credit_source": "epoch0_route_telemetry",
+                "na_reason": None,
+            })
+            self._write(event)
+            emitted.add(key)
+            self._credit_route_keys.add(key)
+        if emitted != expected:
+            missing = sorted(expected - emitted)
+            raise RouteTelemetryError(
+                f"canonical PPO credit linkage is incomplete; missing={missing}"
+            )
+
+    def finalize_collection(
+        self,
+        *,
+        environment: Any,
+        episode_id: int,
+        observed_transition_step: int,
+        optimized_transitions: int,
+    ) -> Mapping[str, Any]:
+        lifecycle = getattr(environment, "lifecycle", None)
+        tasks = getattr(lifecycle, "tasks", {})
+        calculator = getattr(environment, "reward_calculator", None)
+        if calculator is None:
+            raise RouteTelemetryError("reward calculator is unavailable at finalization")
+        for task in tasks.values():
+            if not isinstance(task, Task):
+                continue
+            ledger = self._ledger_for_task(episode_id, task)
+            if not ledger.terminal_emitted:
+                if task.is_terminal:
+                    raise RouteTelemetryError(
+                        "lifecycle-terminal task lacks its terminal event"
+                    )
+                self._emit_terminal(
+                    ledger=ledger,
+                    task_snapshot=task.snapshot(),
+                    observed_transition_step=observed_transition_step,
+                    terminal_kind="collection_censored",
+                    terminal_step=None,
+                    outcome=None,
+                    calculator=calculator,
+                )
+        for key, route in sorted(
+            self._route_events.items(), key=lambda item: item[1]["rollout_index"]
+        ):
+            if key in self._credit_route_keys:
+                continue
+            if int(route["rollout_index"]) < optimized_transitions:
+                raise RouteTelemetryError("optimized route lacks canonical PPO credit")
+            event = self._common("credit", key[0], key[1], key)
+            event.update({
+                "route_step": key[2],
+                "rollout_index": route["rollout_index"],
+                "source_uav": route["source_uav"],
+                "route_category": route["route_category"],
+                "selected_destination_uav": route["selected_destination_uav"],
+                "route_action_index": route["route_action_index"],
+                "credit_status": "tail_not_optimized",
+                "ppo_update_index": None,
+                "ppo_epoch_index": None,
+                "policy_version_before": None,
+                "policy_version_after": None,
+                "advantage": None,
+                "td_residual": None,
+                "return_target": None,
+                "old_route_log_prob": None,
+                "new_route_log_prob": None,
+                "credit_source": None,
+                "na_reason": "tail_not_optimized",
+            })
+            self._write(event)
+            self._credit_route_keys.add(key)
+        if set(self._route_events) != self._credit_route_keys:
+            raise RouteTelemetryError("route/credit cardinality differs at finalization")
+        return self.summary()
+
+    def summary(self) -> Mapping[str, Any]:
+        return {
+            "schema_version": TRAJECTORY_CREDIT_SCHEMA_VERSION,
+            "event_counts": dict(self._event_counts),
+            "task_count": len(self._tasks),
+            "route_event_count": len(self._route_events),
+            "terminal_event_count": len(self._terminal_task_keys),
+            "credit_event_count": len(self._credit_route_keys),
+            "workload_ledger": self._workload_ledger_snapshot(),
+            "energy_ledger": self._energy_ledger_snapshot(),
+            "reward_ledger": self._reward_ledger_snapshot(),
+        }
+
+
 def aggregate_route_outcomes(
     outcomes: Iterable[RouteOutcomeAssociation],
 ) -> dict[str, object]:
@@ -1762,6 +2670,9 @@ __all__ = [
     "GradientMeasurement",
     "ROUTE_GRADIENT_STATUSES",
     "ROUTE_TELEMETRY_SCHEMA_VERSION",
+    "TRAJECTORY_CREDIT_EVENT_TYPES",
+    "TRAJECTORY_CREDIT_SCHEMA_VERSION",
+    "TRAJECTORY_LEDGER_TOLERANCE",
     "RouteHeadGradientTelemetry",
     "RouteTelemetry",
     "RouteTelemetryError",
@@ -1777,6 +2688,8 @@ __all__ = [
     "RoutePPODynamics",
     "RoutePPODynamicsGroup",
     "RouteSampleTelemetry",
+    "TrajectoryCreditTracker",
+    "TrajectoryPreStepCapture",
     "aggregate_route_outcomes",
     "compute_route_only_ppo_dynamics",
     "compute_branch_ppo_dynamics",

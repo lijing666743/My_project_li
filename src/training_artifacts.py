@@ -12,6 +12,7 @@ import csv
 import io
 import json
 import math
+import os
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -20,6 +21,8 @@ from .artifacts import atomic_write_bytes_group, require_artifact_targets_absent
 from .config import RunConfig, compute_route_entropy_schedule
 from .models.ca_gat_mappo_route_telemetry import (
     ROUTE_TELEMETRY_SCHEMA_VERSION,
+    TRAJECTORY_CREDIT_EVENT_TYPES,
+    TRAJECTORY_CREDIT_SCHEMA_VERSION,
     RouteOutcomeAssociation,
     aggregate_route_outcomes,
     ROUTE_ACTION_CATEGORIES,
@@ -167,6 +170,330 @@ class TrainingArtifactOutcome:
     actor_loss: float
     critic_loss: float
     entropy: float
+
+
+class TrajectoryCreditArtifactError(RuntimeError):
+    """Raised when the append-only trajectory-credit sidecar is invalid."""
+
+
+_FORBIDDEN_ROUTE_OBSERVATION_KEYS = {
+    "channel_imag",
+    "channel_real",
+    "future_csi",
+    "instantaneous_channel",
+    "stale_csi",
+    "true_channel",
+}
+_TRAJECTORY_REQUIRED_FIELDS = {
+    "route": {
+        "route_step",
+        "rollout_index",
+        "source_uav",
+        "route_category",
+        "selected_destination_uav",
+        "route_action_index",
+        "route_status",
+        "source_queue_proxy",
+        "legal_route_mask",
+        "selected_link_proxy_status",
+        "selected_link_proxy",
+        "helper_queue_proxy_status",
+        "helper_queue_proxy",
+    },
+    "terminal": {
+        "route_status",
+        "terminal_kind",
+        "outcome",
+        "observed_transition_step",
+        "terminal_step",
+        "source_uav",
+        "first_tx_step",
+        "last_tx_step",
+        "first_cpu_step",
+        "last_cpu_step",
+        "reward_decomposition",
+        "reward_ledger",
+        "workload_ledger",
+        "energy_ledger",
+    },
+    "credit": {
+        "route_step",
+        "rollout_index",
+        "source_uav",
+        "route_category",
+        "selected_destination_uav",
+        "route_action_index",
+        "credit_status",
+        "ppo_update_index",
+        "ppo_epoch_index",
+        "policy_version_before",
+        "policy_version_after",
+        "advantage",
+        "td_residual",
+        "return_target",
+        "na_reason",
+    },
+}
+
+
+def _nested_mapping_keys(value: Any) -> tuple[str, ...]:
+    keys: list[str] = []
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            keys.append(str(key).lower())
+            keys.extend(_nested_mapping_keys(child))
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            keys.extend(_nested_mapping_keys(child))
+    return tuple(keys)
+
+
+def _trajectory_route_key(record: Mapping[str, Any]) -> tuple[int, int, int] | None:
+    value = record.get("route_event_key")
+    if value is None:
+        return None
+    if (
+        not isinstance(value, list)
+        or len(value) != 3
+        or any(isinstance(item, bool) or not isinstance(item, int) for item in value)
+    ):
+        raise TrajectoryCreditArtifactError(
+            "route_event_key must be null or a three-integer JSON array"
+        )
+    return (value[0], value[1], value[2])
+
+
+def _validate_trajectory_credit_record(
+    config: RunConfig,
+    record: Mapping[str, Any],
+) -> tuple[str, tuple[int, int], tuple[int, int, int] | None]:
+    if not isinstance(record, Mapping):
+        raise TrajectoryCreditArtifactError("trajectory-credit record must be a mapping")
+    if record.get("schema_version") != TRAJECTORY_CREDIT_SCHEMA_VERSION:
+        raise TrajectoryCreditArtifactError("trajectory-credit schema version mismatch")
+    event_type = record.get("event_type")
+    if event_type not in TRAJECTORY_CREDIT_EVENT_TYPES:
+        raise TrajectoryCreditArtifactError("unknown trajectory-credit event type")
+    missing = sorted(_TRAJECTORY_REQUIRED_FIELDS[str(event_type)] - set(record))
+    if missing:
+        raise TrajectoryCreditArtifactError(
+            f"{event_type} event is missing required fields: {missing}"
+        )
+    for name, expected in (
+        ("run_id", config.run_id),
+        ("config_hash", config.config_hash),
+        ("git_commit", config.git_commit),
+    ):
+        if record.get(name) != expected:
+            raise TrajectoryCreditArtifactError(
+                f"trajectory-credit {name} differs from the run identity"
+            )
+    episode_id = record.get("episode_id")
+    task_id = record.get("task_id")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in (episode_id, task_id)
+    ):
+        raise TrajectoryCreditArtifactError(
+            "episode_id and task_id must be non-negative integers"
+        )
+    task_key = (episode_id, task_id)
+    route_key = _trajectory_route_key(record)
+    if route_key is not None and route_key[:2] != task_key:
+        raise TrajectoryCreditArtifactError(
+            "route_event_key episode/task identity is inconsistent"
+        )
+    if event_type in {"route", "credit"} and route_key is None:
+        raise TrajectoryCreditArtifactError(
+            f"{event_type} event requires a route_event_key"
+        )
+    if event_type == "route":
+        if record.get("route_step") != route_key[2]:
+            raise TrajectoryCreditArtifactError(
+                "route event step differs from route_event_key"
+            )
+        forbidden = _FORBIDDEN_ROUTE_OBSERVATION_KEYS.intersection(
+            _nested_mapping_keys(record)
+        )
+        if forbidden:
+            raise TrajectoryCreditArtifactError(
+                "route event contains non-causal channel fields: "
+                + ", ".join(sorted(forbidden))
+            )
+        if record.get("route_status") != "applied" or record.get(
+            "route_category"
+        ) not in {"local", "remote"}:
+            raise TrajectoryCreditArtifactError(
+                "route events must describe applied local/remote routing"
+            )
+    elif event_type == "terminal":
+        if record.get("terminal_kind") not in {"lifecycle", "collection_censored"}:
+            raise TrajectoryCreditArtifactError("unknown terminal event kind")
+        decomposition = record.get("reward_decomposition")
+        reward_ledger = record.get("reward_ledger")
+        workload = record.get("workload_ledger")
+        energy = record.get("energy_ledger")
+        if not all(
+            isinstance(value, Mapping)
+            for value in (decomposition, reward_ledger, workload, energy)
+        ):
+            raise TrajectoryCreditArtifactError(
+                "terminal reward and conservation ledgers must be mappings"
+            )
+        for name in ("cumulative_workload_raw", "cumulative_workload_penalty"):
+            if name not in decomposition:
+                raise TrajectoryCreditArtifactError(
+                    f"terminal reward decomposition lacks {name}"
+                )
+        for name in (
+            "tx_energy_attribution_method",
+            "tx_energy_attribution_status",
+            "allocated_task_tx_energy",
+            "unattributed_tx_energy",
+        ):
+            if name not in energy:
+                raise TrajectoryCreditArtifactError(
+                    f"terminal energy ledger lacks {name}"
+                )
+        if (
+            energy.get("tx_energy_attribution_method") != "bits_pro_rata"
+            or energy.get("tx_energy_attribution_status")
+            != "diagnostic_allocation"
+        ):
+            raise TrajectoryCreditArtifactError(
+                "terminal TX energy attribution semantics are invalid"
+            )
+    elif record.get("credit_status") not in {"linked", "tail_not_optimized"}:
+        raise TrajectoryCreditArtifactError("unknown credit event status")
+    json.dumps(record, ensure_ascii=False, allow_nan=False)
+    return str(event_type), task_key, route_key
+
+
+class TrajectoryCreditArtifactWriter:
+    """Durably append validated V1 events to a fresh-run-only JSONL sidecar."""
+
+    def __init__(self, config: RunConfig) -> None:
+        if not isinstance(config, RunConfig):
+            raise TypeError("config must be a RunConfig")
+        if not config.training.mappo.trajectory_credit_telemetry_enabled:
+            raise TrajectoryCreditArtifactError(
+                "trajectory-credit writer requires enabled telemetry"
+            )
+        self.config = config
+        self.path = Path(config.artifact_paths()["trajectory_credit_events"])
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with self.path.open("x", encoding="utf-8", newline="\n"):
+                pass
+        except FileExistsError as exc:
+            raise TrajectoryCreditArtifactError(
+                f"trajectory-credit sidecar already exists: {self.path}"
+            ) from exc
+        self._counts = {name: 0 for name in TRAJECTORY_CREDIT_EVENT_TYPES}
+        self._route_keys: set[tuple[int, int, int]] = set()
+        self._terminal_keys: set[tuple[int, int]] = set()
+        self._credit_keys: set[tuple[int, int, int]] = set()
+
+    def write(self, record: Mapping[str, Any]) -> None:
+        event_type, task_key, route_key = _validate_trajectory_credit_record(
+            self.config, record
+        )
+        if event_type == "route":
+            assert route_key is not None
+            if route_key in self._route_keys:
+                raise TrajectoryCreditArtifactError("duplicate route event identity")
+            self._route_keys.add(route_key)
+        elif event_type == "terminal":
+            if task_key in self._terminal_keys:
+                raise TrajectoryCreditArtifactError("duplicate terminal task identity")
+            self._terminal_keys.add(task_key)
+        else:
+            assert route_key is not None
+            if route_key in self._credit_keys:
+                raise TrajectoryCreditArtifactError("duplicate credit route identity")
+            self._credit_keys.add(route_key)
+        encoded = json.dumps(
+            dict(record),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        with self.path.open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write(encoded + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        self._counts[event_type] += 1
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "schema_version": TRAJECTORY_CREDIT_SCHEMA_VERSION,
+            "path": str(self.path),
+            "event_counts": dict(self._counts),
+            "route_credit_cardinality_match": self._route_keys == self._credit_keys,
+        }
+
+
+def inspect_trajectory_credit_artifact(config: RunConfig) -> dict[str, Any]:
+    """Read back and validate identity, uniqueness, and route-credit cardinality."""
+
+    path = Path(config.artifact_paths()["trajectory_credit_events"])
+    if not path.is_file():
+        raise TrajectoryCreditArtifactError(
+            f"trajectory-credit sidecar is absent: {path}"
+        )
+    counts = {name: 0 for name in TRAJECTORY_CREDIT_EVENT_TYPES}
+    route_keys: set[tuple[int, int, int]] = set()
+    terminal_keys: set[tuple[int, int]] = set()
+    credit_keys: set[tuple[int, int, int]] = set()
+    task_keys: set[tuple[int, int]] = set()
+    with path.open("r", encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, start=1):
+            if not line.endswith("\n") or not line.strip():
+                raise TrajectoryCreditArtifactError(
+                    f"invalid JSONL framing at line {line_number}"
+                )
+            try:
+                record = json.loads(line)
+                event_type, task_key, route_key = _validate_trajectory_credit_record(
+                    config, record
+                )
+            except (json.JSONDecodeError, ValueError, TypeError) as exc:
+                raise TrajectoryCreditArtifactError(
+                    f"invalid trajectory-credit record at line {line_number}"
+                ) from exc
+            task_keys.add(task_key)
+            counts[event_type] += 1
+            if event_type == "route":
+                assert route_key is not None
+                if route_key in route_keys:
+                    raise TrajectoryCreditArtifactError("duplicate route event identity")
+                route_keys.add(route_key)
+            elif event_type == "terminal":
+                if task_key in terminal_keys:
+                    raise TrajectoryCreditArtifactError("duplicate terminal task identity")
+                terminal_keys.add(task_key)
+            else:
+                assert route_key is not None
+                if route_key in credit_keys:
+                    raise TrajectoryCreditArtifactError("duplicate credit route identity")
+                credit_keys.add(route_key)
+    if route_keys != credit_keys:
+        raise TrajectoryCreditArtifactError(
+            "route and credit event identities do not match one-to-one"
+        )
+    if task_keys != terminal_keys:
+        raise TrajectoryCreditArtifactError(
+            "every observed task must have exactly one terminal event"
+        )
+    return {
+        "schema_version": TRAJECTORY_CREDIT_SCHEMA_VERSION,
+        "path": str(path),
+        "event_counts": counts,
+        "task_count": len(task_keys),
+        "route_credit_cardinality_match": True,
+        "terminal_cardinality_match": True,
+    }
 
 
 def _base_record(config: RunConfig, signal_gate_status: str) -> dict[str, Any]:
@@ -1223,6 +1550,10 @@ def write_cagat_mappo_training_artifacts(
     aggregate_path = Path(paths["aggregate_metrics"])
     csv_path = Path(paths["dashboard_csv"])
     dashboard_path = Path(paths["dashboard_png"])
+    trajectory_summary = None
+    trajectory_path = Path(paths["trajectory_credit_events"])
+    if config.training.mappo.trajectory_credit_telemetry_enabled:
+        trajectory_summary = inspect_trajectory_credit_artifact(config)
     artifact_paths = (
         snapshot_path,
         raw_path,
@@ -1242,6 +1573,8 @@ def write_cagat_mappo_training_artifacts(
         signal_gate_status,
         str(csv_path),
     )
+    if trajectory_summary is not None:
+        summary["trajectory_credit_telemetry"] = trajectory_summary
 
     dashboard_stream = io.BytesIO()
     _plot_dashboard(csv_text, dashboard_stream, summary)
@@ -1280,6 +1613,8 @@ def write_cagat_mappo_training_artifacts(
     )
 
     artifacts = tuple(str(path) for path in artifact_paths)
+    if trajectory_summary is not None:
+        artifacts = (*artifacts, str(trajectory_path))
     return TrainingArtifactOutcome(
         artifacts=artifacts,
         smoke_gate_status=smoke_gate_status,
@@ -1295,5 +1630,8 @@ __all__ = [
     "LOSS_TYPE",
     "TRAINING_METRIC_COLUMNS",
     "TrainingArtifactOutcome",
+    "TrajectoryCreditArtifactError",
+    "TrajectoryCreditArtifactWriter",
+    "inspect_trajectory_credit_artifact",
     "write_cagat_mappo_training_artifacts",
 ]

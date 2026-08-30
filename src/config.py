@@ -529,6 +529,7 @@ class MAPPOConfig:
     evaluation_interval_steps: int = 50000
     checkpoint_interval_steps: int = 50000
     checkpoint_schema_version: int = CHECKPOINT_SCHEMA_VERSION
+    trajectory_credit_telemetry_enabled: bool = False
 
     @property
     def recurrent_chunk_count(self) -> int:
@@ -758,6 +759,13 @@ class RunConfig:
             mappo.pop("route_entropy_start_coefficient")
             mappo.pop("route_entropy_schedule_start_step")
             mappo.pop("route_entropy_schedule_end_step")
+        if isinstance(mappo, dict) and not mappo.get(
+            "trajectory_credit_telemetry_enabled", False
+        ):
+            # The V1 sidecar is explicitly opt-in.  Omitting the historical
+            # false value preserves legacy config hashes and run identities;
+            # enabled diagnostic runs receive a distinct canonical identity.
+            mappo.pop("trajectory_credit_telemetry_enabled")
         return resolved
 
     def to_dict(self) -> dict[str, Any]:
@@ -814,6 +822,7 @@ class RunConfig:
             "config_snapshot": str(run_dir / self.output.snapshot_filename),
             "raw_metrics": str(run_dir / self.output.raw_metrics_filename),
             "aggregate_metrics": str(run_dir / self.output.aggregate_metrics_filename),
+            "trajectory_credit_events": str(run_dir / "trajectory_credit_events.jsonl"),
             "dashboard_csv": str(Path(self.output.dashboard_logs_dir) / f"{self.run_id}_metrics.csv"),
             "figure_input": str(Path(self.output.plots_dir) / f"{self.run_id}_figure_input.csv"),
             "dashboard_png": str(Path(self.output.plots_dir) / f"{self.run_id}_dashboard.png"),
@@ -1126,6 +1135,10 @@ class RunConfig:
                 "training.mappo.checkpoint_schema_version must remain "
                 f"{CHECKPOINT_SCHEMA_VERSION}"
             )
+        if not isinstance(mappo.trajectory_credit_telemetry_enabled, bool):
+            raise ConfigError(
+                "training.mappo.trajectory_credit_telemetry_enabled must be boolean"
+            )
         checkpoint_interval = mappo.checkpoint_interval_steps
         if (
             isinstance(checkpoint_interval, bool)
@@ -1326,6 +1339,10 @@ def validate_mappo_checkpoint_resume_compatibility(
 ) -> None:
     """Apply the fail-fast V1 metadata checks without loading checkpoint bytes."""
 
+    if config.training.mappo.trajectory_credit_telemetry_enabled:
+        raise ConfigError(
+            "trajectory-credit telemetry V1 is fresh-run-only; resume is unsupported"
+        )
     validate_mappo_checkpoint_contract(config)
     if (
         isinstance(schema_version, bool)

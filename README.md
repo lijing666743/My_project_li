@@ -144,6 +144,7 @@ knowledge/project_plan/方案2.md
 - Fix-5 runtime blocker 已修复：terminal bootstrap 的 None placeholder 改为保持 old_value 形状的 zeros_like，role 模式维持 [A]、team 模式维持 scalar；新增真实 500-step episode / 256-slot 第二 chunk 回归、短边界回归与 team 兼容回归，Fix-5 targeted 20/20、full unittest discovery 496/496（119 subtests）通过。新 identity 的短诊断 smoke 已完成：1000 transitions、2 episodes、3 PPO updates、smoke_gate=pass；signal_gate=insufficient-horizon 仅表示诊断长度不足，不代表正式训练结果。本次未启动 60k、未 resume、未覆盖失败 run、未提交 commit。
 
 - Small Scenario Candidate Radius Revision V1 已完成配置层、拓扑回归和模型说明同步：resolved candidate-neighbor graph cutoff 为 small=525 m、medium/large=500 m；该阈值不等价于最大通信范围，已绑定 service-edge、channel/SINR/rate/outage、reward 和 RL 算法保持不变。本轮未训练、未运行 Seeds 43–46，等待人工审查。
+- Minimal Trajectory-Credit Telemetry V1 诊断遥测已实现，行为中性回归已完成。
 
 ## 下一步
 

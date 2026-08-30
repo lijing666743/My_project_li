@@ -44,7 +44,11 @@ from .ca_gat_mappo_actions import (
     CAGATMAPPOActionDistribution,
     SequentialActionMaskBatch,
 )
-from .ca_gat_mappo_route_telemetry import RouteOutcomeTracker
+from .ca_gat_mappo_route_telemetry import (
+    RouteOutcomeTracker,
+    TrajectoryCreditTracker,
+    TrajectoryPreStepCapture,
+)
 from .ca_gat_mappo_checkpoint import (
     CheckpointError,
     atomic_save_checkpoint,
@@ -899,7 +903,9 @@ class CAGATMAPPOTrainer:
         return executed, summary
 
     def _perform_update(
-        self, updates: list[CAGATMAPPOUpdateDiagnostics]
+        self,
+        updates: list[CAGATMAPPOUpdateDiagnostics],
+        trajectory_tracker: TrajectoryCreditTracker | None = None,
     ) -> None:
         if not self.rollout_buffer.full:
             raise CAGATMAPPOTrainerError(
@@ -938,10 +944,21 @@ class CAGATMAPPOTrainer:
             raise CAGATMAPPOTrainerError(
                 "updater changed Trainer policy version"
             )
+        update_index = len(updates)
         self.policy_version += 1
+        if trajectory_tracker is not None:
+            rollout_length = self.config.training.mappo.rollout_length_slots
+            trajectory_tracker.observe_ppo_update(
+                output,
+                update_index=update_index,
+                policy_version_before=frozen_version,
+                policy_version_after=self.policy_version,
+                rollout_start_index=self._transitions - rollout_length,
+                rollout_length=rollout_length,
+            )
         updates.append(
             CAGATMAPPOUpdateDiagnostics(
-                update_index=len(updates),
+                update_index=update_index,
                 rollout_policy_version=frozen_version,
                 policy_version_after_update=self.policy_version,
                 output=output,
@@ -1072,6 +1089,10 @@ class CAGATMAPPOTrainer:
 
         if not isinstance(config, RunConfig):
             raise TypeError("config must be a RunConfig")
+        if config.training.mappo.trajectory_credit_telemetry_enabled:
+            raise CAGATMAPPOTrainerError(
+                "trajectory-credit telemetry V1 is fresh-run-only; resume is unsupported"
+            )
         payload = load_checkpoint_payload(checkpoint_path)
         validate_periodic_checkpoint_compatibility(
             config,
@@ -1187,6 +1208,13 @@ class CAGATMAPPOTrainer:
             )
         if self._training_complete:
             raise CAGATMAPPOTrainerError("training already complete")
+        if (
+            pause_at_periodic
+            and self.config.training.mappo.trajectory_credit_telemetry_enabled
+        ):
+            raise CAGATMAPPOTrainerError(
+                "trajectory-credit telemetry V1 cannot pause for later resume"
+            )
         if checkpointing:
             validate_mappo_checkpoint_contract(self.config)
         elif pause_at_periodic:
@@ -1198,6 +1226,16 @@ class CAGATMAPPOTrainer:
         self.critic.train()
 
         route_outcome_tracker = RouteOutcomeTracker(self.config.environment.slot_duration_s)
+        trajectory_tracker: TrajectoryCreditTracker | None = None
+        if self.config.training.mappo.trajectory_credit_telemetry_enabled:
+            # Keep training_artifacts import-order neutral: that module also
+            # reads Trainer result types lazily when publishing final outputs.
+            from ..training_artifacts import TrajectoryCreditArtifactWriter
+
+            trajectory_writer = TrajectoryCreditArtifactWriter(self.config)
+            trajectory_tracker = TrajectoryCreditTracker(
+                self.config, trajectory_writer.write
+            )
         episode_reward = _RewardAccumulator()
         episode_transitions = 0
         episode_index = self._next_episode_index
@@ -1227,6 +1265,7 @@ class CAGATMAPPOTrainer:
         )
         episode_active = True
         rollout_length = self.config.training.mappo.rollout_length_slots
+        last_observed_transition_step: int | None = None
 
         while self._should_continue(
             self._completed_episodes, self._transitions
@@ -1285,18 +1324,45 @@ class CAGATMAPPOTrainer:
                 )
 
             proposals = tuple(action_output.proposals[0][0])
-            step_result = environment.step(proposals)
-            route_action_indices = {
-                proposal.uav_id: int(
-                    action_output.action_indices["route"][0, 0, proposal.uav_id].item()
+            trajectory_capture: TrajectoryPreStepCapture | None = None
+            if trajectory_tracker is not None:
+                route_action_indices = {
+                    proposal.uav_id: int(
+                        action_output.action_indices["route"][
+                            0, 0, proposal.uav_id
+                        ].item()
+                    )
+                    for proposal in proposals
+                }
+                trajectory_capture = trajectory_tracker.capture_pre_step(
+                    episode_id=episode_index,
+                    rollout_index=self._transitions,
+                    observations=observations,
+                    proposals=proposals,
+                    route_action_indices=route_action_indices,
+                    environment=environment,
                 )
-                for proposal in proposals
-            }
+            step_result = environment.step(proposals)
+            if trajectory_tracker is None:
+                # Preserve the exact legacy post-step extraction order when disabled.
+                route_action_indices = {
+                    proposal.uav_id: int(
+                        action_output.action_indices["route"][
+                            0, 0, proposal.uav_id
+                        ].item()
+                    )
+                    for proposal in proposals
+                }
             route_outcome_tracker.observe_step(
                 episode_index,
                 step_result.info,
                 route_action_indices=route_action_indices,
             )
+            if trajectory_tracker is not None:
+                assert trajectory_capture is not None
+                trajectory_tracker.observe_step(
+                    trajectory_capture, environment, step_result.info
+                )
             boundary = self._validate_step_result(slot, step_result)
             if self.policy_version != step_policy_version:
                 raise CAGATMAPPOTrainerError(
@@ -1348,6 +1414,7 @@ class CAGATMAPPOTrainer:
             episode_reward.add(step_result)
             self._transitions += 1
             episode_transitions += 1
+            last_observed_transition_step = slot
             hidden = action_output.hidden_out.detach()
 
             if boundary:
@@ -1363,7 +1430,7 @@ class CAGATMAPPOTrainer:
                 self._next_episode_index = episode_index + 1
                 episode_active = False
                 if self.rollout_buffer.full:
-                    self._perform_update(self._updates)
+                    self._perform_update(self._updates, trajectory_tracker)
                     self._optimized += rollout_length
                 self._report_episode_progress(episode_diagnostics)
 
@@ -1405,7 +1472,7 @@ class CAGATMAPPOTrainer:
                 observations = step_result.observations
                 state = step_result.centralized_state
                 if self.rollout_buffer.full:
-                    self._perform_update(self._updates)
+                    self._perform_update(self._updates, trajectory_tracker)
                     self._optimized += rollout_length
                 if checkpointing and mappo_checkpoint_kind_at(
                     self.config, self._transitions
@@ -1426,6 +1493,17 @@ class CAGATMAPPOTrainer:
             )
 
         self._unused_final_tail = len(self.rollout_buffer)
+        if trajectory_tracker is not None:
+            if last_observed_transition_step is None:
+                raise CAGATMAPPOTrainerError(
+                    "trajectory-credit finalization requires one observed transition"
+                )
+            trajectory_tracker.finalize_collection(
+                environment=environment,
+                episode_id=episode_index,
+                observed_transition_step=last_observed_transition_step,
+                optimized_transitions=self._optimized,
+            )
         if self._unused_final_tail:
             if self.rollout_buffer.finalized:
                 raise CAGATMAPPOTrainerError(
