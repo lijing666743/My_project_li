@@ -386,6 +386,30 @@ class BatchedCAGATMAPPOLossOutput:
     def diagnostics(self):
         return self.flattened.diagnostics
 
+    @property
+    def route_entropy_coefficient(self) -> float:
+        return self.flattened.route_entropy_coefficient
+
+    @property
+    def route_entropy_schedule_progress(self) -> float:
+        return self.flattened.route_entropy_schedule_progress
+
+    @property
+    def route_entropy_loss_contribution(self) -> Tensor:
+        return self.flattened.route_entropy_loss_contribution
+
+    @property
+    def other_branch_entropy_loss_contribution(self) -> Tensor:
+        return self.flattened.other_branch_entropy_loss_contribution
+
+    @property
+    def global_entropy_loss_contribution(self) -> Tensor:
+        return self.flattened.global_entropy_loss_contribution
+
+    @property
+    def collected_environment_steps(self) -> int | None:
+        return self.flattened.collected_environment_steps
+
 
 def compute_configured_batched_ppo_objective_and_loss(
     *,

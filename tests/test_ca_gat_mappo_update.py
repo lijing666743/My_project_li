@@ -647,6 +647,39 @@ class RecurrentPPOUpdateGateTests(unittest.TestCase):
         finally:
             hook.remove()
 
+    def test_15_schedule_enabled_update_propagates_batched_loss_telemetry(self) -> None:
+        scheduled_mappo = replace(
+            self.config.training.mappo,
+            entropy_coefficient_schedule_enabled=True,
+        )
+        scheduled_config = replace(
+            self.config,
+            training=replace(self.config.training, mappo=scheduled_mappo),
+        )
+        scheduled_config.validate()
+        actor = CAGATMAPPOActor(scheduled_config)
+        critic = MAPPOCentralizedCritic(scheduled_config)
+        updater = CAGATMAPPORecurrentPPOUpdater(actor, critic, scheduled_config)
+
+        output = updater.update(
+            self.buffer,
+            collected_environment_steps=3072,
+        )
+
+        self.assertEqual(len(output.epoch_diagnostics), 4)
+        for epoch in output.epoch_diagnostics:
+            self.assertEqual(epoch.route_entropy_coefficient, 0.03)
+            self.assertEqual(epoch.route_entropy_schedule_progress, 0.0)
+            self.assertIsNotNone(epoch.route_entropy_loss_contribution)
+            self.assertIsNotNone(epoch.other_branch_entropy_loss_contribution)
+            self.assertIsNotNone(epoch.global_entropy_loss_contribution)
+            self.assertEqual(epoch.collected_environment_steps, 3072)
+            self.assertAlmostEqual(
+                epoch.global_entropy_loss_contribution,
+                epoch.route_entropy_loss_contribution
+                + epoch.other_branch_entropy_loss_contribution,
+            )
+
     def test_15_actor_critic_device_mismatch_fails_without_fallback(self) -> None:
         actor = CAGATMAPPOActor(self.config)
         critic = MAPPOCentralizedCritic(self.config).to("meta")
