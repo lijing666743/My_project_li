@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .artifacts import atomic_write_bytes_group, require_artifact_targets_absent
-from .config import RunConfig
+from .config import RunConfig, compute_route_entropy_schedule
 from .models.ca_gat_mappo_route_telemetry import (
     ROUTE_TELEMETRY_SCHEMA_VERSION,
     RouteOutcomeAssociation,
@@ -34,7 +34,7 @@ REWARD_SMOOTHING_WINDOW_EPISODES = 5
 MIN_SIGNAL_EPISODES = 10
 MIN_SIGNAL_PPO_EPOCHS = 10
 
-TRAINING_DIAGNOSTICS_SCHEMA_VERSION = 3
+TRAINING_DIAGNOSTICS_SCHEMA_VERSION = 4
 ROUTE_TELEMETRY_ROLLING_WINDOW_PPO_EPOCHS = 4
 _ROUTE_TELEMETRY_COLUMNS = (
     "route_telemetry_schema_version",
@@ -107,6 +107,7 @@ TRAINING_METRIC_COLUMNS = (
     "telemetry_scope",
     "series_index",
     "environment_steps",
+    "collected_environment_steps",
     "episode_index",
     "environment_seed",
     "completed_boundary",
@@ -133,6 +134,11 @@ TRAINING_METRIC_COLUMNS = (
     "actor_loss",
     "critic_loss",
     "entropy",
+    "route_entropy_coefficient",
+    "route_entropy_schedule_progress",
+    "route_entropy_loss_contribution",
+    "other_branch_entropy_loss_contribution",
+    "global_entropy_loss_contribution",
     "total_loss",
     "ratio",
     "approx_kl",
@@ -182,6 +188,7 @@ def _base_record(config: RunConfig, signal_gate_status: str) -> dict[str, Any]:
         "telemetry_scope": None,
         "series_index": None,
         "environment_steps": None,
+        "collected_environment_steps": None,
         "episode_index": None,
         "environment_seed": None,
         "completed_boundary": None,
@@ -208,6 +215,11 @@ def _base_record(config: RunConfig, signal_gate_status: str) -> dict[str, Any]:
         "actor_loss": None,
         "critic_loss": None,
         "entropy": None,
+        "route_entropy_coefficient": None,
+        "route_entropy_schedule_progress": None,
+        "route_entropy_loss_contribution": None,
+        "other_branch_entropy_loss_contribution": None,
+        "global_entropy_loss_contribution": None,
         "total_loss": None,
         "ratio": None,
         "approx_kl": None,
@@ -324,6 +336,7 @@ def _ppo_epoch_records(
                     "telemetry_scope": "per_ppo_epoch",
                     "series_index": series_index,
                     "environment_steps": update_environment_steps,
+                    "collected_environment_steps": epoch.collected_environment_steps,
                     "update_index": update.update_index,
                     "ppo_epoch_index": epoch.epoch_index,
                     "policy_version_before": update.rollout_policy_version,
@@ -336,6 +349,11 @@ def _ppo_epoch_records(
                     "actor_loss": epoch.actor_loss,
                     "critic_loss": epoch.critic_loss,
                     "entropy": epoch.entropy_mean,
+                    "route_entropy_coefficient": epoch.route_entropy_coefficient,
+                    "route_entropy_schedule_progress": epoch.route_entropy_schedule_progress,
+                    "route_entropy_loss_contribution": epoch.route_entropy_loss_contribution,
+                    "other_branch_entropy_loss_contribution": epoch.other_branch_entropy_loss_contribution,
+                    "global_entropy_loss_contribution": epoch.global_entropy_loss_contribution,
                     "total_loss": epoch.total_loss,
                     "ratio": epoch.ratio_mean,
                     "approx_kl": epoch.approx_kl,
@@ -518,6 +536,58 @@ def _diagnostic_checks(config: RunConfig, training: Any) -> dict[str, bool]:
         for epoch in ppo_epochs
         if epoch.route_telemetry is not None
     ]
+    schedule_rows = [
+        (update, epoch)
+        for update in training.updates
+        for epoch in update.output.epoch_diagnostics
+        if epoch.collected_environment_steps is not None
+    ]
+    schedule_group_presence_is_valid = all(
+        sum(
+            epoch.collected_environment_steps is not None
+            for epoch in update.output.epoch_diagnostics
+        )
+        in (0, config.training.mappo.update_epochs)
+        for update in training.updates
+    )
+    schedule_identity_holds = all(
+        math.isclose(
+            epoch.global_entropy_loss_contribution,
+            epoch.route_entropy_loss_contribution
+            + epoch.other_branch_entropy_loss_contribution,
+            rel_tol=1.0e-7,
+            abs_tol=1.0e-9,
+        )
+        for _, epoch in schedule_rows
+    )
+    schedule_reconstruction_holds = all(
+        epoch.collected_environment_steps
+        == (update.update_index + 1)
+        * config.training.mappo.rollout_length_slots
+        and math.isclose(
+            epoch.route_entropy_coefficient,
+            compute_route_entropy_schedule(
+                config.training.mappo,
+                epoch.collected_environment_steps,
+            ).coefficient,
+            rel_tol=0.0,
+            abs_tol=1.0e-12,
+        )
+        and math.isclose(
+            epoch.route_entropy_schedule_progress,
+            compute_route_entropy_schedule(
+                config.training.mappo,
+                epoch.collected_environment_steps,
+            ).progress,
+            rel_tol=0.0,
+            abs_tol=1.0e-12,
+        )
+        for update, epoch in schedule_rows
+    )
+    schedule_presence_is_valid = (
+        not config.training.mappo.entropy_coefficient_schedule_enabled
+        or bool(schedule_rows)
+    )
     return {
         "environment_budget_reached": (
             training.total_environment_transitions
@@ -547,6 +617,12 @@ def _diagnostic_checks(config: RunConfig, training: Any) -> dict[str, bool]:
         "route_telemetry_schema_is_valid": all(
             item.schema_version == ROUTE_TELEMETRY_SCHEMA_VERSION
             for item in route_telemetry
+        ),
+        "route_entropy_schedule_telemetry_identity_holds": (
+            schedule_group_presence_is_valid
+            and schedule_identity_holds
+            and schedule_reconstruction_holds
+            and schedule_presence_is_valid
         ),
         "critic_loss_is_nonnegative": bool(ppo_epochs)
         and all(epoch.critic_loss >= 0.0 for epoch in ppo_epochs),
@@ -620,7 +696,7 @@ def _json_lines(records: list[dict[str, Any]]) -> str:
 
 
 def read_training_metrics_csv_text(csv_text: str) -> tuple[dict[str, str], ...]:
-    """Read schema-v1 or schema-v2 metrics with missing v2 fields as blanks."""
+    """Read legacy or current metrics with absent newer fields as blanks."""
 
     if not isinstance(csv_text, str):
         raise TypeError("csv_text must be a string")
@@ -760,6 +836,12 @@ def _training_summary(
         for update in training.updates
         for epoch in update.output.epoch_diagnostics
     ]
+    schedule_epochs = [
+        epoch
+        for epoch in ppo_epochs
+        if epoch.collected_environment_steps is not None
+    ]
+    latest_schedule_epoch = None if not schedule_epochs else schedule_epochs[-1]
     return {
         "run_id": config.run_id,
         "method_id": config.method_id,
@@ -817,6 +899,30 @@ def _training_summary(
             "clip_fraction_mean": _mean_present(epoch.clip_fraction for epoch in ppo_epochs),
             "actor_grad_norm_before_clip_mean": ppo.actor_grad_norm_before_clip.mean,
             "critic_grad_norm_before_clip_mean": ppo.critic_grad_norm_before_clip.mean,
+            "route_entropy_schedule_latest": (
+                None
+                if latest_schedule_epoch is None
+                else {
+                    "route_entropy_coefficient": (
+                        latest_schedule_epoch.route_entropy_coefficient
+                    ),
+                    "route_entropy_schedule_progress": (
+                        latest_schedule_epoch.route_entropy_schedule_progress
+                    ),
+                    "route_entropy_loss_contribution": (
+                        latest_schedule_epoch.route_entropy_loss_contribution
+                    ),
+                    "other_branch_entropy_loss_contribution": (
+                        latest_schedule_epoch.other_branch_entropy_loss_contribution
+                    ),
+                    "global_entropy_loss_contribution": (
+                        latest_schedule_epoch.global_entropy_loss_contribution
+                    ),
+                    "collected_environment_steps": (
+                        latest_schedule_epoch.collected_environment_steps
+                    ),
+                }
+            ),
             "agent_credit_latest": (
                 None
                 if not ppo_epochs

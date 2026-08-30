@@ -515,6 +515,9 @@ class MAPPOConfig:
     kl_early_stopping: bool = False
     learning_rate_schedule_enabled: bool = False
     entropy_coefficient_schedule_enabled: bool = False
+    route_entropy_start_coefficient: float = 0.03
+    route_entropy_schedule_start_step: int = 3072
+    route_entropy_schedule_end_step: int = 32768
     gradient_accumulation: bool = False
     mixed_precision: bool = False
     training_device: str = "cuda"
@@ -538,6 +541,88 @@ class MAPPOConfig:
         """Expose the canonical environment-step budget without duplicating it."""
 
         return self.max_training_environment_steps
+
+
+@dataclass(frozen=True)
+class RouteEntropySchedulePoint:
+    """Pure route-only entropy schedule value at one collected-step count."""
+
+    collected_environment_steps: int
+    coefficient: float
+    progress: float
+    enabled: bool
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.collected_environment_steps, bool)
+            or not isinstance(self.collected_environment_steps, int)
+            or self.collected_environment_steps < 0
+        ):
+            raise ConfigError(
+                "collected_environment_steps must be a non-negative integer"
+            )
+        if not math.isfinite(self.coefficient) or self.coefficient < 0.0:
+            raise ConfigError(
+                "route entropy coefficient must be finite and non-negative"
+            )
+        if not math.isfinite(self.progress) or not 0.0 <= self.progress <= 1.0:
+            raise ConfigError("route entropy schedule progress must lie in [0, 1]")
+        if not isinstance(self.enabled, bool):
+            raise ConfigError("route entropy schedule enabled state must be boolean")
+
+
+def compute_route_entropy_schedule(
+    mappo: MAPPOConfig,
+    collected_environment_steps: int,
+) -> RouteEntropySchedulePoint:
+    """Return the preregistered route coefficient from config and env steps.
+
+    The treatment intentionally jumps from the base coefficient immediately
+    before ``route_entropy_schedule_start_step`` to the start coefficient at
+    that exact step.  This warmup-to-intervention discontinuity must not be
+    smoothed or interpolated.
+    """
+
+    if not isinstance(mappo, MAPPOConfig):
+        raise TypeError("mappo must be a MAPPOConfig")
+    if (
+        isinstance(collected_environment_steps, bool)
+        or not isinstance(collected_environment_steps, int)
+        or collected_environment_steps < 0
+    ):
+        raise ConfigError(
+            "collected_environment_steps must be a non-negative integer"
+        )
+    base = float(mappo.entropy_coefficient)
+    if not mappo.entropy_coefficient_schedule_enabled:
+        return RouteEntropySchedulePoint(
+            collected_environment_steps=collected_environment_steps,
+            coefficient=base,
+            progress=0.0,
+            enabled=False,
+        )
+
+    start_step = mappo.route_entropy_schedule_start_step
+    end_step = mappo.route_entropy_schedule_end_step
+    if collected_environment_steps < start_step:
+        coefficient = base
+        progress = 0.0
+    elif collected_environment_steps < end_step:
+        progress = (collected_environment_steps - start_step) / (
+            end_step - start_step
+        )
+        coefficient = base + (
+            mappo.route_entropy_start_coefficient - base
+        ) * (end_step - collected_environment_steps) / (end_step - start_step)
+    else:
+        coefficient = base
+        progress = 1.0
+    return RouteEntropySchedulePoint(
+        collected_environment_steps=collected_environment_steps,
+        coefficient=float(coefficient),
+        progress=float(progress),
+        enabled=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -664,6 +749,15 @@ class RunConfig:
             # Keep old config hashes and Checkpoint V1 identities unchanged;
             # role-decomposed credit remains part of the canonical identity.
             mappo.pop("agent_credit_mode")
+        if isinstance(mappo, dict) and not mappo.get(
+            "entropy_coefficient_schedule_enabled", False
+        ):
+            # The historical false flag already belongs to the canonical
+            # payload.  Only the newly introduced route-only parameters are
+            # omitted so legacy hashes remain byte-for-byte unchanged.
+            mappo.pop("route_entropy_start_coefficient")
+            mappo.pop("route_entropy_schedule_start_step")
+            mappo.pop("route_entropy_schedule_end_step")
         return resolved
 
     def to_dict(self) -> dict[str, Any]:
@@ -929,6 +1023,72 @@ class RunConfig:
                 raise ConfigError(f"training.mappo.{name} must lie in (0, 1)")
         if mappo.weight_decay != 0.0:
             raise ConfigError("training.mappo.weight_decay must remain 0.0")
+        if not isinstance(mappo.entropy_coefficient_schedule_enabled, bool):
+            raise ConfigError(
+                "training.mappo.entropy_coefficient_schedule_enabled must be boolean"
+            )
+        for name, value in (
+            ("entropy_coefficient", mappo.entropy_coefficient),
+            (
+                "route_entropy_start_coefficient",
+                mappo.route_entropy_start_coefficient,
+            ),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or value < 0.0
+            ):
+                raise ConfigError(
+                    f"training.mappo.{name} must be finite and non-negative"
+                )
+        for name, value in (
+            (
+                "route_entropy_schedule_start_step",
+                mappo.route_entropy_schedule_start_step,
+            ),
+            (
+                "route_entropy_schedule_end_step",
+                mappo.route_entropy_schedule_end_step,
+            ),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ConfigError(
+                    f"training.mappo.{name} must be a non-negative integer"
+                )
+        if (
+            mappo.route_entropy_schedule_end_step
+            <= mappo.route_entropy_schedule_start_step
+        ):
+            raise ConfigError(
+                "training.mappo.route entropy schedule end must exceed start"
+            )
+        if mappo.entropy_coefficient_schedule_enabled:
+            preregistered = (
+                ("entropy_coefficient", mappo.entropy_coefficient, 0.01),
+                (
+                    "route_entropy_start_coefficient",
+                    mappo.route_entropy_start_coefficient,
+                    0.03,
+                ),
+                (
+                    "route_entropy_schedule_start_step",
+                    mappo.route_entropy_schedule_start_step,
+                    3072,
+                ),
+                (
+                    "route_entropy_schedule_end_step",
+                    mappo.route_entropy_schedule_end_step,
+                    32768,
+                ),
+            )
+            for name, actual, expected in preregistered:
+                if actual != expected:
+                    raise ConfigError(
+                        "the preregistered route entropy treatment requires "
+                        f"training.mappo.{name}={expected}"
+                    )
         for name, value in (
             ("rollout_length_slots", mappo.rollout_length_slots),
             ("recurrent_chunk_length_slots", mappo.recurrent_chunk_length_slots),
@@ -1022,9 +1182,6 @@ class RunConfig:
             "target_kl_enabled": mappo.target_kl_enabled,
             "kl_early_stopping": mappo.kl_early_stopping,
             "learning_rate_schedule_enabled": mappo.learning_rate_schedule_enabled,
-            "entropy_coefficient_schedule_enabled": (
-                mappo.entropy_coefficient_schedule_enabled
-            ),
             "gradient_accumulation": mappo.gradient_accumulation,
             "mixed_precision": mappo.mixed_precision,
         }
@@ -1723,6 +1880,7 @@ __all__ = [
     "MAPPO_INITIAL_POLICY_VERSION",
     "OutputConfig",
     "QMIXConfig",
+    "RouteEntropySchedulePoint",
     "RunConfig",
     "SUPPORTED_METHODS",
     "SUPPORTED_LAUNCH_PROFILES",
@@ -1732,6 +1890,7 @@ __all__ = [
     "WorkloadTimingMode",
     "compute_mappo_checkpoint_active_rollout_length",
     "compute_mappo_periodic_checkpoint_steps",
+    "compute_route_entropy_schedule",
     "mappo_checkpoint_kind_at",
     "mappo_final_checkpoint_path",
     "mappo_periodic_checkpoint_path",

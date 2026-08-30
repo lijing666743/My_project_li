@@ -13,7 +13,12 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from ..config import ActorRatioMode, AgentCreditMode, RunConfig
+from ..config import (
+    ActorRatioMode,
+    AgentCreditMode,
+    RunConfig,
+    compute_route_entropy_schedule,
+)
 
 
 class PPOObjectiveError(ValueError):
@@ -154,6 +159,12 @@ class CAGATMAPPOLossOutput:
     epsilon_clip: float
     value_coefficient: float
     entropy_coefficient: float
+    route_entropy_coefficient: float
+    route_entropy_schedule_progress: float
+    route_entropy_loss_contribution: Tensor
+    other_branch_entropy_loss_contribution: Tensor
+    global_entropy_loss_contribution: Tensor
+    collected_environment_steps: int | None
     diagnostics: PPOObjectiveDiagnostics
     actor_ratio_mode: str = ActorRatioMode.JOINT.value
     agent_credit_mode: str = AgentCreditMode.TEAM.value
@@ -206,6 +217,60 @@ class CAGATMAPPOLossOutput:
             for tensor in losses
         ):
             raise PPOObjectiveError("PPO objective outputs must be finite scalars")
+        entropy_contributions = (
+            self.route_entropy_loss_contribution,
+            self.other_branch_entropy_loss_contribution,
+            self.global_entropy_loss_contribution,
+        )
+        if any(
+            not isinstance(tensor, Tensor)
+            or tensor.ndim != 0
+            or not torch.isfinite(tensor)
+            or float(tensor.detach().cpu().item()) < -1.0e-8
+            for tensor in entropy_contributions
+        ):
+            raise PPOObjectiveError(
+                "entropy loss contributions must be finite non-negative scalars"
+            )
+        route_weight = _finite_coefficient(
+            self.route_entropy_coefficient,
+            "route_entropy_coefficient",
+            strictly_positive=False,
+        )
+        if (
+            not math.isfinite(self.route_entropy_schedule_progress)
+            or not 0.0 <= self.route_entropy_schedule_progress <= 1.0
+        ):
+            raise PPOObjectiveError(
+                "route_entropy_schedule_progress must lie in [0, 1]"
+            )
+        if self.collected_environment_steps is not None and (
+            isinstance(self.collected_environment_steps, bool)
+            or not isinstance(self.collected_environment_steps, int)
+            or self.collected_environment_steps < 0
+        ):
+            raise PPOObjectiveError(
+                "collected_environment_steps must be a non-negative integer or NA"
+            )
+        if not torch.allclose(
+            self.global_entropy_loss_contribution,
+            self.route_entropy_loss_contribution
+            + self.other_branch_entropy_loss_contribution,
+        ):
+            raise PPOObjectiveError(
+                "global entropy contribution must equal route plus other branches"
+            )
+        expected_total_loss = (
+            self.actor_loss
+            + self.value_coefficient * self.critic_loss
+            - self.global_entropy_loss_contribution
+        )
+        if not torch.allclose(self.total_loss, expected_total_loss):
+            raise PPOObjectiveError(
+                "total_loss must subtract the decomposed entropy contribution"
+            )
+        if route_weight != self.route_entropy_coefficient:
+            raise PPOObjectiveError("route entropy coefficient normalization failed")
         if not torch.allclose(self.actor_loss, -self.clipped_objective):
             raise PPOObjectiveError("actor_loss must equal -clipped_objective")
         try:
@@ -294,6 +359,10 @@ def compute_ppo_objective_and_loss(
     new_branch_log_probs: Tensor | None = None,
     old_branch_log_probs: Tensor | None = None,
     active_branch_indicators: Tensor | None = None,
+    route_entropy: Tensor | None = None,
+    route_entropy_coefficient: float | None = None,
+    route_entropy_schedule_progress: float = 0.0,
+    collected_environment_steps: int | None = None,
 ) -> CAGATMAPPOLossOutput:
     """Compute the frozen PPO objective from proposal-policy statistics.
 
@@ -332,6 +401,33 @@ def compute_ppo_objective_and_loss(
         "entropy_coefficient",
         strictly_positive=False,
     )
+    route_entropy_weight = (
+        entropy_weight
+        if route_entropy_coefficient is None
+        else _finite_coefficient(
+            route_entropy_coefficient,
+            "route_entropy_coefficient",
+            strictly_positive=False,
+        )
+    )
+    if (
+        isinstance(route_entropy_schedule_progress, bool)
+        or not isinstance(route_entropy_schedule_progress, (int, float))
+        or not math.isfinite(float(route_entropy_schedule_progress))
+        or not 0.0 <= float(route_entropy_schedule_progress) <= 1.0
+    ):
+        raise PPOObjectiveError(
+            "route_entropy_schedule_progress must lie in [0, 1]"
+        )
+    schedule_progress = float(route_entropy_schedule_progress)
+    if collected_environment_steps is not None and (
+        isinstance(collected_environment_steps, bool)
+        or not isinstance(collected_environment_steps, int)
+        or collected_environment_steps < 0
+    ):
+        raise PPOObjectiveError(
+            "collected_environment_steps must be a non-negative integer or NA"
+        )
 
     new_log_prob = _floating_tensor(new_joint_log_prob, "new_joint_log_prob", 2)
     old_log_prob = _floating_tensor(old_joint_log_prob, "old_joint_log_prob", 2)
@@ -340,6 +436,11 @@ def compute_ppo_objective_and_loss(
     values = _floating_tensor(current_value, "current_value", credit_rank)
     targets = _floating_tensor(return_target, "return_target", credit_rank)
     active_entropy = _floating_tensor(entropy, "entropy", 2)
+    active_route_entropy = (
+        None
+        if route_entropy is None
+        else _floating_tensor(route_entropy, "route_entropy", 2)
+    )
 
     time_steps, agent_count = new_log_prob.shape
     if time_steps == 0 or agent_count == 0:
@@ -348,6 +449,15 @@ def compute_ppo_objective_and_loss(
         raise PPOObjectiveError("new and old joint log-prob must share shape [T,A]")
     if active_entropy.shape != new_log_prob.shape:
         raise PPOObjectiveError("entropy must share the policy shape [T,A]")
+    if (
+        active_route_entropy is not None
+        and active_route_entropy.shape != new_log_prob.shape
+    ):
+        raise PPOObjectiveError("route_entropy must share the policy shape [T,A]")
+    if active_route_entropy is None and route_entropy_weight != entropy_weight:
+        raise PPOObjectiveError(
+            "a distinct route entropy coefficient requires route_entropy"
+        )
     expected_credit_shape = (
         (time_steps,)
         if credit_mode is AgentCreditMode.TEAM
@@ -369,6 +479,8 @@ def compute_ppo_objective_and_loss(
         targets,
         active_entropy,
     )
+    if active_route_entropy is not None:
+        floating_inputs = (*floating_inputs, active_route_entropy)
     if any(tensor.device != new_log_prob.device for tensor in floating_inputs):
         raise PPOObjectiveError("all PPO statistics must share one device")
     if any(tensor.dtype != new_log_prob.dtype for tensor in floating_inputs):
@@ -535,11 +647,39 @@ def compute_ppo_objective_and_loss(
         "critic_loss",
     )
     entropy_mean = _masked_mean(active_entropy, actor_valid_mask, "entropy_mean")
-    total_loss = (
-        actor_loss
-        + value_weight * critic_loss
-        - entropy_weight * entropy_mean
+    route_entropy_mean = (
+        entropy_mean.new_zeros(())
+        if active_route_entropy is None
+        else _masked_mean(
+            active_route_entropy,
+            actor_valid_mask,
+            "route_entropy_mean",
+        )
     )
+    other_branch_entropy_mean = entropy_mean - route_entropy_mean
+    route_entropy_loss_contribution = (
+        route_entropy_weight * route_entropy_mean
+    )
+    other_branch_entropy_loss_contribution = (
+        entropy_weight * other_branch_entropy_mean
+    )
+    global_entropy_loss_contribution = (
+        route_entropy_loss_contribution
+        + other_branch_entropy_loss_contribution
+    )
+    if route_entropy_weight == entropy_weight:
+        # Preserve the legacy disabled/base-coefficient loss operation exactly.
+        total_loss = (
+            actor_loss
+            + value_weight * critic_loss
+            - entropy_weight * entropy_mean
+        )
+    else:
+        total_loss = (
+            actor_loss
+            + value_weight * critic_loss
+            - global_entropy_loss_contribution
+        )
     if not torch.isfinite(total_loss):
         raise PPOObjectiveError("total_loss produced NaN or Inf")
 
@@ -628,6 +768,14 @@ def compute_ppo_objective_and_loss(
         epsilon_clip=epsilon,
         value_coefficient=value_weight,
         entropy_coefficient=entropy_weight,
+        route_entropy_coefficient=route_entropy_weight,
+        route_entropy_schedule_progress=schedule_progress,
+        route_entropy_loss_contribution=route_entropy_loss_contribution,
+        other_branch_entropy_loss_contribution=(
+            other_branch_entropy_loss_contribution
+        ),
+        global_entropy_loss_contribution=global_entropy_loss_contribution,
+        collected_environment_steps=collected_environment_steps,
         diagnostics=diagnostics,
         actor_ratio_mode=ratio_mode.value,
         agent_credit_mode=credit_mode.value,
@@ -655,6 +803,8 @@ def compute_configured_ppo_objective_and_loss(
     new_branch_log_probs: Tensor | None = None,
     old_branch_log_probs: Tensor | None = None,
     active_branch_indicators: Tensor | None = None,
+    route_entropy: Tensor | None = None,
+    collected_environment_steps: int | None = None,
 ) -> CAGATMAPPOLossOutput:
     """Use the Section 4 values already centralized in ``RunConfig``."""
 
@@ -662,6 +812,21 @@ def compute_configured_ppo_objective_and_loss(
         raise TypeError("config must be a RunConfig")
     config.validate()
     mappo = config.training.mappo
+    if mappo.entropy_coefficient_schedule_enabled:
+        if route_entropy is None:
+            raise PPOObjectiveError(
+                "enabled route entropy schedule requires route_entropy"
+            )
+        if collected_environment_steps is None:
+            raise PPOObjectiveError(
+                "enabled route entropy schedule requires collected_environment_steps"
+            )
+    schedule = compute_route_entropy_schedule(
+        mappo,
+        0
+        if collected_environment_steps is None
+        else collected_environment_steps,
+    )
     return compute_ppo_objective_and_loss(
         new_joint_log_prob=new_joint_log_prob,
         old_joint_log_prob=old_joint_log_prob,
@@ -678,6 +843,10 @@ def compute_configured_ppo_objective_and_loss(
         new_branch_log_probs=new_branch_log_probs,
         old_branch_log_probs=old_branch_log_probs,
         active_branch_indicators=active_branch_indicators,
+        route_entropy=route_entropy,
+        route_entropy_coefficient=schedule.coefficient,
+        route_entropy_schedule_progress=schedule.progress,
+        collected_environment_steps=collected_environment_steps,
     )
 
 

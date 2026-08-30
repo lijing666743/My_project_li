@@ -400,6 +400,8 @@ def compute_configured_batched_ppo_objective_and_loss(
     new_branch_log_probs: Tensor | None = None,
     old_branch_log_probs: Tensor | None = None,
     active_branch_indicators: Tensor | None = None,
+    route_entropy: Tensor | None = None,
+    collected_environment_steps: int | None = None,
 ) -> BatchedCAGATMAPPOLossOutput:
     """Apply the passed PPO objective uniformly over all B-by-L positions."""
 
@@ -415,6 +417,13 @@ def compute_configured_batched_ppo_objective_and_loss(
     ):
         if not isinstance(tensor, Tensor) or tensor.shape != new_joint_log_prob.shape:
             raise RecurrentPPOUpdateError(f"{name} must have shape [8,32,A]")
+    if route_entropy is not None and (
+        not isinstance(route_entropy, Tensor)
+        or route_entropy.shape != new_joint_log_prob.shape
+    ):
+        raise RecurrentPPOUpdateError(
+            "route_entropy must have shape [8,32,A] or be NA"
+        )
     credit_mode = AgentCreditMode(config.training.mappo.agent_credit_mode)
     expected_credit_shape = (
         (8, 32)
@@ -495,6 +504,12 @@ def compute_configured_batched_ppo_objective_and_loss(
         new_branch_log_probs=flattened_new_branches,
         old_branch_log_probs=flattened_old_branches,
         active_branch_indicators=flattened_active_branches,
+        route_entropy=(
+            None
+            if route_entropy is None
+            else route_entropy.reshape(256, agent_count)
+        ),
+        collected_environment_steps=collected_environment_steps,
     )
     return BatchedCAGATMAPPOLossOutput(
         flattened=flattened,
@@ -823,6 +838,12 @@ class RecurrentPPOEpochDiagnostics:
     clip_max_norm: float
     approx_kl: float | None = None
     clip_fraction: float | None = None
+    route_entropy_coefficient: float | None = None
+    route_entropy_schedule_progress: float | None = None
+    route_entropy_loss_contribution: float | None = None
+    other_branch_entropy_loss_contribution: float | None = None
+    global_entropy_loss_contribution: float | None = None
+    collected_environment_steps: int | None = None
     route_telemetry: RouteTelemetry | None = None
     agent_credit_telemetry: AgentCreditPPOEpochTelemetry | None = None
 
@@ -847,6 +868,68 @@ class RecurrentPPOEpochDiagnostics:
             math.isfinite(self.clip_fraction) and 0.0 <= self.clip_fraction <= 1.0
         ):
             raise RecurrentPPOUpdateError("clip_fraction must lie in [0, 1] or be NA")
+        entropy_schedule_values = (
+            self.route_entropy_coefficient,
+            self.route_entropy_schedule_progress,
+            self.route_entropy_loss_contribution,
+            self.other_branch_entropy_loss_contribution,
+            self.global_entropy_loss_contribution,
+            self.collected_environment_steps,
+        )
+        present_count = sum(value is not None for value in entropy_schedule_values)
+        if present_count not in (0, len(entropy_schedule_values)):
+            raise RecurrentPPOUpdateError(
+                "route entropy schedule telemetry must be all present or all NA"
+            )
+        if present_count:
+            assert self.route_entropy_coefficient is not None
+            assert self.route_entropy_schedule_progress is not None
+            assert self.route_entropy_loss_contribution is not None
+            assert self.other_branch_entropy_loss_contribution is not None
+            assert self.global_entropy_loss_contribution is not None
+            assert self.collected_environment_steps is not None
+            scalar_values = (
+                self.route_entropy_coefficient,
+                self.route_entropy_schedule_progress,
+                self.route_entropy_loss_contribution,
+                self.other_branch_entropy_loss_contribution,
+                self.global_entropy_loss_contribution,
+            )
+            if not all(math.isfinite(value) for value in scalar_values):
+                raise RecurrentPPOUpdateError(
+                    "route entropy schedule telemetry contains NaN or Inf"
+                )
+            if (
+                self.route_entropy_coefficient < 0.0
+                or self.route_entropy_loss_contribution < -1.0e-8
+                or self.other_branch_entropy_loss_contribution < -1.0e-8
+                or self.global_entropy_loss_contribution < -1.0e-8
+            ):
+                raise RecurrentPPOUpdateError(
+                    "route entropy coefficients and contributions must be non-negative"
+                )
+            if not 0.0 <= self.route_entropy_schedule_progress <= 1.0:
+                raise RecurrentPPOUpdateError(
+                    "route entropy schedule progress must lie in [0, 1]"
+                )
+            if (
+                isinstance(self.collected_environment_steps, bool)
+                or not isinstance(self.collected_environment_steps, int)
+                or self.collected_environment_steps < 0
+            ):
+                raise RecurrentPPOUpdateError(
+                    "collected environment steps must be a non-negative integer"
+                )
+            if not math.isclose(
+                self.global_entropy_loss_contribution,
+                self.route_entropy_loss_contribution
+                + self.other_branch_entropy_loss_contribution,
+                rel_tol=1.0e-7,
+                abs_tol=1.0e-9,
+            ):
+                raise RecurrentPPOUpdateError(
+                    "global entropy contribution must equal route plus other branches"
+                )
         if self.route_telemetry is not None and not isinstance(
             self.route_telemetry, RouteTelemetry
         ):
@@ -1006,8 +1089,28 @@ class CAGATMAPPORecurrentPPOUpdater:
             raise RecurrentPPOUpdateError(f"{name} gradient norm is NaN or Inf")
         return value
 
-    def update(self, buffer: CAGATMAPPORolloutBuffer) -> RecurrentPPOUpdateOutput:
+    def update(
+        self,
+        buffer: CAGATMAPPORolloutBuffer,
+        *,
+        collected_environment_steps: int | None = None,
+    ) -> RecurrentPPOUpdateOutput:
         """Run exactly four epochs over the sole deterministic 8-by-32 minibatch."""
+        if collected_environment_steps is not None and (
+            isinstance(collected_environment_steps, bool)
+            or not isinstance(collected_environment_steps, int)
+            or collected_environment_steps < 0
+        ):
+            raise RecurrentPPOUpdateError(
+                "collected_environment_steps must be a non-negative integer"
+            )
+        if (
+            self.config.training.mappo.entropy_coefficient_schedule_enabled
+            and collected_environment_steps is None
+        ):
+            raise RecurrentPPOUpdateError(
+                "enabled route entropy schedule requires collected environment steps"
+            )
 
         minibatch = build_recurrent_ppo_minibatch(buffer, self.config)
         prepared = _prepare_device_minibatch(minibatch, self.device, self.dtype)
@@ -1048,6 +1151,8 @@ class CAGATMAPPORecurrentPPOUpdater:
                 new_branch_log_probs=new_branch_log_probs,
                 old_branch_log_probs=prepared.old_branch_log_probs,
                 active_branch_indicators=prepared.active_branch_indicators,
+                route_entropy=evaluation.policy.branch_entropies["route"],
+                collected_environment_steps=collected_environment_steps,
             )
             loss.total_loss.backward()
             route_telemetry = None
@@ -1117,6 +1222,40 @@ class CAGATMAPPORecurrentPPOUpdater:
                     clip_max_norm=mappo.gradient_clip_norm,
                     approx_kl=loss.diagnostics.approx_kl,
                     clip_fraction=loss.diagnostics.clipped_fraction,
+                    route_entropy_coefficient=(
+                        None
+                        if collected_environment_steps is None
+                        else loss.route_entropy_coefficient
+                    ),
+                    route_entropy_schedule_progress=(
+                        None
+                        if collected_environment_steps is None
+                        else loss.route_entropy_schedule_progress
+                    ),
+                    route_entropy_loss_contribution=(
+                        None
+                        if collected_environment_steps is None
+                        else float(
+                            loss.route_entropy_loss_contribution.detach().cpu().item()
+                        )
+                    ),
+                    other_branch_entropy_loss_contribution=(
+                        None
+                        if collected_environment_steps is None
+                        else float(
+                            loss.other_branch_entropy_loss_contribution.detach()
+                            .cpu()
+                            .item()
+                        )
+                    ),
+                    global_entropy_loss_contribution=(
+                        None
+                        if collected_environment_steps is None
+                        else float(
+                            loss.global_entropy_loss_contribution.detach().cpu().item()
+                        )
+                    ),
+                    collected_environment_steps=collected_environment_steps,
                     route_telemetry=route_telemetry,
                     agent_credit_telemetry=agent_credit_telemetry,
                 )

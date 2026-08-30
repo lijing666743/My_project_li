@@ -916,7 +916,14 @@ class CAGATMAPPOTrainer:
                 "policy version changed before PPO update"
             )
         generator_state = self.policy_generator.get_state().clone()
-        output = self.updater.update(self.rollout_buffer)
+        if self.config.training.mappo.entropy_coefficient_schedule_enabled:
+            output = self.updater.update(
+                self.rollout_buffer,
+                collected_environment_steps=self._transitions,
+            )
+        else:
+            # Preserve the exact legacy updater call shape when disabled.
+            output = self.updater.update(self.rollout_buffer)
         if not isinstance(output, RecurrentPPOUpdateOutput):
             raise CAGATMAPPOTrainerError(
                 "updater must return RecurrentPPOUpdateOutput"
