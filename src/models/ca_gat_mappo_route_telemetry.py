@@ -244,6 +244,21 @@ class RouteTelemetry:
     route_head_total_grad_status: str
     route_head_total_grad_norm: float | None
     route_probability_valid_sample_count: int = 0
+    base_route_advantage_valid_sample_count: int = 0
+    base_route_advantage_mean: float | None = None
+    base_route_advantage_std: float | None = None
+    base_route_advantage_median: float | None = None
+    base_route_advantage_p90_absolute_magnitude: float | None = None
+    new_route_advantage_valid_sample_count: int = 0
+    new_route_advantage_mean: float | None = None
+    new_route_advantage_std: float | None = None
+    new_route_advantage_median: float | None = None
+    new_route_advantage_p90_absolute_magnitude: float | None = None
+    route_advantage_delta_valid_sample_count: int = 0
+    route_advantage_delta_mean: float | None = None
+    route_advantage_delta_std: float | None = None
+    route_advantage_delta_median: float | None = None
+    route_advantage_delta_p90_absolute_magnitude: float | None = None
     mean_selected_route_probability_all_route_active: float | None = None
     mean_local_probability_all_route_active: float | None = None
     mean_defer_probability_all_route_active: float | None = None
@@ -350,6 +365,25 @@ class RouteTelemetry:
                 "route_active_return_std",
             ),
         )
+        for prefix in (
+            "base_route_advantage",
+            "new_route_advantage",
+            "route_advantage_delta",
+        ):
+            count = getattr(self, f"{prefix}_valid_sample_count")
+            if count not in (0, self.route_branch_active_count):
+                raise RouteTelemetryError(
+                    f"{prefix} count must be zero or equal route-active count"
+                )
+            self._validate_optional_group(
+                count,
+                (
+                    f"{prefix}_mean",
+                    f"{prefix}_std",
+                    f"{prefix}_median",
+                    f"{prefix}_p90_absolute_magnitude",
+                ),
+            )
         for prefix in (
             "local_route",
             "remote_route",
@@ -633,6 +667,11 @@ def collect_route_telemetry(
     shared_trunk: Any = None,
     epsilon_clip: float = 0.2,
     actor_ratio_mode: str = ActorRatioMode.JOINT.value,
+    base_advantage: Tensor | None = None,
+    route_advantage: Tensor | None = None,
+    branch_advantage: Tensor | None = None,
+    bootstrap_mask: Tensor | None = None,
+    effective_route_gae_lambda: float | None = None,
 ) -> RouteTelemetry:
     """Aggregate route telemetry without changing the PPO algorithm state."""
 
@@ -660,6 +699,37 @@ def collect_route_telemetry(
     if td_residual is not None and tuple(td_residual.shape) != tuple(advantage.shape):
         raise RouteTelemetryError(
             "td_residual must share the scalar or per-agent advantage shape"
+        )
+    if base_advantage is not None and tuple(base_advantage.shape) not in valid_credit_shapes:
+        raise RouteTelemetryError(
+            "base_advantage must have shape [B,T] or [B,T,A]"
+        )
+    if route_advantage is not None and tuple(route_advantage.shape) != (
+        batch,
+        time,
+        agents,
+    ):
+        raise RouteTelemetryError("route_advantage must have shape [B,T,A]")
+    if branch_advantage is not None and tuple(branch_advantage.shape) != (
+        batch,
+        time,
+        agents,
+        len(ACTION_BRANCH_ORDER),
+    ):
+        raise RouteTelemetryError("branch_advantage must have shape [B,T,A,7]")
+    if bootstrap_mask is not None and (
+        tuple(bootstrap_mask.shape) != (batch, time)
+        or bootstrap_mask.dtype != torch.bool
+    ):
+        raise RouteTelemetryError("bootstrap_mask must be boolean [B,T]")
+    if effective_route_gae_lambda is not None and (
+        isinstance(effective_route_gae_lambda, bool)
+        or not isinstance(effective_route_gae_lambda, (int, float))
+        or not math.isfinite(float(effective_route_gae_lambda))
+        or not 0.0 <= float(effective_route_gae_lambda) <= 1.0
+    ):
+        raise RouteTelemetryError(
+            "effective_route_gae_lambda must lie in [0, 1] or be NA"
         )
     if (
         tuple(sequence_valid_mask.shape) != (batch, time)
@@ -785,6 +855,23 @@ def collect_route_telemetry(
         if expanded_advantage.ndim == 2:
             expanded_advantage = expanded_advantage.unsqueeze(-1).expand_as(route_active)
             expanded_return = expanded_return.unsqueeze(-1).expand_as(route_active)
+        expanded_base_advantage = (
+            advantage if base_advantage is None else base_advantage
+        ).detach().to(device=device)
+        if expanded_base_advantage.ndim == 2:
+            expanded_base_advantage = expanded_base_advantage.unsqueeze(-1).expand_as(
+                route_active
+            )
+        expanded_new_route_advantage = (
+            advantage if route_advantage is None else route_advantage
+        ).detach().to(device=device)
+        if expanded_new_route_advantage.ndim == 2:
+            expanded_new_route_advantage = (
+                expanded_new_route_advantage.unsqueeze(-1).expand_as(route_active)
+            )
+        expanded_route_advantage_delta = (
+            expanded_new_route_advantage - expanded_base_advantage
+        )
         raw_branch_active = torch.stack(
             [
                 policy.active_branches[branch].detach().to(device=device)
@@ -807,11 +894,16 @@ def collect_route_telemetry(
             ],
             dim=-1,
         )
+        branch_ppo_advantage = (
+            expanded_advantage.unsqueeze(-1).expand_as(new_branch_log_probs)
+            if branch_advantage is None
+            else branch_advantage.detach().to(device=device)
+        )
         branch_ppo = compute_branch_ppo_dynamics(
             old_branch_log_probs,
             new_branch_log_probs,
             valid_branch_active,
-            expanded_advantage.unsqueeze(-1).expand_as(new_branch_log_probs),
+            branch_ppo_advantage,
             epsilon_clip,
         )
         active_branch_matrix = tuple(
@@ -881,6 +973,18 @@ def collect_route_telemetry(
                 if td_values is not None
                 else RouteDistributionSummary()
             )
+        base_route_advantage_summary = summarize_distribution(
+            expanded_base_advantage,
+            active,
+        )
+        new_route_advantage_summary = summarize_distribution(
+            expanded_new_route_advantage,
+            active,
+        )
+        route_advantage_delta_summary = summarize_distribution(
+            expanded_route_advantage_delta,
+            active,
+        )
 
         def mean_active(values: Tensor) -> float | None:
             return _optional_mean(values, active)
@@ -911,12 +1015,50 @@ def collect_route_telemetry(
         flat_old = old_route.reshape(-1) if old_route is not None else None
         flat_new = new_route.reshape(-1)
         flat_adv = expanded_advantage.reshape(-1)
+        flat_base_adv = expanded_base_advantage.reshape(-1)
+        flat_new_route_adv = expanded_new_route_advantage.reshape(-1)
+        flat_route_adv_delta = expanded_route_advantage_delta.reshape(-1)
         flat_ret = expanded_return.reshape(-1)
         flat_td = td_values.reshape(-1) if td_values is not None else None
         flat_total_remote = total_remote_probability.reshape(-1)
         flat_local = local_probability.reshape(-1)
         flat_defer = defer_probability.reshape(-1)
         flat_best = best_remote_probability.reshape(-1)
+        flat_bootstrap = (
+            None
+            if bootstrap_mask is None
+            else bootstrap_mask.detach().to(device="cpu").reshape(-1)
+        )
+        base_credit_is_per_agent = (
+            (advantage if base_advantage is None else base_advantage).ndim == 3
+        )
+
+        def trace_provenance(index: int) -> tuple[int | None, str | None, str | None]:
+            if flat_bootstrap is None:
+                return None, None, None
+            boundary_index = next(
+                (
+                    candidate
+                    for candidate in range(index, flat_bootstrap.numel())
+                    if not bool(flat_bootstrap[candidate])
+                ),
+                None,
+            )
+            if boundary_index is not None:
+                return (
+                    boundary_index - index + 1,
+                    "episode_boundary",
+                    "none_episode_boundary",
+                )
+            return (
+                flat_bootstrap.numel() - index,
+                "rollout_boundary",
+                (
+                    "saved_source_agent_v_next"
+                    if base_credit_is_per_agent
+                    else "saved_team_v_next"
+                ),
+            )
         for flat_index in torch.nonzero(flat_active, as_tuple=False).reshape(-1).tolist():
             b = flat_index // (time * agents)
             remainder = flat_index % (time * agents)
@@ -942,6 +1084,9 @@ def collect_route_telemetry(
             new_value = float(flat_new[flat_index].item())
             log_ratio = new_value - old_value if old_value is not None else None
             ratio = math.exp(log_ratio) if log_ratio is not None else None
+            trace_length, trace_end_kind, bootstrap_source = trace_provenance(
+                b * time + t
+            )
             samples.append(RouteSampleTelemetry(
                 batch_index=b,
                 time_index=t,
@@ -974,6 +1119,17 @@ def collect_route_telemetry(
                 advantage=float(flat_adv[flat_index].item()),
                 return_target=float(flat_ret[flat_index].item()),
                 td_residual=float(flat_td[flat_index].item()) if flat_td is not None else None,
+                base_route_advantage=float(flat_base_adv[flat_index].item()),
+                new_route_advantage=float(flat_new_route_adv[flat_index].item()),
+                route_advantage_delta=float(flat_route_adv_delta[flat_index].item()),
+                effective_route_gae_lambda=(
+                    None
+                    if effective_route_gae_lambda is None
+                    else float(effective_route_gae_lambda)
+                ),
+                credit_trace_length_slots=trace_length,
+                trace_end_kind=trace_end_kind,
+                bootstrap_source=bootstrap_source,
             ))
 
         return RouteTelemetry(
@@ -1039,6 +1195,33 @@ def collect_route_telemetry(
             route_head_total_grad_status=gradients.total.status,
             route_head_total_grad_norm=gradients.total.norm,
             route_probability_valid_sample_count=active_count,
+            base_route_advantage_valid_sample_count=(
+                base_route_advantage_summary.count
+            ),
+            base_route_advantage_mean=base_route_advantage_summary.mean,
+            base_route_advantage_std=base_route_advantage_summary.std,
+            base_route_advantage_median=base_route_advantage_summary.median,
+            base_route_advantage_p90_absolute_magnitude=(
+                base_route_advantage_summary.p90_absolute_magnitude
+            ),
+            new_route_advantage_valid_sample_count=(
+                new_route_advantage_summary.count
+            ),
+            new_route_advantage_mean=new_route_advantage_summary.mean,
+            new_route_advantage_std=new_route_advantage_summary.std,
+            new_route_advantage_median=new_route_advantage_summary.median,
+            new_route_advantage_p90_absolute_magnitude=(
+                new_route_advantage_summary.p90_absolute_magnitude
+            ),
+            route_advantage_delta_valid_sample_count=(
+                route_advantage_delta_summary.count
+            ),
+            route_advantage_delta_mean=route_advantage_delta_summary.mean,
+            route_advantage_delta_std=route_advantage_delta_summary.std,
+            route_advantage_delta_median=route_advantage_delta_summary.median,
+            route_advantage_delta_p90_absolute_magnitude=(
+                route_advantage_delta_summary.p90_absolute_magnitude
+            ),
             mean_selected_route_probability_all_route_active=mean_active(selected_probability),
             mean_local_probability_all_route_active=mean_active(local_probability),
             mean_defer_probability_all_route_active=mean_active(defer_probability),
@@ -1086,6 +1269,7 @@ class RouteDistributionSummary:
     p75: float | None = None
     positive_fraction: float | None = None
     negative_fraction: float | None = None
+    p90_absolute_magnitude: float | None = None
 
     def record(self, prefix: str, *, include_quantiles: bool = True) -> dict[str, object]:
         result = {
@@ -1121,6 +1305,9 @@ def summarize_distribution(values: Tensor, mask: Tensor | None = None) -> RouteD
         p75=float(torch.quantile(selected, 0.75).cpu().item()),
         positive_fraction=float((selected > 0).float().mean().cpu().item()),
         negative_fraction=float((selected < 0).float().mean().cpu().item()),
+        p90_absolute_magnitude=float(
+            torch.quantile(selected.abs(), 0.90).cpu().item()
+        ),
     )
 
 
@@ -1219,6 +1406,13 @@ class RouteSampleTelemetry:
     advantage: float | None
     return_target: float | None
     td_residual: float | None
+    base_route_advantage: float | None = None
+    new_route_advantage: float | None = None
+    route_advantage_delta: float | None = None
+    effective_route_gae_lambda: float | None = None
+    credit_trace_length_slots: int | None = None
+    trace_end_kind: str | None = None
+    bootstrap_source: str | None = None
 
     def __post_init__(self) -> None:
         if self.number_of_legal_remote_destinations != len(self.legal_remote_destinations):
@@ -1253,6 +1447,13 @@ class RouteSampleTelemetry:
             "route_sample_advantage": self.advantage,
             "route_sample_return_target": self.return_target,
             "route_sample_td_residual": self.td_residual,
+            "route_sample_base_route_advantage": self.base_route_advantage,
+            "route_sample_new_route_advantage": self.new_route_advantage,
+            "route_sample_advantage_delta": self.route_advantage_delta,
+            "route_sample_effective_route_gae_lambda": self.effective_route_gae_lambda,
+            "route_sample_credit_trace_length_slots": self.credit_trace_length_slots,
+            "route_sample_trace_end_kind": self.trace_end_kind,
+            "route_sample_bootstrap_source": self.bootstrap_source,
         }
 
 
@@ -2532,6 +2733,13 @@ class TrajectoryCreditTracker:
                 "policy_version_before": policy_version_before,
                 "policy_version_after": policy_version_after,
                 "advantage": sample.advantage,
+                "base_route_advantage": sample.base_route_advantage,
+                "new_route_advantage": sample.new_route_advantage,
+                "route_advantage_delta": sample.route_advantage_delta,
+                "effective_route_gae_lambda": sample.effective_route_gae_lambda,
+                "credit_trace_length_slots": sample.credit_trace_length_slots,
+                "trace_end_kind": sample.trace_end_kind,
+                "bootstrap_source": sample.bootstrap_source,
                 "td_residual": sample.td_residual,
                 "return_target": sample.return_target,
                 "old_route_log_prob": sample.old_route_log_prob,

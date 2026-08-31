@@ -16,6 +16,7 @@ from torch import Tensor
 from ..config import (
     ActorRatioMode,
     AgentCreditMode,
+    RouteCreditMode,
     RunConfig,
     compute_route_entropy_schedule,
 )
@@ -174,6 +175,7 @@ class CAGATMAPPOLossOutput:
     branch_unclipped_surrogate: Tensor | None = None
     branch_clipped_surrogate: Tensor | None = None
     branch_surrogate: Tensor | None = None
+    branch_advantage: Tensor | None = None
     active_branch_indicators: Tensor | None = None
     active_branch_count: Tensor | None = None
 
@@ -288,6 +290,7 @@ class CAGATMAPPOLossOutput:
             self.branch_unclipped_surrogate,
             self.branch_clipped_surrogate,
             self.branch_surrogate,
+            self.branch_advantage,
         )
         if ratio_mode is ActorRatioMode.JOINT:
             if any(tensor is not None for tensor in branch_tensors) or any(
@@ -363,6 +366,7 @@ def compute_ppo_objective_and_loss(
     route_entropy_coefficient: float | None = None,
     route_entropy_schedule_progress: float = 0.0,
     collected_environment_steps: int | None = None,
+    route_advantage: Tensor | None = None,
 ) -> CAGATMAPPOLossOutput:
     """Compute the frozen PPO objective from proposal-policy statistics.
 
@@ -433,6 +437,11 @@ def compute_ppo_objective_and_loss(
     old_log_prob = _floating_tensor(old_joint_log_prob, "old_joint_log_prob", 2)
     credit_rank = 1 if credit_mode is AgentCreditMode.TEAM else 2
     raw_advantage = _floating_tensor(advantage, "advantage", credit_rank)
+    raw_route_advantage = (
+        None
+        if route_advantage is None
+        else _floating_tensor(route_advantage, "route_advantage", 2)
+    )
     values = _floating_tensor(current_value, "current_value", credit_rank)
     targets = _floating_tensor(return_target, "return_target", credit_rank)
     active_entropy = _floating_tensor(entropy, "entropy", 2)
@@ -472,6 +481,17 @@ def compute_ppo_objective_and_loss(
             raise PPOObjectiveError(
                 f"{name} shape differs from agent_credit_mode"
             )
+    if raw_route_advantage is not None:
+        if ratio_mode is not ActorRatioMode.BRANCH_SPECIFIC:
+            raise PPOObjectiveError(
+                "route_advantage requires branch_specific actor ratios"
+            )
+        if credit_mode is not AgentCreditMode.ROLE_DECOMPOSED:
+            raise PPOObjectiveError(
+                "route_advantage requires role_decomposed agent credit"
+            )
+        if raw_route_advantage.shape != (time_steps, agent_count):
+            raise PPOObjectiveError("route_advantage must have shape [T,A]")
     floating_inputs = (
         old_log_prob,
         raw_advantage,
@@ -481,6 +501,8 @@ def compute_ppo_objective_and_loss(
     )
     if active_route_entropy is not None:
         floating_inputs = (*floating_inputs, active_route_entropy)
+    if raw_route_advantage is not None:
+        floating_inputs = (*floating_inputs, raw_route_advantage)
     if any(tensor.device != new_log_prob.device for tensor in floating_inputs):
         raise PPOObjectiveError("all PPO statistics must share one device")
     if any(tensor.dtype != new_log_prob.dtype for tensor in floating_inputs):
@@ -510,6 +532,7 @@ def compute_ppo_objective_and_loss(
     branch_unclipped_surrogate = None
     branch_clipped_surrogate = None
     branch_surrogate = None
+    branch_advantage = None
     fixed_active_branches = None
     active_branch_count = None
     if ratio_mode is ActorRatioMode.JOINT:
@@ -585,9 +608,21 @@ def compute_ppo_objective_and_loss(
             1.0 - epsilon,
             1.0 + epsilon,
         )
-        branch_advantage = expanded_advantage.unsqueeze(-1).expand_as(
-            branch_ratio
-        )
+        if raw_route_advantage is None:
+            branch_advantage = expanded_advantage.unsqueeze(-1).expand_as(
+                branch_ratio
+            )
+        else:
+            fixed_route_advantage = raw_route_advantage.detach()
+            branch_advantage = torch.cat(
+                (
+                    fixed_route_advantage.unsqueeze(-1),
+                    expanded_advantage.unsqueeze(-1).expand_as(branch_ratio)[
+                        ..., 1:
+                    ],
+                ),
+                dim=-1,
+            )
         branch_unclipped_surrogate = torch.where(
             fixed_active_branches,
             branch_ratio * branch_advantage,
@@ -785,6 +820,7 @@ def compute_ppo_objective_and_loss(
         branch_unclipped_surrogate=branch_unclipped_surrogate,
         branch_clipped_surrogate=branch_clipped_surrogate,
         branch_surrogate=branch_surrogate,
+        branch_advantage=branch_advantage,
         active_branch_indicators=fixed_active_branches,
         active_branch_count=active_branch_count,
     )
@@ -805,6 +841,7 @@ def compute_configured_ppo_objective_and_loss(
     active_branch_indicators: Tensor | None = None,
     route_entropy: Tensor | None = None,
     collected_environment_steps: int | None = None,
+    route_advantage: Tensor | None = None,
 ) -> CAGATMAPPOLossOutput:
     """Use the Section 4 values already centralized in ``RunConfig``."""
 
@@ -812,6 +849,16 @@ def compute_configured_ppo_objective_and_loss(
         raise TypeError("config must be a RunConfig")
     config.validate()
     mappo = config.training.mappo
+    route_credit_mode = RouteCreditMode(mappo.route_credit_mode)
+    if route_credit_mode is RouteCreditMode.ROUTE_SPECIFIC_GAE:
+        if route_advantage is None:
+            raise PPOObjectiveError(
+                "route_specific_gae requires route_advantage"
+            )
+    elif route_advantage is not None:
+        raise PPOObjectiveError(
+            "shared_gae must not receive route_advantage"
+        )
     if mappo.entropy_coefficient_schedule_enabled:
         if route_entropy is None:
             raise PPOObjectiveError(
@@ -847,6 +894,7 @@ def compute_configured_ppo_objective_and_loss(
         route_entropy_coefficient=schedule.coefficient,
         route_entropy_schedule_progress=schedule.progress,
         collected_environment_steps=collected_environment_steps,
+        route_advantage=route_advantage,
     )
 
 

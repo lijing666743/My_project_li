@@ -16,7 +16,7 @@ import torch
 from torch import Tensor, nn
 from torch.optim import Adam
 
-from ..config import ActorRatioMode, AgentCreditMode, RunConfig
+from ..config import ActorRatioMode, AgentCreditMode, RouteCreditMode, RunConfig
 from ..env.actions import ActionProposal
 from .ca_gat_mappo import (
     ACTION_BRANCH_ORDER,
@@ -31,7 +31,10 @@ from .ca_gat_mappo_actions import (
     SequentialActionDistributionOutput,
     SequentialActionMaskBatch,
 )
-from .ca_gat_mappo_gae import compute_rollout_gae
+from .ca_gat_mappo_gae import (
+    compute_rollout_gae,
+    compute_route_specific_advantage,
+)
 from .ca_gat_mappo_ppo import (
     CAGATMAPPOLossOutput,
     compute_configured_ppo_objective_and_loss,
@@ -109,6 +112,8 @@ class RecurrentPPOMinibatch:
     agent_credit_mode: str
     old_branch_log_probs: Tensor | None = None
     td_residual: Tensor | None = None
+    route_advantage: Tensor | None = None
+    bootstrap_mask: Tensor | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.spec, MAPPOTensorSpec):
@@ -158,6 +163,7 @@ class RecurrentPPOMinibatch:
         optional = {
             "old_branch_log_probs": (8, 32, self.spec.uav_count, len(ACTION_BRANCH_ORDER)),
             "td_residual": credit_shape,
+            "route_advantage": (8, 32, self.spec.uav_count),
         }
         for name, expected_shape in optional.items():
             tensor = getattr(self, name)
@@ -165,6 +171,15 @@ class RecurrentPPOMinibatch:
                 raise RecurrentPPOUpdateError(f"{name} has an invalid optional snapshot shape")
             if tensor is not None and (tensor.dtype != torch.float32 or tensor.requires_grad or not torch.isfinite(tensor).all()):
                 raise RecurrentPPOUpdateError(f"{name} must be a detached finite CPU float32 snapshot")
+        if self.bootstrap_mask is not None and (
+            not isinstance(self.bootstrap_mask, Tensor)
+            or tuple(self.bootstrap_mask.shape) != (8, 32)
+            or self.bootstrap_mask.device.type != "cpu"
+            or self.bootstrap_mask.dtype != torch.bool
+        ):
+            raise RecurrentPPOUpdateError(
+                "bootstrap_mask must be a detached boolean [8,32] CPU snapshot"
+            )
         if self.rollout_indices.dtype != torch.long:
             raise RecurrentPPOUpdateError("rollout_indices must use torch.long")
         expected_indices = torch.arange(256, dtype=torch.long).reshape(8, 32)
@@ -237,6 +252,16 @@ def build_recurrent_ppo_minibatch(
     chunks = tuple(buffer.get_sequence(index * 32, 32) for index in range(8))
     full_rollout = buffer.get_sequence(0, 256)
     gae = compute_rollout_gae(full_rollout, config)
+    route_advantage = None
+    mappo = config.training.mappo
+    if RouteCreditMode(mappo.route_credit_mode) is RouteCreditMode.ROUTE_SPECIFIC_GAE:
+        route_advantage = compute_route_specific_advantage(
+            base_td_residual=gae.td_residual,
+            bootstrap_mask=gae.bootstrap_mask,
+            sequence_mask=gae.sequence_mask,
+            gamma=mappo.gamma,
+            route_gae_lambda=mappo.route_gae_lambda,
+        )
     actor_batches = tuple(chunk.actor_batch for chunk in chunks)
     actor_batch = _cat_actor_batches(actor_batches)
     centralized_batch = CentralizedStateTensorBatch(
@@ -276,6 +301,12 @@ def build_recurrent_ppo_minibatch(
         td_residual=gae.td_residual.reshape(
             (8, 32) + tuple(gae.td_residual.shape[1:])
         ).clone(),
+        route_advantage=(
+            None
+            if route_advantage is None
+            else route_advantage.reshape(8, 32, expected_spec.uav_count).clone()
+        ),
+        bootstrap_mask=gae.bootstrap_mask.reshape(8, 32).clone(),
     )
     return result
 
@@ -342,6 +373,11 @@ class BatchedCAGATMAPPOLossOutput:
     @property
     def branch_surrogate(self) -> Tensor | None:
         value = self.flattened.branch_surrogate
+        return None if value is None else self._branch_view(value)
+
+    @property
+    def branch_advantage(self) -> Tensor | None:
+        value = self.flattened.branch_advantage
         return None if value is None else self._branch_view(value)
 
     @property
@@ -426,6 +462,7 @@ def compute_configured_batched_ppo_objective_and_loss(
     active_branch_indicators: Tensor | None = None,
     route_entropy: Tensor | None = None,
     collected_environment_steps: int | None = None,
+    route_advantage: Tensor | None = None,
 ) -> BatchedCAGATMAPPOLossOutput:
     """Apply the passed PPO objective uniformly over all B-by-L positions."""
 
@@ -463,6 +500,13 @@ def compute_configured_batched_ppo_objective_and_loss(
             raise RecurrentPPOUpdateError(
                 f"{name} shape differs from agent_credit_mode"
             )
+    if route_advantage is not None and (
+        not isinstance(route_advantage, Tensor)
+        or tuple(route_advantage.shape) != (8, 32, agent_count)
+    ):
+        raise RecurrentPPOUpdateError(
+            "route_advantage must have shape [8,32,A] or be NA"
+        )
     if (
         not isinstance(sequence_valid_mask, Tensor)
         or sequence_valid_mask.shape != (8, 32)
@@ -534,6 +578,11 @@ def compute_configured_batched_ppo_objective_and_loss(
             else route_entropy.reshape(256, agent_count)
         ),
         collected_environment_steps=collected_environment_steps,
+        route_advantage=(
+            None
+            if route_advantage is None
+            else route_advantage.reshape(256, agent_count)
+        ),
     )
     return BatchedCAGATMAPPOLossOutput(
         flattened=flattened,
@@ -706,6 +755,8 @@ class _DeviceRecurrentPPOMinibatch:
     sequence_valid_mask: Tensor
     old_branch_log_probs: Tensor | None = None
     td_residual: Tensor | None = None
+    route_advantage: Tensor | None = None
+    bootstrap_mask: Tensor | None = None
 
 
 def _prepare_device_minibatch(
@@ -729,6 +780,10 @@ def _prepare_device_minibatch(
                               if minibatch.old_branch_log_probs is not None else None),
         td_residual=(minibatch.td_residual.to(device=device, dtype=dtype)
                      if minibatch.td_residual is not None else None),
+        route_advantage=(minibatch.route_advantage.to(device=device, dtype=dtype)
+                         if minibatch.route_advantage is not None else None),
+        bootstrap_mask=(minibatch.bootstrap_mask.to(device=device)
+                        if minibatch.bootstrap_mask is not None else None),
     )
 
 
@@ -1138,12 +1193,16 @@ class CAGATMAPPORecurrentPPOUpdater:
 
         minibatch = build_recurrent_ppo_minibatch(buffer, self.config)
         prepared = _prepare_device_minibatch(minibatch, self.device, self.dtype)
-        fixed_targets: Mapping[str, Tensor] = {
+        fixed_targets: dict[str, Tensor] = {
             "old_joint_log_prob": prepared.old_joint_log_prob.detach().clone(),
             "old_value": prepared.old_value.detach().clone(),
             "advantage": prepared.advantage.detach().clone(),
             "return_target": prepared.return_target.detach().clone(),
         }
+        if prepared.route_advantage is not None:
+            fixed_targets["route_advantage"] = (
+                prepared.route_advantage.detach().clone()
+            )
         mappo = self.config.training.mappo
         epoch_diagnostics: list[RecurrentPPOEpochDiagnostics] = []
         for epoch_index in range(mappo.update_epochs):
@@ -1177,6 +1236,7 @@ class CAGATMAPPORecurrentPPOUpdater:
                 active_branch_indicators=prepared.active_branch_indicators,
                 route_entropy=evaluation.policy.branch_entropies["route"],
                 collected_environment_steps=collected_environment_steps,
+                route_advantage=prepared.route_advantage,
             )
             loss.total_loss.backward()
             route_telemetry = None
@@ -1185,7 +1245,11 @@ class CAGATMAPPORecurrentPPOUpdater:
                     policy=evaluation.policy,
                     action_mask_batch=prepared.action_mask_batch,
                     proposals=prepared.proposals,
-                    advantage=prepared.advantage,
+                    advantage=(
+                        prepared.route_advantage
+                        if prepared.route_advantage is not None
+                        else prepared.advantage
+                    ),
                     return_target=prepared.return_target,
                     sequence_valid_mask=prepared.sequence_valid_mask,
                     route_head=self.actor.action_heads["route"],
@@ -1194,6 +1258,16 @@ class CAGATMAPPORecurrentPPOUpdater:
                     shared_trunk=self.actor,
                     epsilon_clip=self.config.training.mappo.ppo_clip_epsilon,
                     actor_ratio_mode=mappo.actor_ratio_mode,
+                    base_advantage=prepared.advantage,
+                    route_advantage=prepared.route_advantage,
+                    branch_advantage=loss.branch_advantage,
+                    bootstrap_mask=prepared.bootstrap_mask,
+                    effective_route_gae_lambda=(
+                        mappo.route_gae_lambda
+                        if RouteCreditMode(mappo.route_credit_mode)
+                        is RouteCreditMode.ROUTE_SPECIFIC_GAE
+                        else mappo.gae_lambda
+                    ),
                 )
             agent_credit_telemetry = None
             if (

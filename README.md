@@ -145,6 +145,7 @@ knowledge/project_plan/方案2.md
 
 - Small Scenario Candidate Radius Revision V1 已完成配置层、拓扑回归和模型说明同步：resolved candidate-neighbor graph cutoff 为 small=525 m、medium/large=500 m；该阈值不等价于最大通信范围，已绑定 service-edge、channel/SINR/rate/outage、reward 和 RL 算法保持不变。本轮未训练、未运行 Seeds 43–46，等待人工审查。
 - Minimal Trajectory-Credit Telemetry V1 诊断遥测已实现，行为中性回归已完成。
+- Route-Specific Lambda-One GAE V1 已实现，并通过静态验证与行为隔离验证；本结论不包含性能、收敛或算法优越性声明。
 
 ## 下一步
 

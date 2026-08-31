@@ -351,6 +351,63 @@ def compute_per_agent_gae_and_returns(
     )
 
 
+def compute_route_specific_advantage(
+    *,
+    base_td_residual: Tensor,
+    bootstrap_mask: Tensor,
+    sequence_mask: Tensor,
+    gamma: float,
+    route_gae_lambda: float,
+) -> Tensor:
+    """Recur a route-only per-agent advantage from the frozen base residual.
+
+    The function deliberately accepts the already-computed production TD
+    residual instead of reward/value inputs.  This makes it impossible for the
+    route estimator to introduce a second reward, value, or bootstrap
+    definition and leaves the production critic target outside this path.
+    """
+
+    resolved_gamma = _coefficient(gamma, "gamma", include_zero=False)
+    resolved_lambda = _coefficient(
+        route_gae_lambda,
+        "route_gae_lambda",
+        include_zero=True,
+    )
+    residual = _float_matrix(base_td_residual, "base_td_residual")
+    bootstrap = _bool_vector(bootstrap_mask, "bootstrap_mask")
+    valid = _bool_vector(sequence_mask, "sequence_mask")
+    if bootstrap.shape != valid.shape or residual.shape[0] != valid.shape[0]:
+        raise GAEComputationError(
+            "route advantage inputs must share the same time axis"
+        )
+    valid_length = int(valid.sum().item())
+    if valid_length == 0:
+        raise GAEComputationError("route advantage sequence has no valid positions")
+    expected_valid = torch.arange(valid.numel()) < valid_length
+    if not torch.equal(valid, expected_valid):
+        raise GAEComputationError(
+            "route sequence_mask must describe one contiguous prefix"
+        )
+    if torch.any(bootstrap & ~valid):
+        raise GAEComputationError(
+            "route bootstrap mask cannot enable padding positions"
+        )
+
+    advantage = torch.zeros_like(residual)
+    next_advantage = torch.zeros(residual.shape[1], dtype=torch.float32)
+    recurrence_scale = resolved_gamma * resolved_lambda
+    bootstrap_float = bootstrap.to(dtype=torch.float32).unsqueeze(-1)
+    for index in range(valid_length - 1, -1, -1):
+        advantage[index] = (
+            residual[index]
+            + recurrence_scale * bootstrap_float[index] * next_advantage
+        )
+        next_advantage = advantage[index]
+    if not torch.isfinite(advantage).all():
+        raise GAEComputationError("route advantage contains NaN or Inf")
+    return advantage
+
+
 def compute_rollout_gae(
     chunk: CAGATMAPPORolloutChunk,
     config: RunConfig,
@@ -404,5 +461,6 @@ __all__ = [
     "GAEComputationError",
     "compute_gae_and_returns",
     "compute_per_agent_gae_and_returns",
+    "compute_route_specific_advantage",
     "compute_rollout_gae",
 ]

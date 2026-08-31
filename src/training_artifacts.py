@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .artifacts import atomic_write_bytes_group, require_artifact_targets_absent
-from .config import RunConfig, compute_route_entropy_schedule
+from .config import RouteCreditMode, RunConfig, compute_route_entropy_schedule
 from .models.ca_gat_mappo_route_telemetry import (
     ROUTE_TELEMETRY_SCHEMA_VERSION,
     TRAJECTORY_CREDIT_EVENT_TYPES,
@@ -67,6 +67,15 @@ _ROUTE_SAMPLE_COLUMNS = (
     "route_sample_advantage",
     "route_sample_return_target",
     "route_sample_td_residual",
+    "route_sample_base_route_advantage",
+    "route_sample_new_route_advantage",
+    "route_sample_advantage_delta",
+    "route_sample_effective_route_gae_lambda",
+    "route_sample_credit_trace_length_slots",
+    "route_sample_trace_end_kind",
+    "route_sample_bootstrap_source",
+    "global_rollout_index",
+    "policy_version",
 )
 _ROUTE_OUTCOME_COLUMNS = tuple(
     f"route_outcome_{item.name}" for item in fields(RouteOutcomeAssociation)
@@ -106,6 +115,8 @@ TRAINING_METRIC_COLUMNS = (
     "diagnostics_schema_version",
     "actor_ratio_mode",
     "agent_credit_mode",
+    "route_credit_mode",
+    "effective_route_gae_lambda",
     "record_type",
     "telemetry_scope",
     "series_index",
@@ -501,6 +512,13 @@ def _base_record(config: RunConfig, signal_gate_status: str) -> dict[str, Any]:
     actor_ratio_mode = getattr(ratio_mode, "value", ratio_mode)
     credit_mode = config.training.mappo.agent_credit_mode
     agent_credit_mode = getattr(credit_mode, "value", credit_mode)
+    route_mode = config.training.mappo.route_credit_mode
+    route_credit_mode = getattr(route_mode, "value", route_mode)
+    effective_route_gae_lambda = (
+        config.training.mappo.route_gae_lambda
+        if RouteCreditMode(route_mode) is RouteCreditMode.ROUTE_SPECIFIC_GAE
+        else config.training.mappo.gae_lambda
+    )
     return {
         "run_id": config.run_id,
         "method_id": config.method_id,
@@ -511,6 +529,8 @@ def _base_record(config: RunConfig, signal_gate_status: str) -> dict[str, Any]:
         "diagnostics_schema_version": TRAINING_DIAGNOSTICS_SCHEMA_VERSION,
         "actor_ratio_mode": actor_ratio_mode,
         "agent_credit_mode": agent_credit_mode,
+        "route_credit_mode": route_credit_mode,
+        "effective_route_gae_lambda": effective_route_gae_lambda,
         "record_type": None,
         "telemetry_scope": None,
         "series_index": None,
@@ -762,6 +782,12 @@ def _route_sample_records(
                     "ppo_clip_epsilon": mappo.ppo_clip_epsilon,
                     "route_telemetry_enabled": True,
                     "route_telemetry_schema_version": telemetry.schema_version,
+                    "global_rollout_index": (
+                        update.update_index * mappo.rollout_length_slots
+                        + sample.batch_index * mappo.recurrent_chunk_length_slots
+                        + sample.time_index
+                    ),
+                    "policy_version": update.rollout_policy_version,
                 })
                 record.update(sample.record())
                 records.append(record)

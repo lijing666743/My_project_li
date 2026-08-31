@@ -223,6 +223,13 @@ class AgentCreditMode(str, Enum):
     ROLE_DECOMPOSED = "role_decomposed"
 
 
+class RouteCreditMode(str, Enum):
+    """Select shared base GAE or a route-only longer-horizon estimator."""
+
+    SHARED_GAE = "shared_gae"
+    ROUTE_SPECIFIC_GAE = "route_specific_gae"
+
+
 def _installed_distribution_version(name: str) -> str:
     try:
         return importlib.metadata.version(name)
@@ -495,6 +502,8 @@ class MAPPOConfig:
     ppo_clip_epsilon: float = 0.20
     actor_ratio_mode: ActorRatioMode = ActorRatioMode.JOINT
     agent_credit_mode: AgentCreditMode = AgentCreditMode.TEAM
+    route_credit_mode: RouteCreditMode = RouteCreditMode.SHARED_GAE
+    route_gae_lambda: float = 1.0
     entropy_coefficient: float = 0.01
     value_coefficient: float = 0.50
     rollout_length_slots: int = 256
@@ -750,6 +759,16 @@ class RunConfig:
             # Keep old config hashes and Checkpoint V1 identities unchanged;
             # role-decomposed credit remains part of the canonical identity.
             mappo.pop("agent_credit_mode")
+        if (
+            isinstance(mappo, dict)
+            and mappo.get("route_credit_mode") == RouteCreditMode.SHARED_GAE.value
+        ):
+            # Shared GAE is the historical actor-credit behavior.  Both the
+            # selector and its dormant treatment coefficient stay outside the
+            # legacy canonical payload so old hashes remain byte-for-byte
+            # stable.
+            mappo.pop("route_credit_mode")
+            mappo.pop("route_gae_lambda")
         if isinstance(mappo, dict) and not mappo.get(
             "entropy_coefficient_schedule_enabled", False
         ):
@@ -1000,6 +1019,46 @@ class RunConfig:
                 f"{tuple(mode.value for mode in AgentCreditMode)}, "
                 f"got {mappo.agent_credit_mode!r}"
             ) from exc
+        try:
+            route_credit_mode = RouteCreditMode(mappo.route_credit_mode)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(
+                "training.mappo.route_credit_mode must be one of "
+                f"{tuple(mode.value for mode in RouteCreditMode)}, "
+                f"got {mappo.route_credit_mode!r}"
+            ) from exc
+        if (
+            isinstance(mappo.route_gae_lambda, bool)
+            or not isinstance(mappo.route_gae_lambda, (int, float))
+            or not math.isfinite(float(mappo.route_gae_lambda))
+            or not 0.0 <= float(mappo.route_gae_lambda) <= 1.0
+        ):
+            raise ConfigError(
+                "training.mappo.route_gae_lambda must lie in [0, 1]"
+            )
+        if route_credit_mode is RouteCreditMode.ROUTE_SPECIFIC_GAE:
+            required = (
+                ("gamma", mappo.gamma, 0.99),
+                ("gae_lambda", mappo.gae_lambda, 0.95),
+                ("route_gae_lambda", mappo.route_gae_lambda, 1.0),
+                (
+                    "actor_ratio_mode",
+                    ActorRatioMode(mappo.actor_ratio_mode),
+                    ActorRatioMode.BRANCH_SPECIFIC,
+                ),
+                (
+                    "agent_credit_mode",
+                    AgentCreditMode(mappo.agent_credit_mode),
+                    AgentCreditMode.ROLE_DECOMPOSED,
+                ),
+            )
+            for name, actual, expected in required:
+                if actual != expected:
+                    expected_value = getattr(expected, "value", expected)
+                    raise ConfigError(
+                        "route_specific_gae requires "
+                        f"training.mappo.{name}={expected_value}"
+                    )
         if mappo.optimizer != "Adam":
             raise ConfigError("training.mappo.optimizer must be 'Adam'")
         if mappo.optimizer_topology != "separate_actor_critic":
@@ -1336,6 +1395,7 @@ def validate_mappo_checkpoint_resume_compatibility(
     cuda_available: bool,
     checkpoint_actor_ratio_mode: str | None = None,
     checkpoint_agent_credit_mode: str | None = None,
+    checkpoint_route_credit_mode: str | None = None,
 ) -> None:
     """Apply the fail-fast V1 metadata checks without loading checkpoint bytes."""
 
@@ -1387,6 +1447,22 @@ def validate_mappo_checkpoint_resume_compatibility(
         raise ConfigError(
             "checkpoint agent_credit_mode mismatch; changing between team and "
             "role_decomposed requires a new run"
+        )
+    try:
+        source_route_credit_mode = RouteCreditMode(
+            RouteCreditMode.SHARED_GAE.value
+            if checkpoint_route_credit_mode is None
+            else checkpoint_route_credit_mode
+        )
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("checkpoint route_credit_mode is invalid") from exc
+    target_route_credit_mode = RouteCreditMode(
+        config.training.mappo.route_credit_mode
+    )
+    if source_route_credit_mode != target_route_credit_mode:
+        raise ConfigError(
+            "checkpoint route_credit_mode mismatch; changing between shared_gae "
+            "and route_specific_gae requires a new run"
         )
     if config_hash != config.config_hash:
         raise ConfigError("checkpoint canonical config_hash mismatch")
@@ -1897,6 +1973,7 @@ __all__ = [
     "MAPPO_INITIAL_POLICY_VERSION",
     "OutputConfig",
     "QMIXConfig",
+    "RouteCreditMode",
     "RouteEntropySchedulePoint",
     "RunConfig",
     "SUPPORTED_METHODS",
