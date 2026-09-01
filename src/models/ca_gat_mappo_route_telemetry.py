@@ -3063,7 +3063,10 @@ class TrajectoryCreditTracker:
                 "credit_trace_length_slots": sample.credit_trace_length_slots,
                 "trace_end_kind": sample.trace_end_kind,
                 "bootstrap_source": sample.bootstrap_source,
-                "task_id": sample.task_id,
+                # ``sample.task_id`` is optional N-step provenance.  Shared
+                # GAE intentionally leaves it as None, while the artifact
+                # credit event always has the formal identity in ``key``.
+                "task_id": key[1],
                 "branch_event_key": (
                     None
                     if sample.branch_event_key is None

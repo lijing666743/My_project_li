@@ -761,6 +761,73 @@ class TrajectoryCreditTrackerTests(unittest.TestCase):
         self.assertEqual(credits[0]["ppo_epoch_index"], 0)
         self.assertEqual(credits[0]["advantage"], 0.75)
 
+    def test_22c_shared_gae_credit_writer_uses_formal_route_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = telemetry_config(Path(directory))
+            self.assertEqual(
+                config.training.mappo.route_credit_mode.value,
+                "shared_gae",
+            )
+            tracker, events, item = synthetic_local_route(config)
+            writer = TrajectoryCreditArtifactWriter(config)
+            for record in events:
+                writer.write(record)
+            tracker._emit = writer.write
+            sample = (
+                ppo_output_for_local_route()
+                .epoch_diagnostics[0]
+                .route_telemetry.samples[0]
+            )
+            self.assertIsNone(sample.task_id)
+            terminal = terminal_record(config)
+            terminal["route_event_key"] = [0, item.task_id, 1]
+            writer.write(terminal)
+            tracker.observe_ppo_update(
+                ppo_output_for_local_route(),
+                update_index=0,
+                policy_version_before=0,
+                policy_version_after=1,
+                rollout_start_index=0,
+                rollout_length=256,
+            )
+            records = [
+                json.loads(line)
+                for line in Path(
+                    config.artifact_paths()["trajectory_credit_events"]
+                )
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            credit = next(
+                record for record in records if record["event_type"] == "credit"
+            )
+            self.assertEqual(credit["task_id"], item.task_id)
+            summary = inspect_trajectory_credit_artifact(config)
+            self.assertTrue(summary["route_credit_cardinality_match"])
+
+    def test_22d_shared_gae_no_head_keeps_nstep_metadata_disabled(self) -> None:
+        executed, summary = CAGATMAPPOTrainer._execution_metadata(
+            {
+                "executed": [{"uav_id": 0}],
+                "service": {
+                    "routing": [
+                        {
+                            "uav_id": 0,
+                            "task_id": None,
+                            "proposal": "defer",
+                            "applied": False,
+                        }
+                    ]
+                },
+            },
+            episode_id=0,
+            global_rollout_index=0,
+            policy_version=0,
+            route_credit_enabled=False,
+        )
+        self.assertEqual(executed, [{"uav_id": 0}])
+        self.assertNotIn("route_credit_step", summary)
+
     def test_22b_four_ppo_epochs_still_emit_one_canonical_credit(self) -> None:
         tracker, events, _ = synthetic_local_route(telemetry_config())
         base = ppo_output_for_local_route().epoch_diagnostics[0]

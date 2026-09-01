@@ -230,8 +230,8 @@ class RolloutCappedRouteNstepHandCalculationTests(unittest.TestCase):
                 step(
                     0,
                     10,
-                    decisions=(decision(0, 0, "task", 10),),
-                    terminals=(terminal(0, 0, "task", 10, kind),),
+                    decisions=(decision(0, 0, 7, 10),),
+                    terminals=(terminal(0, 0, 7, 10, kind),),
                 ),
             ),
         )
@@ -302,7 +302,7 @@ class RolloutCappedRouteNstepHandCalculationTests(unittest.TestCase):
             route_active=torch.tensor([[True], [False]]),
             metadata=(
                 step(
-                    0, 50, decisions=(decision(0, 0, "late", 50),)
+                    0, 50, decisions=(decision(0, 0, 8, 50),)
                 ),
                 step(0, 51),
             ),
@@ -381,7 +381,7 @@ class RolloutCappedRouteNstepIdentityTests(unittest.TestCase):
                             0,
                             decisions=(
                                 decision(
-                                    0, 0, "same", 0, category=category
+                                    0, 0, 9, 0, category=category
                                 ),
                             ),
                         ),
@@ -390,7 +390,7 @@ class RolloutCappedRouteNstepIdentityTests(unittest.TestCase):
                             1,
                             terminals=(
                                 terminal(
-                                    0, 0, "same", 1, "completed"
+                                    0, 0, 9, 1, "completed"
                                 ),
                             ),
                         ),
@@ -511,6 +511,28 @@ class RolloutCappedRouteNstepIdentityTests(unittest.TestCase):
                     step(0, 1),
                 ),
             )
+
+    def test_active_route_rejects_invalid_task_identity(self) -> None:
+        for invalid_task_id in (-1, None, True):
+            with self.subTest(task_id=invalid_task_id):
+                with self.assertRaisesRegex(RouteNstepError, "task_id"):
+                    estimate(
+                        reward=torch.ones((1, 1)),
+                        old_value=torch.zeros((1, 1)),
+                        bootstrap_value=torch.zeros((1, 1)),
+                        bootstrap_mask=torch.tensor([True]),
+                        episode_boundary=torch.tensor([False]),
+                        route_active=torch.tensor([[True]]),
+                        metadata=(
+                            step(
+                                0,
+                                0,
+                                decisions=(
+                                    decision(0, 0, invalid_task_id, 0),
+                                ),
+                            ),
+                        ),
+                    )
 
 
 class RolloutCappedRouteNstepIntegrationTests(unittest.TestCase):

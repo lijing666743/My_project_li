@@ -48,6 +48,15 @@ class RouteNstepSample:
     bootstrap_used: bool
 
     def __post_init__(self) -> None:
+        for name, value in (
+            ("episode_id", self.episode_id),
+            ("source_uav", self.source_uav),
+            ("task_id", self.task_id),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise RouteNstepError(
+                    f"{name} must be a non-negative integer"
+                )
         if self.category not in {"local", "remote", "defer"}:
             raise RouteNstepError("route-event category is invalid")
         if self.stop_kind not in ROUTE_NSTEP_STOP_KINDS:
@@ -143,6 +152,7 @@ def build_route_credit_step_metadata(
         task_id = raw.get("task_id")
         if task_id is None:
             continue
+        task_id = _nonnegative_int(task_id, "routing.task_id")
         category = _route_category(raw.get("proposal"))
         applied = raw.get("applied")
         expected_applied = category != "defer"
@@ -197,6 +207,7 @@ def build_route_credit_step_metadata(
                 raise RouteNstepError(
                     "terminal task snapshot lacks task_id"
                 )
+            task_id = _nonnegative_int(task_id, "terminal.task_id")
             key = (source, task_id)
             if key in terminal_keys:
                 raise RouteNstepError(
@@ -362,6 +373,8 @@ def compute_rollout_capped_route_event_nstep(
                 raise RouteNstepError(
                     "route step has duplicate agent decisions"
                 )
+            _nonnegative_int(raw.get("episode_id"), "decision.episode_id")
+            _nonnegative_int(raw.get("task_id"), "decision.task_id")
             per_agent[source] = raw
         decisions.append(per_agent)
         terminal_rows = tuple(
@@ -373,6 +386,10 @@ def compute_rollout_capped_route_event_nstep(
         )
         if len(terminal_rows) != len(step["terminals"]):
             raise RouteNstepError("terminal metadata must be mappings")
+        for raw in terminal_rows:
+            _nonnegative_int(raw.get("episode_id"), "terminal.episode_id")
+            _nonnegative_int(raw.get("source_uav"), "terminal.source_uav")
+            _nonnegative_int(raw.get("task_id"), "terminal.task_id")
         terminals.append(terminal_rows)
 
     output = base.clone()
@@ -395,7 +412,9 @@ def compute_rollout_capped_route_event_nstep(
             source = _nonnegative_int(
                 decision.get("source_uav"), "decision.source_uav"
             )
-            task_id = decision.get("task_id")
+            task_id = _nonnegative_int(
+                decision.get("task_id"), "decision.task_id"
+            )
             category = str(decision.get("category"))
             branch_key = tuple(
                 _sequence(
