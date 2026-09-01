@@ -591,7 +591,7 @@ class RouteEntropyTrainerAndTelemetryTests(unittest.TestCase):
             "collected_environment_steps",
         }
         self.assertTrue(required_fields.issubset(TRAINING_METRIC_COLUMNS))
-        self.assertEqual(TRAINING_DIAGNOSTICS_SCHEMA_VERSION, 4)
+        self.assertEqual(TRAINING_DIAGNOSTICS_SCHEMA_VERSION, 5)
         self.assertEqual(
             {record["route_entropy_coefficient"] for record in records},
             {0.03},
@@ -629,4 +629,3 @@ class RouteEntropyTrainerAndTelemetryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

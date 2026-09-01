@@ -43,6 +43,10 @@ from .ca_gat_mappo_route_telemetry import (
     RouteTelemetry,
     collect_route_telemetry,
 )
+from .ca_gat_mappo_route_nstep import (
+    RouteNstepSample,
+    compute_rollout_capped_route_event_nstep,
+)
 from .ca_gat_mappo_rollout import CAGATMAPPORolloutBuffer
 
 
@@ -114,6 +118,9 @@ class RecurrentPPOMinibatch:
     td_residual: Tensor | None = None
     route_advantage: Tensor | None = None
     bootstrap_mask: Tensor | None = None
+    route_nstep_samples: tuple[
+        tuple[tuple[RouteNstepSample | None, ...], ...], ...
+    ] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.spec, MAPPOTensorSpec):
@@ -230,6 +237,21 @@ class RecurrentPPOMinibatch:
             for time_step in chunk
         ):
             raise RecurrentPPOUpdateError("proposal snapshots have a ragged agent axis")
+        if self.route_nstep_samples is not None and (
+            len(self.route_nstep_samples) != 8
+            or any(
+                len(chunk) != 32
+                for chunk in self.route_nstep_samples
+            )
+            or any(
+                len(time_step) != self.spec.uav_count
+                for chunk in self.route_nstep_samples
+                for time_step in chunk
+            )
+        ):
+            raise RecurrentPPOUpdateError(
+                "route_nstep_samples must have shape [8][32][A]"
+            )
 
 
 def build_recurrent_ppo_minibatch(
@@ -253,14 +275,35 @@ def build_recurrent_ppo_minibatch(
     full_rollout = buffer.get_sequence(0, 256)
     gae = compute_rollout_gae(full_rollout, config)
     route_advantage = None
+    route_nstep_samples = None
     mappo = config.training.mappo
-    if RouteCreditMode(mappo.route_credit_mode) is RouteCreditMode.ROUTE_SPECIFIC_GAE:
+    route_mode = RouteCreditMode(mappo.route_credit_mode)
+    if route_mode is RouteCreditMode.ROUTE_SPECIFIC_GAE:
         route_advantage = compute_route_specific_advantage(
             base_td_residual=gae.td_residual,
             bootstrap_mask=gae.bootstrap_mask,
             sequence_mask=gae.sequence_mask,
             gamma=mappo.gamma,
             route_gae_lambda=mappo.route_gae_lambda,
+        )
+    elif route_mode is RouteCreditMode.ROLLOUT_CAPPED_ROUTE_EVENT_NSTEP:
+        nstep = compute_rollout_capped_route_event_nstep(
+            reward=full_rollout.reward,
+            old_value=full_rollout.old_value,
+            bootstrap_value=full_rollout.bootstrap_values,
+            bootstrap_mask=gae.bootstrap_mask,
+            episode_boundary=full_rollout.episode_boundary,
+            route_active=full_rollout.active_branch_indicators[..., 0],
+            base_advantage=gae.advantage,
+            transition_metadata=(
+                full_rollout.rejection_or_downgrade_summaries
+            ),
+            gamma=mappo.gamma,
+        )
+        route_advantage = nstep.advantage
+        route_nstep_samples = tuple(
+            tuple(nstep.samples[index * 32 : (index + 1) * 32])
+            for index in range(8)
         )
     actor_batches = tuple(chunk.actor_batch for chunk in chunks)
     actor_batch = _cat_actor_batches(actor_batches)
@@ -307,6 +350,7 @@ def build_recurrent_ppo_minibatch(
             else route_advantage.reshape(8, 32, expected_spec.uav_count).clone()
         ),
         bootstrap_mask=gae.bootstrap_mask.reshape(8, 32).clone(),
+        route_nstep_samples=route_nstep_samples,
     )
     return result
 
@@ -757,6 +801,9 @@ class _DeviceRecurrentPPOMinibatch:
     td_residual: Tensor | None = None
     route_advantage: Tensor | None = None
     bootstrap_mask: Tensor | None = None
+    route_nstep_samples: tuple[
+        tuple[tuple[RouteNstepSample | None, ...], ...], ...
+    ] | None = None
 
 
 def _prepare_device_minibatch(
@@ -784,6 +831,7 @@ def _prepare_device_minibatch(
                          if minibatch.route_advantage is not None else None),
         bootstrap_mask=(minibatch.bootstrap_mask.to(device=device)
                         if minibatch.bootstrap_mask is not None else None),
+        route_nstep_samples=minibatch.route_nstep_samples,
     )
 
 
@@ -1266,8 +1314,14 @@ class CAGATMAPPORecurrentPPOUpdater:
                         mappo.route_gae_lambda
                         if RouteCreditMode(mappo.route_credit_mode)
                         is RouteCreditMode.ROUTE_SPECIFIC_GAE
-                        else mappo.gae_lambda
+                        else (
+                            None
+                            if RouteCreditMode(mappo.route_credit_mode)
+                            is RouteCreditMode.ROLLOUT_CAPPED_ROUTE_EVENT_NSTEP
+                            else mappo.gae_lambda
+                        )
                     ),
+                    route_nstep_samples=prepared.route_nstep_samples,
                 )
             agent_credit_telemetry = None
             if (

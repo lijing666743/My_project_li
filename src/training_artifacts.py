@@ -37,7 +37,7 @@ REWARD_SMOOTHING_WINDOW_EPISODES = 5
 MIN_SIGNAL_EPISODES = 10
 MIN_SIGNAL_PPO_EPOCHS = 10
 
-TRAINING_DIAGNOSTICS_SCHEMA_VERSION = 4
+TRAINING_DIAGNOSTICS_SCHEMA_VERSION = 5
 ROUTE_TELEMETRY_ROLLING_WINDOW_PPO_EPOCHS = 4
 _ROUTE_TELEMETRY_COLUMNS = (
     "route_telemetry_schema_version",
@@ -74,6 +74,16 @@ _ROUTE_SAMPLE_COLUMNS = (
     "route_sample_credit_trace_length_slots",
     "route_sample_trace_end_kind",
     "route_sample_bootstrap_source",
+    "route_sample_task_id",
+    "route_sample_branch_event_key",
+    "route_sample_branch_credit_event_key",
+    "route_sample_formal_route_event_key",
+    "route_sample_nstep_route_advantage",
+    "route_sample_nstep_horizon",
+    "route_sample_nstep_stop_kind",
+    "route_sample_stop_kind",
+    "route_sample_terminal_before_rollout",
+    "route_sample_bootstrap_used",
     "global_rollout_index",
     "policy_version",
 )
@@ -517,7 +527,12 @@ def _base_record(config: RunConfig, signal_gate_status: str) -> dict[str, Any]:
     effective_route_gae_lambda = (
         config.training.mappo.route_gae_lambda
         if RouteCreditMode(route_mode) is RouteCreditMode.ROUTE_SPECIFIC_GAE
-        else config.training.mappo.gae_lambda
+        else (
+            None
+            if RouteCreditMode(route_mode)
+            is RouteCreditMode.ROLLOUT_CAPPED_ROUTE_EVENT_NSTEP
+            else config.training.mappo.gae_lambda
+        )
     )
     return {
         "run_id": config.run_id,
@@ -783,11 +798,20 @@ def _route_sample_records(
                     "route_telemetry_enabled": True,
                     "route_telemetry_schema_version": telemetry.schema_version,
                     "global_rollout_index": (
-                        update.update_index * mappo.rollout_length_slots
-                        + sample.batch_index * mappo.recurrent_chunk_length_slots
-                        + sample.time_index
+                        sample.global_rollout_index
+                        if sample.global_rollout_index is not None
+                        else (
+                            update.update_index * mappo.rollout_length_slots
+                            + sample.batch_index
+                            * mappo.recurrent_chunk_length_slots
+                            + sample.time_index
+                        )
                     ),
-                    "policy_version": update.rollout_policy_version,
+                    "policy_version": (
+                        sample.policy_version
+                        if sample.policy_version is not None
+                        else update.rollout_policy_version
+                    ),
                 })
                 record.update(sample.record())
                 records.append(record)

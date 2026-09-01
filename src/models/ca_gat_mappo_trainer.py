@@ -23,6 +23,7 @@ from ..config import (
     CHECKPOINT_V1_DIAGNOSTICS_STATE_FIELDS,
     CHECKPOINT_V1_TRAINING_STATE_FIELDS,
     MAPPO_INITIAL_POLICY_VERSION,
+    RouteCreditMode,
     RunConfig,
     mappo_checkpoint_kind_at,
     mappo_final_checkpoint_path,
@@ -49,6 +50,7 @@ from .ca_gat_mappo_route_telemetry import (
     TrajectoryCreditTracker,
     TrajectoryPreStepCapture,
 )
+from .ca_gat_mappo_route_nstep import build_route_credit_step_metadata
 from .ca_gat_mappo_checkpoint import (
     CheckpointError,
     atomic_save_checkpoint,
@@ -880,6 +882,11 @@ class CAGATMAPPOTrainer:
     @staticmethod
     def _execution_metadata(
         info: Mapping[str, Any],
+        *,
+        episode_id: int,
+        global_rollout_index: int,
+        policy_version: int,
+        route_credit_enabled: bool,
     ) -> tuple[
         Sequence[Mapping[str, Any]],
         Mapping[str, Any],
@@ -900,6 +907,13 @@ class CAGATMAPPOTrainer:
             "downgrade": info.get("downgrade", ()),
             "canonicalization": info.get("canonicalization", ()),
         }
+        if route_credit_enabled:
+            summary["route_credit_step"] = build_route_credit_step_metadata(
+                info,
+                episode_id=episode_id,
+                global_rollout_index=global_rollout_index,
+                policy_version=policy_version,
+            )
         return executed, summary
 
     def _perform_update(
@@ -1386,7 +1400,16 @@ class CAGATMAPPOTrainer:
                     )
 
             executed, rejections = self._execution_metadata(
-                step_result.info
+                step_result.info,
+                episode_id=episode_index,
+                global_rollout_index=self._transitions,
+                policy_version=step_policy_version,
+                route_credit_enabled=(
+                    RouteCreditMode(
+                        self.config.training.mappo.route_credit_mode
+                    )
+                    is RouteCreditMode.ROLLOUT_CAPPED_ROUTE_EVENT_NSTEP
+                ),
             )
             rollout_reward: Tensor | float = (
                 step_result.reward

@@ -850,10 +850,13 @@ def compute_configured_ppo_objective_and_loss(
     config.validate()
     mappo = config.training.mappo
     route_credit_mode = RouteCreditMode(mappo.route_credit_mode)
-    if route_credit_mode is RouteCreditMode.ROUTE_SPECIFIC_GAE:
+    if route_credit_mode in {
+        RouteCreditMode.ROUTE_SPECIFIC_GAE,
+        RouteCreditMode.ROLLOUT_CAPPED_ROUTE_EVENT_NSTEP,
+    }:
         if route_advantage is None:
             raise PPOObjectiveError(
-                "route_specific_gae requires route_advantage"
+                f"{route_credit_mode.value} requires route_advantage"
             )
     elif route_advantage is not None:
         raise PPOObjectiveError(

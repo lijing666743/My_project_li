@@ -227,7 +227,8 @@ class RouteCreditMode(str, Enum):
     """Select shared base GAE or a route-only longer-horizon estimator."""
 
     SHARED_GAE = "shared_gae"
-    ROUTE_SPECIFIC_GAE = "route_specific_gae"
+    ROUTE_SPECIFIC_GAE = "route_specific_gae"  # Provenance: REJECT_AS_PRIMARY.
+    ROLLOUT_CAPPED_ROUTE_EVENT_NSTEP = "rollout_capped_route_event_nstep"
 
 
 def _installed_distribution_version(name: str) -> str:
@@ -769,6 +770,15 @@ class RunConfig:
             # stable.
             mappo.pop("route_credit_mode")
             mappo.pop("route_gae_lambda")
+        elif (
+            isinstance(mappo, dict)
+            and mappo.get("route_credit_mode")
+            == RouteCreditMode.ROLLOUT_CAPPED_ROUTE_EVENT_NSTEP.value
+        ):
+            # This estimator has no lambda recurrence.  Keep the selected
+            # treatment mode canonical while excluding its dormant legacy
+            # coefficient from run identity.
+            mappo.pop("route_gae_lambda")
         if isinstance(mappo, dict) and not mappo.get(
             "entropy_coefficient_schedule_enabled", False
         ):
@@ -1057,6 +1067,31 @@ class RunConfig:
                     expected_value = getattr(expected, "value", expected)
                     raise ConfigError(
                         "route_specific_gae requires "
+                        f"training.mappo.{name}={expected_value}"
+                    )
+        if (
+            route_credit_mode
+            is RouteCreditMode.ROLLOUT_CAPPED_ROUTE_EVENT_NSTEP
+        ):
+            required = (
+                ("gamma", mappo.gamma, 0.99),
+                ("gae_lambda", mappo.gae_lambda, 0.95),
+                (
+                    "actor_ratio_mode",
+                    ActorRatioMode(mappo.actor_ratio_mode),
+                    ActorRatioMode.BRANCH_SPECIFIC,
+                ),
+                (
+                    "agent_credit_mode",
+                    AgentCreditMode(mappo.agent_credit_mode),
+                    AgentCreditMode.ROLE_DECOMPOSED,
+                ),
+            )
+            for name, actual, expected in required:
+                if actual != expected:
+                    expected_value = getattr(expected, "value", expected)
+                    raise ConfigError(
+                        "rollout_capped_route_event_nstep requires "
                         f"training.mappo.{name}={expected_value}"
                     )
         if mappo.optimizer != "Adam":
@@ -1461,8 +1496,8 @@ def validate_mappo_checkpoint_resume_compatibility(
     )
     if source_route_credit_mode != target_route_credit_mode:
         raise ConfigError(
-            "checkpoint route_credit_mode mismatch; changing between shared_gae "
-            "and route_specific_gae requires a new run"
+            "checkpoint route_credit_mode mismatch; changing route-credit mode "
+            "requires a new run"
         )
     if config_hash != config.config_hash:
         raise ConfigError("checkpoint canonical config_hash mismatch")

@@ -25,9 +25,10 @@ from .ca_gat_mappo_actions import (
     SequentialActionDistributionOutput,
     SequentialActionMaskBatch,
 )
+from .ca_gat_mappo_route_nstep import RouteNstepSample
 
 
-ROUTE_TELEMETRY_SCHEMA_VERSION = 3
+ROUTE_TELEMETRY_SCHEMA_VERSION = 4
 TRAJECTORY_CREDIT_SCHEMA_VERSION = 1
 TRAJECTORY_CREDIT_EVENT_TYPES = ("route", "terminal", "credit")
 TRAJECTORY_LEDGER_TOLERANCE = 1.0e-9
@@ -249,16 +250,25 @@ class RouteTelemetry:
     base_route_advantage_std: float | None = None
     base_route_advantage_median: float | None = None
     base_route_advantage_p90_absolute_magnitude: float | None = None
+    base_route_advantage_p95_absolute_magnitude: float | None = None
     new_route_advantage_valid_sample_count: int = 0
     new_route_advantage_mean: float | None = None
     new_route_advantage_std: float | None = None
     new_route_advantage_median: float | None = None
     new_route_advantage_p90_absolute_magnitude: float | None = None
+    new_route_advantage_p95_absolute_magnitude: float | None = None
+    nstep_route_advantage_valid_sample_count: int = 0
+    nstep_route_advantage_mean: float | None = None
+    nstep_route_advantage_std: float | None = None
+    nstep_route_advantage_median: float | None = None
+    nstep_route_advantage_p90_absolute_magnitude: float | None = None
+    nstep_route_advantage_p95_absolute_magnitude: float | None = None
     route_advantage_delta_valid_sample_count: int = 0
     route_advantage_delta_mean: float | None = None
     route_advantage_delta_std: float | None = None
     route_advantage_delta_median: float | None = None
     route_advantage_delta_p90_absolute_magnitude: float | None = None
+    route_advantage_delta_p95_absolute_magnitude: float | None = None
     mean_selected_route_probability_all_route_active: float | None = None
     mean_local_probability_all_route_active: float | None = None
     mean_defer_probability_all_route_active: float | None = None
@@ -285,6 +295,9 @@ class RouteTelemetry:
     _advantage_distributions: Mapping[str, RouteDistributionSummary] = field(default_factory=dict, repr=False)
     _return_distributions: Mapping[str, RouteDistributionSummary] = field(default_factory=dict, repr=False)
     _td_residual_distributions: Mapping[str, RouteDistributionSummary] = field(default_factory=dict, repr=False)
+    _route_credit_distributions: Mapping[
+        str, Mapping[str, RouteDistributionSummary]
+    ] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         if self.schema_version != ROUTE_TELEMETRY_SCHEMA_VERSION:
@@ -368,6 +381,7 @@ class RouteTelemetry:
         for prefix in (
             "base_route_advantage",
             "new_route_advantage",
+            "nstep_route_advantage",
             "route_advantage_delta",
         ):
             count = getattr(self, f"{prefix}_valid_sample_count")
@@ -382,6 +396,7 @@ class RouteTelemetry:
                     f"{prefix}_std",
                     f"{prefix}_median",
                     f"{prefix}_p90_absolute_magnitude",
+                    f"{prefix}_p95_absolute_magnitude",
                 ),
             )
         for prefix in (
@@ -460,6 +475,23 @@ class RouteTelemetry:
                     "negative_fraction",
                 )
             )
+        for group in ("local_route", "remote_route", "defer_route"):
+            for credit in (
+                "base_route_advantage",
+                "nstep_route_advantage",
+                "route_advantage_delta",
+            ):
+                distribution_names.extend(
+                    f"{group}_{credit}_{suffix}"
+                    for suffix in (
+                        "valid_sample_count",
+                        "mean",
+                        "std",
+                        "median",
+                        "p90_absolute_magnitude",
+                        "p95_absolute_magnitude",
+                    )
+                )
         return (
             names
             + tuple(ROUTE_PPO_RECORD_FIELDS)
@@ -500,6 +532,23 @@ class RouteTelemetry:
                 result.update(summary.record(
                     f"{group}_{prefix}", include_quantiles=include_quantiles
                 ))
+        for group in ("local_route", "remote_route", "defer_route"):
+            summaries = (self._route_credit_distributions or {}).get(
+                group, {}
+            )
+            for credit in (
+                "base_route_advantage",
+                "nstep_route_advantage",
+                "route_advantage_delta",
+            ):
+                summary = summaries.get(credit, RouteDistributionSummary())
+                result.update(
+                    summary.record(
+                        f"{group}_{credit}",
+                        include_quantiles=False,
+                        include_absolute_quantiles=True,
+                    )
+                )
         return result
 
     def _validate_optional_group(
@@ -672,6 +721,9 @@ def collect_route_telemetry(
     branch_advantage: Tensor | None = None,
     bootstrap_mask: Tensor | None = None,
     effective_route_gae_lambda: float | None = None,
+    route_nstep_samples: Sequence[
+        Sequence[Sequence[RouteNstepSample | None]]
+    ] | None = None,
 ) -> RouteTelemetry:
     """Aggregate route telemetry without changing the PPO algorithm state."""
 
@@ -730,6 +782,18 @@ def collect_route_telemetry(
     ):
         raise RouteTelemetryError(
             "effective_route_gae_lambda must lie in [0, 1] or be NA"
+        )
+    if route_nstep_samples is not None and (
+        len(route_nstep_samples) != batch
+        or any(len(chunk) != time for chunk in route_nstep_samples)
+        or any(
+            len(time_step) != agents
+            for chunk in route_nstep_samples
+            for time_step in chunk
+        )
+    ):
+        raise RouteTelemetryError(
+            "route_nstep_samples must have shape [B][T][A]"
         )
     if (
         tuple(sequence_valid_mask.shape) != (batch, time)
@@ -985,6 +1049,24 @@ def collect_route_telemetry(
             expanded_route_advantage_delta,
             active,
         )
+        route_credit_distributions = {}
+        if route_nstep_samples is not None:
+            for name, mask in (
+                ("local_route", local_group),
+                ("remote_route", remote_group),
+                ("defer_route", defer_group),
+            ):
+                route_credit_distributions[name] = {
+                    "base_route_advantage": summarize_distribution(
+                        expanded_base_advantage, mask
+                    ),
+                    "nstep_route_advantage": summarize_distribution(
+                        expanded_new_route_advantage, mask
+                    ),
+                    "route_advantage_delta": summarize_distribution(
+                        expanded_route_advantage_delta, mask
+                    ),
+                }
 
         def mean_active(values: Tensor) -> float | None:
             return _optional_mean(values, active)
@@ -1024,6 +1106,22 @@ def collect_route_telemetry(
         flat_local = local_probability.reshape(-1)
         flat_defer = defer_probability.reshape(-1)
         flat_best = best_remote_probability.reshape(-1)
+        flat_nstep_samples = (
+            None
+            if route_nstep_samples is None
+            else tuple(
+                sample
+                for chunk in route_nstep_samples
+                for time_step in chunk
+                for sample in time_step
+            )
+        )
+        if flat_nstep_samples is not None:
+            for flat_index, event in enumerate(flat_nstep_samples):
+                if bool(flat_active[flat_index]) != (event is not None):
+                    raise RouteTelemetryError(
+                        "route activity and N-step sample provenance disagree"
+                    )
         flat_bootstrap = (
             None
             if bootstrap_mask is None
@@ -1087,6 +1185,44 @@ def collect_route_telemetry(
             trace_length, trace_end_kind, bootstrap_source = trace_provenance(
                 b * time + t
             )
+            nstep_event = (
+                None
+                if flat_nstep_samples is None
+                else flat_nstep_samples[flat_index]
+            )
+            if nstep_event is not None:
+                if (
+                    nstep_event.source_uav != source_uavs[flat_index]
+                    or nstep_event.category != category
+                    or not math.isclose(
+                        nstep_event.base_advantage,
+                        float(flat_base_adv[flat_index].item()),
+                        rel_tol=0.0,
+                        abs_tol=1.0e-6,
+                    )
+                    or not math.isclose(
+                        nstep_event.nstep_advantage,
+                        float(flat_new_route_adv[flat_index].item()),
+                        rel_tol=0.0,
+                        abs_tol=1.0e-6,
+                    )
+                    or not math.isclose(
+                        nstep_event.advantage_delta,
+                        float(flat_route_adv_delta[flat_index].item()),
+                        rel_tol=0.0,
+                        abs_tol=1.0e-6,
+                    )
+                ):
+                    raise RouteTelemetryError(
+                        "N-step provenance differs from the actor advantage"
+                    )
+                trace_length = nstep_event.horizon
+                trace_end_kind = nstep_event.stop_kind
+                bootstrap_source = (
+                    "saved_source_agent_v_next"
+                    if nstep_event.bootstrap_used
+                    else "none_episode_boundary"
+                )
             samples.append(RouteSampleTelemetry(
                 batch_index=b,
                 time_index=t,
@@ -1130,6 +1266,50 @@ def collect_route_telemetry(
                 credit_trace_length_slots=trace_length,
                 trace_end_kind=trace_end_kind,
                 bootstrap_source=bootstrap_source,
+                task_id=(
+                    None if nstep_event is None else nstep_event.task_id
+                ),
+                branch_event_key=(
+                    None
+                    if nstep_event is None
+                    else nstep_event.branch_event_key
+                ),
+                formal_route_event_key=(
+                    None
+                    if nstep_event is None
+                    else nstep_event.formal_route_event_key
+                ),
+                global_rollout_index=(
+                    None
+                    if nstep_event is None
+                    else nstep_event.global_rollout_index
+                ),
+                policy_version=(
+                    None
+                    if nstep_event is None
+                    else nstep_event.policy_version
+                ),
+                nstep_route_advantage=(
+                    None
+                    if nstep_event is None
+                    else nstep_event.nstep_advantage
+                ),
+                nstep_horizon=(
+                    None if nstep_event is None else nstep_event.horizon
+                ),
+                nstep_stop_kind=(
+                    None if nstep_event is None else nstep_event.stop_kind
+                ),
+                terminal_before_rollout=(
+                    None
+                    if nstep_event is None
+                    else nstep_event.terminal_before_rollout
+                ),
+                bootstrap_used=(
+                    None
+                    if nstep_event is None
+                    else nstep_event.bootstrap_used
+                ),
             ))
 
         return RouteTelemetry(
@@ -1204,6 +1384,9 @@ def collect_route_telemetry(
             base_route_advantage_p90_absolute_magnitude=(
                 base_route_advantage_summary.p90_absolute_magnitude
             ),
+            base_route_advantage_p95_absolute_magnitude=(
+                base_route_advantage_summary.p95_absolute_magnitude
+            ),
             new_route_advantage_valid_sample_count=(
                 new_route_advantage_summary.count
             ),
@@ -1213,6 +1396,39 @@ def collect_route_telemetry(
             new_route_advantage_p90_absolute_magnitude=(
                 new_route_advantage_summary.p90_absolute_magnitude
             ),
+            new_route_advantage_p95_absolute_magnitude=(
+                new_route_advantage_summary.p95_absolute_magnitude
+            ),
+            nstep_route_advantage_valid_sample_count=(
+                new_route_advantage_summary.count
+                if route_nstep_samples is not None
+                else 0
+            ),
+            nstep_route_advantage_mean=(
+                new_route_advantage_summary.mean
+                if route_nstep_samples is not None
+                else None
+            ),
+            nstep_route_advantage_std=(
+                new_route_advantage_summary.std
+                if route_nstep_samples is not None
+                else None
+            ),
+            nstep_route_advantage_median=(
+                new_route_advantage_summary.median
+                if route_nstep_samples is not None
+                else None
+            ),
+            nstep_route_advantage_p90_absolute_magnitude=(
+                new_route_advantage_summary.p90_absolute_magnitude
+                if route_nstep_samples is not None
+                else None
+            ),
+            nstep_route_advantage_p95_absolute_magnitude=(
+                new_route_advantage_summary.p95_absolute_magnitude
+                if route_nstep_samples is not None
+                else None
+            ),
             route_advantage_delta_valid_sample_count=(
                 route_advantage_delta_summary.count
             ),
@@ -1221,6 +1437,9 @@ def collect_route_telemetry(
             route_advantage_delta_median=route_advantage_delta_summary.median,
             route_advantage_delta_p90_absolute_magnitude=(
                 route_advantage_delta_summary.p90_absolute_magnitude
+            ),
+            route_advantage_delta_p95_absolute_magnitude=(
+                route_advantage_delta_summary.p95_absolute_magnitude
             ),
             mean_selected_route_probability_all_route_active=mean_active(selected_probability),
             mean_local_probability_all_route_active=mean_active(local_probability),
@@ -1246,6 +1465,7 @@ def collect_route_telemetry(
             _advantage_distributions=advantage_distributions,
             _return_distributions=return_distributions,
             _td_residual_distributions=td_distributions,
+            _route_credit_distributions=route_credit_distributions,
             shared_trunk_grad_status=trunk_measurement.status,
             shared_trunk_grad_norm=trunk_measurement.norm,
             route_head_weight_grad_mean=gradients.weight.mean,
@@ -1270,8 +1490,15 @@ class RouteDistributionSummary:
     positive_fraction: float | None = None
     negative_fraction: float | None = None
     p90_absolute_magnitude: float | None = None
+    p95_absolute_magnitude: float | None = None
 
-    def record(self, prefix: str, *, include_quantiles: bool = True) -> dict[str, object]:
+    def record(
+        self,
+        prefix: str,
+        *,
+        include_quantiles: bool = True,
+        include_absolute_quantiles: bool = False,
+    ) -> dict[str, object]:
         result = {
             f"{prefix}_valid_sample_count": self.count,
             f"{prefix}_mean": self.mean,
@@ -1284,6 +1511,15 @@ class RouteDistributionSummary:
                 f"{prefix}_p75": self.p75,
                 f"{prefix}_positive_fraction": self.positive_fraction,
                 f"{prefix}_negative_fraction": self.negative_fraction,
+            })
+        if include_absolute_quantiles:
+            result.update({
+                f"{prefix}_p90_absolute_magnitude": (
+                    self.p90_absolute_magnitude
+                ),
+                f"{prefix}_p95_absolute_magnitude": (
+                    self.p95_absolute_magnitude
+                ),
             })
         return result
 
@@ -1307,6 +1543,9 @@ def summarize_distribution(values: Tensor, mask: Tensor | None = None) -> RouteD
         negative_fraction=float((selected < 0).float().mean().cpu().item()),
         p90_absolute_magnitude=float(
             torch.quantile(selected.abs(), 0.90).cpu().item()
+        ),
+        p95_absolute_magnitude=float(
+            torch.quantile(selected.abs(), 0.95).cpu().item()
         ),
     )
 
@@ -1413,6 +1652,16 @@ class RouteSampleTelemetry:
     credit_trace_length_slots: int | None = None
     trace_end_kind: str | None = None
     bootstrap_source: str | None = None
+    task_id: object | None = None
+    branch_event_key: tuple[object, ...] | None = None
+    formal_route_event_key: tuple[object, ...] | None = None
+    global_rollout_index: int | None = None
+    policy_version: int | None = None
+    nstep_route_advantage: float | None = None
+    nstep_horizon: int | None = None
+    nstep_stop_kind: str | None = None
+    terminal_before_rollout: bool | None = None
+    bootstrap_used: bool | None = None
 
     def __post_init__(self) -> None:
         if self.number_of_legal_remote_destinations != len(self.legal_remote_destinations):
@@ -1421,6 +1670,43 @@ class RouteSampleTelemetry:
             total = sum(self.remote_probability_by_destination.values())
             if not math.isclose(total, self.total_remote_probability_mass, rel_tol=1e-6, abs_tol=1e-6):
                 raise RouteTelemetryError("total remote probability is not the legal-destination sum")
+        nstep_fields = (
+            self.branch_event_key,
+            self.global_rollout_index,
+            self.policy_version,
+            self.nstep_route_advantage,
+            self.nstep_horizon,
+            self.nstep_stop_kind,
+            self.terminal_before_rollout,
+            self.bootstrap_used,
+        )
+        if any(value is not None for value in nstep_fields):
+            if any(value is None for value in nstep_fields):
+                raise RouteTelemetryError(
+                    "N-step route-sample provenance must be complete"
+                )
+            if self.task_id is None:
+                raise RouteTelemetryError(
+                    "N-step route-sample provenance requires task_id"
+                )
+            if self.category == "defer":
+                if self.formal_route_event_key is not None:
+                    raise RouteTelemetryError(
+                        "defer must not expose a formal route-event key"
+                    )
+            elif self.formal_route_event_key is None:
+                raise RouteTelemetryError(
+                    "local/remote N-step samples require a formal key"
+                )
+            if self.advantage is None or not math.isclose(
+                self.advantage,
+                float(self.nstep_route_advantage),
+                rel_tol=0.0,
+                abs_tol=1.0e-6,
+            ):
+                raise RouteTelemetryError(
+                    "actual route sample advantage differs from N-step value"
+                )
 
     def record(self) -> dict[str, object]:
         return {
@@ -1454,6 +1740,32 @@ class RouteSampleTelemetry:
             "route_sample_credit_trace_length_slots": self.credit_trace_length_slots,
             "route_sample_trace_end_kind": self.trace_end_kind,
             "route_sample_bootstrap_source": self.bootstrap_source,
+            "route_sample_task_id": self.task_id,
+            "route_sample_branch_event_key": (
+                None
+                if self.branch_event_key is None
+                else list(self.branch_event_key)
+            ),
+            "route_sample_branch_credit_event_key": (
+                None
+                if self.branch_event_key is None
+                else list(self.branch_event_key)
+            ),
+            "route_sample_formal_route_event_key": (
+                None
+                if self.formal_route_event_key is None
+                else list(self.formal_route_event_key)
+            ),
+            "route_sample_nstep_route_advantage": (
+                self.nstep_route_advantage
+            ),
+            "route_sample_nstep_horizon": self.nstep_horizon,
+            "route_sample_nstep_stop_kind": self.nstep_stop_kind,
+            "route_sample_stop_kind": self.nstep_stop_kind,
+            "route_sample_terminal_before_rollout": (
+                self.terminal_before_rollout
+            ),
+            "route_sample_bootstrap_used": self.bootstrap_used,
         }
 
 
@@ -2717,6 +3029,17 @@ class TrajectoryCreditTracker:
                 or sample.selected_route_action_index != route["route_action_index"]
             ):
                 raise RouteTelemetryError("PPO route sample differs from route identity")
+            if sample.task_id is not None and sample.task_id != key[1]:
+                raise RouteTelemetryError(
+                    "PPO N-step sample task differs from formal route identity"
+                )
+            if (
+                sample.formal_route_event_key is not None
+                and tuple(sample.formal_route_event_key) != key
+            ):
+                raise RouteTelemetryError(
+                    "PPO N-step formal route-event key is inconsistent"
+                )
             if key in self._credit_route_keys or key in emitted:
                 raise RouteTelemetryError("route transition produced duplicate PPO credit")
             event = self._common("credit", key[0], key[1], key)
@@ -2740,6 +3063,33 @@ class TrajectoryCreditTracker:
                 "credit_trace_length_slots": sample.credit_trace_length_slots,
                 "trace_end_kind": sample.trace_end_kind,
                 "bootstrap_source": sample.bootstrap_source,
+                "task_id": sample.task_id,
+                "branch_event_key": (
+                    None
+                    if sample.branch_event_key is None
+                    else list(sample.branch_event_key)
+                ),
+                "branch_credit_event_key": (
+                    None
+                    if sample.branch_event_key is None
+                    else list(sample.branch_event_key)
+                ),
+                "formal_route_event_key": (
+                    None
+                    if sample.formal_route_event_key is None
+                    else list(sample.formal_route_event_key)
+                ),
+                "nstep_route_advantage": sample.nstep_route_advantage,
+                "nstep_horizon": sample.nstep_horizon,
+                "nstep_stop_kind": sample.nstep_stop_kind,
+                "terminal_before_rollout": (
+                    sample.terminal_before_rollout
+                ),
+                "bootstrap_used": sample.bootstrap_used,
+                "credit_global_rollout_index": (
+                    sample.global_rollout_index
+                ),
+                "credit_policy_version": sample.policy_version,
                 "td_residual": sample.td_residual,
                 "return_target": sample.return_target,
                 "old_route_log_prob": sample.old_route_log_prob,
@@ -2808,6 +3158,24 @@ class TrajectoryCreditTracker:
                 "policy_version_before": None,
                 "policy_version_after": None,
                 "advantage": None,
+                "base_route_advantage": None,
+                "new_route_advantage": None,
+                "route_advantage_delta": None,
+                "effective_route_gae_lambda": None,
+                "credit_trace_length_slots": None,
+                "trace_end_kind": None,
+                "bootstrap_source": None,
+                "task_id": route.get("task_id"),
+                "branch_event_key": None,
+                "branch_credit_event_key": None,
+                "formal_route_event_key": None,
+                "nstep_route_advantage": None,
+                "nstep_horizon": None,
+                "nstep_stop_kind": None,
+                "terminal_before_rollout": None,
+                "bootstrap_used": None,
+                "credit_global_rollout_index": None,
+                "credit_policy_version": None,
                 "td_residual": None,
                 "return_target": None,
                 "old_route_log_prob": None,
