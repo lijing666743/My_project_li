@@ -22,7 +22,7 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
-from ..config import AgentCreditMode, RunConfig, STREAM_IDS
+from ..config import AgentCreditMode, RouteDecoderMode, RunConfig, STREAM_IDS
 from ..env.actions import ActionProposal
 from ..env.observation import ActorObservation, BRANCH_ORDER, QueueSummary
 from ..env.state import CentralizedState
@@ -923,6 +923,138 @@ class CAGATv2Layer(nn.Module):
         return self.normalization(self_state + update)
 
 
+class CandidateAwareRouteDecoderV1(nn.Module):
+    """Shared candidate scorer with explicit destination-to-logit wiring."""
+
+    def __init__(
+        self,
+        *,
+        uav_count: int,
+        recurrent_dimension: int,
+        candidate_dimension: int,
+        edge_dimension: int,
+    ) -> None:
+        super().__init__()
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in (
+                uav_count,
+                recurrent_dimension,
+                candidate_dimension,
+                edge_dimension,
+            )
+        ):
+            raise MAPPONetworkError(
+                "candidate-aware decoder dimensions must be positive integers"
+            )
+        if uav_count < 2:
+            raise MAPPONetworkError(
+                "candidate-aware decoder requires at least two UAVs"
+            )
+        self.uav_count = uav_count
+        self.recurrent_dimension = recurrent_dimension
+        self.candidate_dimension = candidate_dimension
+        self.edge_dimension = edge_dimension
+        self.edge_projection = nn.Linear(edge_dimension, candidate_dimension)
+        self.candidate_normalization = nn.LayerNorm(candidate_dimension)
+        self.query_projection = nn.Linear(
+            recurrent_dimension, candidate_dimension
+        )
+        self.candidate_projection = nn.Linear(
+            candidate_dimension, candidate_dimension
+        )
+        self.fixed_head = nn.Linear(recurrent_dimension, 3)
+        self.remote_scorer = nn.Linear(candidate_dimension, 1)
+        self.register_buffer(
+            "remote_candidate_ids",
+            torch.tensor(
+                [
+                    [candidate for candidate in range(uav_count) if candidate != ego]
+                    for ego in range(uav_count)
+                ],
+                dtype=torch.long,
+            ),
+            persistent=False,
+        )
+
+    def forward(
+        self,
+        recurrent_features: Tensor,
+        candidate_public_features: Tensor,
+        candidate_edge_features: Tensor,
+    ) -> Tensor:
+        if recurrent_features.ndim != 4:
+            raise MAPPONetworkError(
+                "route recurrent features must be [batch,time,agent,hidden]"
+            )
+        batch, time, agents, recurrent_dimension = recurrent_features.shape
+        expected_public = (
+            batch,
+            time,
+            agents,
+            self.uav_count,
+            self.candidate_dimension,
+        )
+        expected_edge = (
+            batch,
+            time,
+            agents,
+            self.uav_count,
+            self.edge_dimension,
+        )
+        if (
+            agents != self.uav_count
+            or recurrent_dimension != self.recurrent_dimension
+        ):
+            raise MAPPONetworkError("route recurrent features differ from decoder spec")
+        if tuple(candidate_public_features.shape) != expected_public:
+            raise MAPPONetworkError(
+                "candidate public features differ from decoder spec"
+            )
+        if tuple(candidate_edge_features.shape) != expected_edge:
+            raise MAPPONetworkError(
+                "candidate edge features differ from decoder spec"
+            )
+        tensors = (
+            recurrent_features,
+            candidate_public_features,
+            candidate_edge_features,
+        )
+        if any(not tensor.is_floating_point() for tensor in tensors):
+            raise MAPPONetworkError("route decoder inputs must be floating tensors")
+        if any(
+            tensor.device != recurrent_features.device
+            or tensor.dtype != recurrent_features.dtype
+            for tensor in tensors[1:]
+        ):
+            raise MAPPONetworkError(
+                "route decoder inputs must share device and dtype"
+            )
+        if any(not torch.isfinite(tensor).all() for tensor in tensors):
+            raise MAPPONetworkError("route decoder inputs contain NaN or Inf")
+
+        candidate_state = self.candidate_normalization(
+            candidate_public_features
+            + self.edge_projection(candidate_edge_features)
+        )
+        query = self.query_projection(recurrent_features).unsqueeze(-2)
+        candidate_key = self.candidate_projection(candidate_state)
+        all_candidate_logits = self.remote_scorer(
+            torch.tanh(query + candidate_key)
+        ).squeeze(-1)
+        gather_index = self.remote_candidate_ids.view(
+            1, 1, self.uav_count, self.uav_count - 1
+        ).expand(batch, time, -1, -1)
+        remote_logits = torch.gather(all_candidate_logits, -1, gather_index)
+        logits = torch.cat(
+            [self.fixed_head(recurrent_features), remote_logits], dim=-1
+        )
+        expected_logits = (batch, time, agents, self.uav_count + 2)
+        if tuple(logits.shape) != expected_logits or not torch.isfinite(logits).all():
+            raise MAPPONetworkError("candidate-aware route logits are invalid")
+        return logits
+
+
 @dataclass(frozen=True)
 class ActorNetworkOutput:
     """Raw seven-head logits, validated masks, and recurrent output."""
@@ -951,6 +1083,9 @@ class CAGATMAPPOActor(nn.Module):
     def __init__(self, config: RunConfig) -> None:
         super().__init__()
         self.spec = MAPPOTensorSpec.from_config(config)
+        self.route_decoder_mode = RouteDecoderMode(
+            config.training.mappo.route_decoder_mode
+        )
         hidden = self.spec.encoder_hidden_dimension
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(_derived_torch_seed(config.seed))
@@ -985,17 +1120,37 @@ class CAGATMAPPOActor(nn.Module):
                     )
                 }
             )
+            # Always consume the historical route-head RNG draw before the
+            # shared non-route modules.  This preserves same-seed common-module
+            # initialization across both decoder modes.
+            legacy_route_head = nn.Linear(hidden, dimensions["route"])
+            non_route_heads = {
+                "tx_select": nn.Linear(hidden, dimensions["tx_select"]),
+                "resource_group": nn.Linear(2 * hidden, dimensions["resource_group"]),
+                "resource_width": nn.Linear(3 * hidden, dimensions["resource_width"]),
+                "power_level": nn.Linear(4 * hidden, dimensions["power_level"]),
+                "cpu_queue": nn.Linear(hidden, dimensions["cpu_queue"]),
+                "cpu_frequency": nn.Linear(2 * hidden, dimensions["cpu_frequency"]),
+            }
+            route_head: nn.Module
+            if self.route_decoder_mode is RouteDecoderMode.LEGACY:
+                route_head = legacy_route_head
+            else:
+                route_head = CandidateAwareRouteDecoderV1(
+                    uav_count=self.spec.uav_count,
+                    recurrent_dimension=self.spec.gru_hidden_dimension,
+                    candidate_dimension=self.spec.encoder_hidden_dimension,
+                    edge_dimension=self.spec.edge_feature_dim,
+                )
             self.action_heads = nn.ModuleDict(
-                {
-                    "route": nn.Linear(hidden, dimensions["route"]),
-                    "tx_select": nn.Linear(hidden, dimensions["tx_select"]),
-                    "resource_group": nn.Linear(2 * hidden, dimensions["resource_group"]),
-                    "resource_width": nn.Linear(3 * hidden, dimensions["resource_width"]),
-                    "power_level": nn.Linear(4 * hidden, dimensions["power_level"]),
-                    "cpu_queue": nn.Linear(hidden, dimensions["cpu_queue"]),
-                    "cpu_frequency": nn.Linear(2 * hidden, dimensions["cpu_frequency"]),
-                }
+                {"route": route_head, **non_route_heads}
             )
+
+    @property
+    def route_decoder(self) -> nn.Module:
+        """Return the selected route module without duplicate registration."""
+
+        return self.action_heads["route"]
 
     def initial_hidden(
         self,
@@ -1013,6 +1168,42 @@ class CAGATMAPPOActor(nn.Module):
             dtype=parameter.dtype if dtype is None else dtype,
         )
 
+    def route_logits(
+        self,
+        recurrent_features: Tensor,
+        candidate_public_features: Tensor,
+        candidate_edge_features: Tensor,
+    ) -> Tensor:
+        """Return raw route logits for the configured decoder architecture."""
+
+        if recurrent_features.ndim != 4:
+            raise MAPPONetworkError(
+                "recurrent_features must be [batch,time,agent,hidden]"
+            )
+        expected = (
+            *recurrent_features.shape[:3],
+            self.spec.action_dimensions["route"],
+        )
+        if self.route_decoder_mode is RouteDecoderMode.LEGACY:
+            route_head = self.route_decoder
+            if not isinstance(route_head, nn.Linear):
+                raise MAPPONetworkError("legacy route decoder must be Linear")
+            logits = route_head(recurrent_features)
+        else:
+            route_decoder = self.route_decoder
+            if not isinstance(route_decoder, CandidateAwareRouteDecoderV1):
+                raise MAPPONetworkError(
+                    "candidate-aware route decoder has an invalid module type"
+                )
+            logits = route_decoder(
+                recurrent_features,
+                candidate_public_features,
+                candidate_edge_features,
+            )
+        if tuple(logits.shape) != expected or not torch.isfinite(logits).all():
+            raise MAPPONetworkError("route logits are invalid")
+        return logits
+
     def branch_logits(
         self,
         branch: str,
@@ -1023,6 +1214,10 @@ class CAGATMAPPOActor(nn.Module):
 
         if branch not in ACTION_BRANCH_DEPENDENCIES:
             raise MAPPONetworkError(f"unknown action branch {branch!r}")
+        if branch == "route" and self.route_decoder_mode is not RouteDecoderMode.LEGACY:
+            raise MAPPONetworkError(
+                "candidate-aware route logits require explicit candidate features"
+            )
         if recurrent_features.ndim != 4:
             raise MAPPONetworkError(
                 "recurrent_features must be [batch,time,agent,hidden]"
@@ -1136,10 +1331,25 @@ class CAGATMAPPOActor(nn.Module):
             )
         recurrent = torch.stack(outputs, dim=1)
 
+        candidate_public_state = public_state.reshape(
+            batch_size,
+            time,
+            agents,
+            self.spec.uav_count,
+            self.spec.encoder_hidden_dimension,
+        )
         logits = {
-            branch: self.branch_logits(branch, recurrent, batch.action_indices)
-            for branch in ACTION_BRANCH_ORDER
+            "route": self.route_logits(
+                recurrent, candidate_public_state, batch.edge_features
+            )
         }
+        logits.update(
+            {
+                branch: self.branch_logits(branch, recurrent, batch.action_indices)
+                for branch in ACTION_BRANCH_ORDER
+                if branch != "route"
+            }
+        )
         for branch in ACTION_BRANCH_ORDER:
             if logits[branch].shape != batch.action_masks[branch].shape:
                 raise MAPPONetworkError(f"{branch} logits and mask shapes differ")
@@ -1201,6 +1411,7 @@ __all__ = [
     "ActorTensorBatch",
     "CAGATMAPPOActor",
     "CAGATv2Layer",
+    "CandidateAwareRouteDecoderV1",
     "CentralizedCritic",
     "CentralizedStateTensorBatch",
     "CentralizedStateTensorizer",

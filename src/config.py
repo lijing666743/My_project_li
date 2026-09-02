@@ -223,6 +223,13 @@ class AgentCreditMode(str, Enum):
     ROLE_DECOMPOSED = "role_decomposed"
 
 
+class RouteDecoderMode(str, Enum):
+    """Select the actor route-logit decoder architecture."""
+
+    LEGACY = "legacy"
+    CANDIDATE_AWARE_V1 = "candidate_aware_v1"
+
+
 class RouteCreditMode(str, Enum):
     """Select shared base GAE or a route-only longer-horizon estimator."""
 
@@ -503,6 +510,7 @@ class MAPPOConfig:
     ppo_clip_epsilon: float = 0.20
     actor_ratio_mode: ActorRatioMode = ActorRatioMode.JOINT
     agent_credit_mode: AgentCreditMode = AgentCreditMode.TEAM
+    route_decoder_mode: RouteDecoderMode = RouteDecoderMode.LEGACY
     route_credit_mode: RouteCreditMode = RouteCreditMode.SHARED_GAE
     route_gae_lambda: float = 1.0
     entropy_coefficient: float = 0.01
@@ -760,6 +768,14 @@ class RunConfig:
             # Keep old config hashes and Checkpoint V1 identities unchanged;
             # role-decomposed credit remains part of the canonical identity.
             mappo.pop("agent_credit_mode")
+        if (
+            isinstance(mappo, dict)
+            and mappo.get("route_decoder_mode") == RouteDecoderMode.LEGACY.value
+        ):
+            # ``legacy`` is the historical actor route head.  Its omitted
+            # selector preserves pre-V1 config hashes and checkpoint identity;
+            # candidate_aware_v1 remains explicit and canonical.
+            mappo.pop("route_decoder_mode")
         if (
             isinstance(mappo, dict)
             and mappo.get("route_credit_mode") == RouteCreditMode.SHARED_GAE.value
@@ -1030,6 +1046,14 @@ class RunConfig:
                 f"got {mappo.agent_credit_mode!r}"
             ) from exc
         try:
+            route_decoder_mode = RouteDecoderMode(mappo.route_decoder_mode)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(
+                "training.mappo.route_decoder_mode must be one of "
+                f"{tuple(mode.value for mode in RouteDecoderMode)}, "
+                f"got {mappo.route_decoder_mode!r}"
+            ) from exc
+        try:
             route_credit_mode = RouteCreditMode(mappo.route_credit_mode)
         except (TypeError, ValueError) as exc:
             raise ConfigError(
@@ -1037,6 +1061,14 @@ class RunConfig:
                 f"{tuple(mode.value for mode in RouteCreditMode)}, "
                 f"got {mappo.route_credit_mode!r}"
             ) from exc
+        if (
+            route_decoder_mode is RouteDecoderMode.CANDIDATE_AWARE_V1
+            and route_credit_mode is not RouteCreditMode.SHARED_GAE
+        ):
+            raise ConfigError(
+                "candidate_aware_v1 requires "
+                "training.mappo.route_credit_mode=shared_gae"
+            )
         if (
             isinstance(mappo.route_gae_lambda, bool)
             or not isinstance(mappo.route_gae_lambda, (int, float))
@@ -1430,6 +1462,7 @@ def validate_mappo_checkpoint_resume_compatibility(
     cuda_available: bool,
     checkpoint_actor_ratio_mode: str | None = None,
     checkpoint_agent_credit_mode: str | None = None,
+    checkpoint_route_decoder_mode: str | None = None,
     checkpoint_route_credit_mode: str | None = None,
 ) -> None:
     """Apply the fail-fast V1 metadata checks without loading checkpoint bytes."""
@@ -1482,6 +1515,22 @@ def validate_mappo_checkpoint_resume_compatibility(
         raise ConfigError(
             "checkpoint agent_credit_mode mismatch; changing between team and "
             "role_decomposed requires a new run"
+        )
+    try:
+        source_route_decoder_mode = RouteDecoderMode(
+            RouteDecoderMode.LEGACY.value
+            if checkpoint_route_decoder_mode is None
+            else checkpoint_route_decoder_mode
+        )
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("checkpoint route_decoder_mode is invalid") from exc
+    target_route_decoder_mode = RouteDecoderMode(
+        config.training.mappo.route_decoder_mode
+    )
+    if source_route_decoder_mode != target_route_decoder_mode:
+        raise ConfigError(
+            "checkpoint route_decoder_mode mismatch; changing route decoder "
+            "requires a new run"
         )
     try:
         source_route_credit_mode = RouteCreditMode(
@@ -2008,6 +2057,7 @@ __all__ = [
     "MAPPO_INITIAL_POLICY_VERSION",
     "OutputConfig",
     "QMIXConfig",
+    "RouteDecoderMode",
     "RouteCreditMode",
     "RouteEntropySchedulePoint",
     "RunConfig",

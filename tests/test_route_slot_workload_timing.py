@@ -154,6 +154,7 @@ class RouteSlotWorkloadTimingTests(unittest.TestCase):
         historical["environment"].pop("workload_timing_mode")
         historical["training"]["mappo"].pop("actor_ratio_mode")
         historical["training"]["mappo"].pop("agent_credit_mode")
+        historical["training"]["mappo"].pop("route_decoder_mode")
         historical["training"]["mappo"].pop("route_credit_mode")
         historical["training"]["mappo"].pop("route_gae_lambda")
         historical["training"]["mappo"].pop(

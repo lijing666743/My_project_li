@@ -20,7 +20,10 @@ from ..config import ActorRatioMode, RunConfig, WorkloadTimingMode
 from ..env.actions import ActionProposal
 from ..env.reward import TaskWorkloadSnapshot
 from ..env.tasks import Task, TaskOutcome
-from .ca_gat_mappo import ACTION_BRANCH_ORDER
+from .ca_gat_mappo import (
+    ACTION_BRANCH_ORDER,
+    CandidateAwareRouteDecoderV1,
+)
 from .ca_gat_mappo_actions import (
     SequentialActionDistributionOutput,
     SequentialActionMaskBatch,
@@ -581,11 +584,184 @@ def _gradient_measurement(parameter: nn.Parameter) -> GradientMeasurement:
     )
 
 
-def measure_route_head_gradients(route_head: nn.Linear, route_domains: Any = None) -> RouteHeadGradientTelemetry:
+def _aggregate_gradient_measurement(
+    parameters: Sequence[nn.Parameter],
+) -> GradientMeasurement:
+    gradients = tuple(
+        parameter.grad.detach()
+        for parameter in parameters
+        if parameter.grad is not None
+    )
+    if not gradients:
+        return GradientMeasurement("none", None)
+    if any(not torch.isfinite(gradient).all() for gradient in gradients):
+        raise RouteTelemetryError("route-head gradient contains NaN or Inf")
+    squared_norm = math.fsum(
+        float(torch.sum(gradient * gradient).cpu().item())
+        for gradient in gradients
+    )
+    signed_sum = math.fsum(
+        float(gradient.sum().cpu().item()) for gradient in gradients
+    )
+    count = sum(gradient.numel() for gradient in gradients)
+    norm = math.sqrt(squared_norm)
+    return GradientMeasurement(
+        "zero" if norm == 0.0 else "finite_nonzero",
+        norm,
+        mean=signed_sum / count,
+        signed_sum=signed_sum,
+    )
+
+
+def _gradient_tensor_measurement(gradient: Tensor | None) -> GradientMeasurement:
+    if gradient is None:
+        return GradientMeasurement("none", None)
+    detached = gradient.detach()
+    if not torch.isfinite(detached).all():
+        raise RouteTelemetryError("route-head gradient contains NaN or Inf")
+    norm = float(torch.linalg.vector_norm(detached).cpu().item())
+    return GradientMeasurement(
+        "zero" if norm == 0.0 else "finite_nonzero",
+        norm,
+        mean=float(detached.mean().cpu().item()),
+        signed_sum=float(detached.sum().cpu().item()),
+    )
+
+
+def _candidate_route_gradient_rows(
+    route_head: CandidateAwareRouteDecoderV1,
+    route_domains: Any,
+) -> tuple[RouteHeadGradientRowTelemetry, ...]:
+    domains = list(route_domains or ())
+    if domains and isinstance(domains[0], str):
+        domains = [tuple(domains)]
+    rows: list[RouteHeadGradientRowTelemetry] = []
+    fixed_roles = ("idle", "local", "defer")
+    fixed_weight_gradient = route_head.fixed_head.weight.grad
+    fixed_bias_gradient = route_head.fixed_head.bias.grad
+    for row_index, default_role in enumerate(fixed_roles):
+        values = [
+            domain[row_index]
+            for domain in domains
+            if row_index < len(domain)
+        ]
+        role = default_role
+        for candidate_role in fixed_roles:
+            if any(
+                type(value) is str and value == candidate_role
+                for value in values
+            ):
+                role = candidate_role
+                break
+        measurement = _gradient_tensor_measurement(
+            None
+            if fixed_weight_gradient is None
+            else fixed_weight_gradient[row_index]
+        )
+        bias_value = (
+            None
+            if fixed_bias_gradient is None
+            else float(fixed_bias_gradient[row_index].detach().cpu().item())
+        )
+        rows.append(
+            RouteHeadGradientRowTelemetry(
+                row_index=row_index,
+                semantic_role=role,
+                destination_uavs=(),
+                grad_status=measurement.status,
+                grad_norm=measurement.norm,
+                grad_mean=measurement.mean,
+                grad_signed_sum=measurement.signed_sum,
+                bias_grad=bias_value,
+                parameter_update_direction_mean=(
+                    -measurement.mean if measurement.mean is not None else None
+                ),
+                parameter_update_direction_signed_sum=(
+                    -measurement.signed_sum
+                    if measurement.signed_sum is not None
+                    else None
+                ),
+                bias_update_direction=(
+                    -bias_value if bias_value is not None else None
+                ),
+            )
+        )
+    destinations = tuple(
+        sorted(
+            {
+                value
+                for domain in domains
+                for value in domain
+                if isinstance(value, int) and not isinstance(value, bool)
+            }
+            or set(range(route_head.uav_count))
+        )
+    )
+    remote_measurement = _gradient_measurement(route_head.remote_scorer.weight)
+    remote_bias_gradient = route_head.remote_scorer.bias.grad
+    remote_bias_value = (
+        None
+        if remote_bias_gradient is None
+        else float(remote_bias_gradient.detach().cpu().item())
+    )
+    rows.append(
+        RouteHeadGradientRowTelemetry(
+            row_index=3,
+            semantic_role="remote",
+            destination_uavs=destinations,
+            grad_status=remote_measurement.status,
+            grad_norm=remote_measurement.norm,
+            grad_mean=remote_measurement.mean,
+            grad_signed_sum=remote_measurement.signed_sum,
+            bias_grad=remote_bias_value,
+            parameter_update_direction_mean=(
+                -remote_measurement.mean
+                if remote_measurement.mean is not None
+                else None
+            ),
+            parameter_update_direction_signed_sum=(
+                -remote_measurement.signed_sum
+                if remote_measurement.signed_sum is not None
+                else None
+            ),
+            bias_update_direction=(
+                -remote_bias_value if remote_bias_value is not None else None
+            ),
+        )
+    )
+    return tuple(rows)
+
+
+def measure_route_head_gradients(
+    route_head: nn.Module, route_domains: Any = None
+) -> RouteHeadGradientTelemetry:
     """Read existing route-head gradients without changing or clipping them."""
 
+    if isinstance(route_head, CandidateAwareRouteDecoderV1):
+        named_parameters = tuple(route_head.named_parameters())
+        weight_parameters = tuple(
+            parameter
+            for name, parameter in named_parameters
+            if not name.endswith("bias")
+        )
+        bias_parameters = tuple(
+            parameter
+            for name, parameter in named_parameters
+            if name.endswith("bias")
+        )
+        with torch.no_grad():
+            return RouteHeadGradientTelemetry(
+                weight=_aggregate_gradient_measurement(weight_parameters),
+                bias=_aggregate_gradient_measurement(bias_parameters),
+                total=_aggregate_gradient_measurement(
+                    tuple(parameter for _, parameter in named_parameters)
+                ),
+                rows=_candidate_route_gradient_rows(route_head, route_domains),
+            )
     if not isinstance(route_head, nn.Linear) or route_head.bias is None:
-        raise TypeError("route_head must be a Linear layer with weight and bias")
+        raise TypeError(
+            "route_head must be a Linear or CandidateAwareRouteDecoderV1"
+        )
     with torch.no_grad():
         weight = _gradient_measurement(route_head.weight)
         bias = _gradient_measurement(route_head.bias)
@@ -609,10 +785,15 @@ def measure_route_head_gradients(route_head: nn.Linear, route_domains: Any = Non
 
 
 def measure_route_head_gradient_rows(
-    route_head: nn.Linear, route_domains: Any = None
+    route_head: nn.Module, route_domains: Any = None
 ) -> tuple[RouteHeadGradientRowTelemetry, ...]:
     """Map existing route-head row gradients to local/defer/remote semantics."""
 
+    if isinstance(route_head, CandidateAwareRouteDecoderV1):
+        with torch.no_grad():
+            return _candidate_route_gradient_rows(route_head, route_domains)
+    if not isinstance(route_head, nn.Linear) or route_head.bias is None:
+        raise TypeError("route_head has an unsupported module type")
     domains = list(route_domains or ())
     if domains and isinstance(domains[0], str):
         domains = [tuple(domains)]
@@ -709,7 +890,7 @@ def collect_route_telemetry(
     advantage: Tensor,
     return_target: Tensor,
     sequence_valid_mask: Tensor,
-    route_head: nn.Linear,
+    route_head: nn.Module,
     old_route_log_prob: Tensor | None = None,
     old_branch_log_probs: Tensor | None = None,
     td_residual: Tensor | None = None,

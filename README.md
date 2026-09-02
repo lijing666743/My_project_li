@@ -147,6 +147,7 @@ knowledge/project_plan/方案2.md
 - Minimal Trajectory-Credit Telemetry V1 诊断遥测已实现，行为中性回归已完成。
 - Route-Specific Lambda-One GAE V1 已实现，并通过静态验证与行为隔离验证；本结论不包含性能、收敛或算法优越性声明。
 - Rollout-Capped Route-Event N-Step Return V1 credit estimator 已实现，并通过静态验证与行为隔离验证；本结论不包含性能、收敛或算法优越性声明。
+- Candidate-aware Route Decoder V1 已完成结构实现：新增 `training.mappo.route_decoder_mode={legacy,candidate_aware_v1}`，方案 A 以共享 Candidate Scorer 将每个候选 UAV 的 public encoding 与对应 edge features 显式映射到固定 Remote UAV 编号的 logit；仅修改 actor route branch 及其配置、checkpoint/evaluation identity、只读梯度遥测和测试接线，critic、environment、reward、PPO objective、GAE/credit estimator 与动作语义均未修改，Treatment 强制 `route_credit_mode=shared_gae`。默认 `legacy` 继续保持历史 canonical hash 和旧 checkpoint 解释，跨 decoder mode resume 要求新 run；V1 targeted structural/regression gates 12/12 PASS，完整 unittest 共运行 602 项（597 PASS，5 项 CUDA-only 因本机无 CUDA 跳过）。本轮未运行 4000/60K/500K、未运行 Seeds 43–46、未添加 counterfactual instrumentation、未生成训练 artifact、未提交 commit，等待人工审核。
 
 ## 下一步
 

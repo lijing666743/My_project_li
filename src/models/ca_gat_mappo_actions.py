@@ -368,7 +368,11 @@ class CAGATMAPPOActionDistribution:
         )
 
         for branch in ACTION_BRANCH_ORDER:
-            logits = self.actor.branch_logits(branch, recurrent, selected_indices)
+            logits = (
+                network_output.raw_logits["route"]
+                if branch == "route"
+                else self.actor.branch_logits(branch, recurrent, selected_indices)
+            )
             dimension = self.spec.action_dimensions[branch]
             mask_rows: list[np.ndarray] = []
             for contract, context in zip(contracts, contexts):

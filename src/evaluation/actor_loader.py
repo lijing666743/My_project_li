@@ -14,6 +14,7 @@ from ..config import (
     ActorRatioMode,
     AgentCreditMode,
     CHECKPOINT_KIND_FINAL_COMPLETED,
+    RouteDecoderMode,
     RunConfig,
 )
 from ..models.ca_gat_mappo import CAGATMAPPOActor, MAPPOTensorSpec
@@ -26,6 +27,7 @@ _ARCHITECTURE_FIELDS = (
     "gat_layer_count",
     "attention_head_count",
     "gru_hidden_dimension",
+    "route_decoder_mode",
 )
 
 
@@ -266,7 +268,11 @@ def _validate_source_compatibility(
     if not isinstance(source_mappo, Mapping):
         raise EvaluationCheckpointError("checkpoint MAPPO config is invalid")
     for name in _ARCHITECTURE_FIELDS:
-        if source_mappo.get(name) != getattr(config.training.mappo, name):
+        source_value = source_mappo.get(name)
+        if name == "route_decoder_mode" and source_value is None:
+            source_value = RouteDecoderMode.LEGACY.value
+        target_value = getattr(config.training.mappo, name)
+        if source_value != target_value:
             raise EvaluationCheckpointError(
                 f"checkpoint actor architecture mismatch: {name}"
             )
