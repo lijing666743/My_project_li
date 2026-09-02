@@ -160,6 +160,9 @@ class RouteSlotWorkloadTimingTests(unittest.TestCase):
         historical["training"]["mappo"].pop(
             "trajectory_credit_telemetry_enabled"
         )
+        historical["training"]["mappo"].pop(
+            "route_diagnostic_samples_enabled"
+        )
         for field_name in (
             "route_entropy_start_coefficient",
             "route_entropy_schedule_start_step",

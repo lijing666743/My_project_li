@@ -20,10 +20,13 @@ from typing import Any, Iterable, Mapping
 from .artifacts import atomic_write_bytes_group, require_artifact_targets_absent
 from .config import RouteCreditMode, RunConfig, compute_route_entropy_schedule
 from .models.ca_gat_mappo_route_telemetry import (
+    ROUTE_DIAGNOSTIC_SCHEMA_VERSION,
+    ROUTE_DIAGNOSTIC_UTILITY_LABEL,
     ROUTE_TELEMETRY_SCHEMA_VERSION,
     TRAJECTORY_CREDIT_EVENT_TYPES,
     TRAJECTORY_CREDIT_SCHEMA_VERSION,
     RouteOutcomeAssociation,
+    RouteDiagnosticSampleCollector,
     aggregate_route_outcomes,
     ROUTE_ACTION_CATEGORIES,
     RouteTelemetry,
@@ -195,6 +198,10 @@ class TrainingArtifactOutcome:
 
 class TrajectoryCreditArtifactError(RuntimeError):
     """Raised when the append-only trajectory-credit sidecar is invalid."""
+
+
+class RouteDiagnosticArtifactError(RuntimeError):
+    """Raised when the actor-safe route-diagnostic sidecar is invalid."""
 
 
 _FORBIDDEN_ROUTE_OBSERVATION_KEYS = {
@@ -514,6 +521,268 @@ def inspect_trajectory_credit_artifact(config: RunConfig) -> dict[str, Any]:
         "task_count": len(task_keys),
         "route_credit_cardinality_match": True,
         "terminal_cardinality_match": True,
+    }
+
+
+def _validate_route_diagnostic_header(
+    config: RunConfig,
+    header: Mapping[str, Any],
+) -> None:
+    if header.get("record_type") != "schema":
+        raise RouteDiagnosticArtifactError("first diagnostic sidecar line must be a schema header")
+    if header.get("schema_version") != ROUTE_DIAGNOSTIC_SCHEMA_VERSION:
+        raise RouteDiagnosticArtifactError("route diagnostic schema version mismatch")
+    if header.get("sidecar") != "route_diagnostic_samples_v1":
+        raise RouteDiagnosticArtifactError("route diagnostic sidecar name mismatch")
+    if header.get("utility_label") != ROUTE_DIAGNOSTIC_UTILITY_LABEL:
+        raise RouteDiagnosticArtifactError("route diagnostic utility label mismatch")
+    for name, expected in (
+        ("run_id", config.run_id),
+        ("config_hash", config.config_hash),
+        ("git_commit", config.git_commit),
+    ):
+        if header.get(name) != expected:
+            raise RouteDiagnosticArtifactError(f"route diagnostic header {name} mismatch")
+    contract = header.get("diagnostic_contract")
+    if not isinstance(contract, Mapping):
+        raise RouteDiagnosticArtifactError("route diagnostic header lacks diagnostic_contract")
+    for name in (
+        "slot_duration_s", "ru_ids", "ru_bandwidth_hz", "ru_count", "uav_count",
+        "resource_group_count", "resource_groups", "resource_width_options",
+        "power_levels", "reference_transmit_power_w", "outage_threshold_linear",
+        "energy_tolerance_j", "reference_cpu_frequency_hz", "reference_cpu_coefficient",
+    ):
+        if name not in contract:
+            raise RouteDiagnosticArtifactError(f"route diagnostic contract lacks {name!r}")
+
+
+def _validate_route_diagnostic_record(
+    config: RunConfig,
+    header: Mapping[str, Any],
+    record: Mapping[str, Any],
+) -> tuple[str, ...]:
+    if not isinstance(record, Mapping):
+        raise RouteDiagnosticArtifactError("route diagnostic record must be a mapping")
+    if record.get("record_type") != "route_diagnostic_sample":
+        raise RouteDiagnosticArtifactError("unknown route diagnostic record type")
+    if record.get("schema_version") != ROUTE_DIAGNOSTIC_SCHEMA_VERSION:
+        raise RouteDiagnosticArtifactError("route diagnostic record schema version mismatch")
+    if record.get("utility_label") != ROUTE_DIAGNOSTIC_UTILITY_LABEL:
+        raise RouteDiagnosticArtifactError("route diagnostic record utility label mismatch")
+    for name in ("run_id", "config_hash", "git_commit"):
+        if record.get(name) != header.get(name):
+            raise RouteDiagnosticArtifactError(f"route diagnostic record {name} mismatch")
+    required = (
+        "episode_id", "global_environment_step", "route_slot", "policy_version",
+        "source_uav", "head_task_id", "primary_key", "task", "source",
+        "candidates", "policy", "join",
+    )
+    missing = [name for name in required if name not in record]
+    if missing:
+        raise RouteDiagnosticArtifactError(f"route diagnostic record lacks fields: {missing}")
+    key = record.get("primary_key")
+    expected_key = [
+        record.get("run_id"),
+        record.get("episode_id"),
+        record.get("global_environment_step"),
+        record.get("source_uav"),
+        record.get("head_task_id"),
+    ]
+    if key != expected_key:
+        raise RouteDiagnosticArtifactError("route diagnostic primary key is inconsistent")
+    if not isinstance(record["candidates"], list) or not isinstance(record["policy"], Mapping):
+        raise RouteDiagnosticArtifactError("route diagnostic candidates/policy sections are invalid")
+    candidates = record["candidates"]
+    candidate_ids = [item.get("candidate_uav") for item in candidates if isinstance(item, Mapping)]
+    expected_ids = [
+        candidate
+        for candidate in range(int(header["diagnostic_contract"]["uav_count"]))
+        if candidate != int(record["source_uav"])
+    ]
+    if candidate_ids != expected_ids:
+        raise RouteDiagnosticArtifactError("route diagnostic candidate IDs are not complete or aligned")
+    ru_count = int(header["diagnostic_contract"]["ru_count"])
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            raise RouteDiagnosticArtifactError("route diagnostic candidate must be a mapping")
+        link = candidate.get("link_history")
+        if not isinstance(link, Mapping):
+            raise RouteDiagnosticArtifactError("route diagnostic candidate lacks link_history")
+        for name in (
+            "historical_quality_by_ru", "historical_quality_valid_mask",
+            "historical_interference_w_by_ru", "historical_interference_valid_mask",
+        ):
+            if not isinstance(link.get(name), list) or len(link[name]) != ru_count:
+                raise RouteDiagnosticArtifactError(f"route diagnostic {name} has invalid RU alignment")
+    policy = record["policy"]
+    entries = policy.get("route_entries")
+    if not isinstance(entries, list) or len(entries) != len(header.get("route_domain_fixed_actions", ())) + len(expected_ids):
+        raise RouteDiagnosticArtifactError("route diagnostic route entries are not aligned with route domain")
+    if [item.get("action_index") for item in entries] != list(range(len(entries))):
+        raise RouteDiagnosticArtifactError("route diagnostic route action indices are not contiguous")
+    if not isinstance(policy.get("remote_probability_by_candidate"), list):
+        raise RouteDiagnosticArtifactError("route diagnostic remote probabilities are missing")
+    if [item.get("candidate_uav") for item in policy["remote_probability_by_candidate"]] != expected_ids:
+        raise RouteDiagnosticArtifactError("route diagnostic probability candidate IDs are misaligned")
+    json.dumps(record, ensure_ascii=False, allow_nan=False)
+    return tuple(key)
+
+
+class RouteDiagnosticArtifactWriter:
+    """Streaming writer for the independent actor-safe diagnostic sidecar."""
+
+    def __init__(
+        self,
+        config: RunConfig,
+        header: Mapping[str, Any],
+        *,
+        allow_existing: bool = False,
+    ) -> None:
+        if not isinstance(config, RunConfig):
+            raise TypeError("config must be a RunConfig")
+        if not config.training.mappo.route_diagnostic_samples_enabled:
+            raise RouteDiagnosticArtifactError(
+                "route diagnostic writer requires enabled telemetry"
+            )
+        _validate_route_diagnostic_header(config, header)
+        self.config = config
+        self.path = Path(config.artifact_paths()["route_diagnostic_samples"])
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._header = dict(header)
+        self._keys: set[tuple[Any, ...]] = set()
+        self._route_counts = {"local": 0, "remote": 0, "defer": 0}
+        if self.path.exists():
+            if not allow_existing:
+                raise RouteDiagnosticArtifactError(
+                    f"route diagnostic sidecar already exists: {self.path}"
+                )
+            self._load_existing()
+        else:
+            try:
+                with self.path.open("x", encoding="utf-8", newline="\n") as stream:
+                    stream.write(json.dumps(
+                        self._header,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ) + "\n")
+                    stream.flush()
+            except OSError as exc:
+                raise RouteDiagnosticArtifactError(
+                    f"failed to create route diagnostic sidecar: {self.path}"
+                ) from exc
+
+    def _load_existing(self) -> None:
+        try:
+            with self.path.open("r", encoding="utf-8") as stream:
+                lines = list(stream)
+        except OSError as exc:
+            raise RouteDiagnosticArtifactError(
+                f"failed to read route diagnostic sidecar: {self.path}"
+            ) from exc
+        if not lines:
+            raise RouteDiagnosticArtifactError("route diagnostic sidecar is empty")
+        try:
+            header = json.loads(lines[0])
+        except json.JSONDecodeError as exc:
+            raise RouteDiagnosticArtifactError("route diagnostic header is invalid JSON") from exc
+        _validate_route_diagnostic_header(self.config, header)
+        if header != self._header:
+            raise RouteDiagnosticArtifactError("route diagnostic header differs on resume")
+        for line_number, line in enumerate(lines[1:], start=2):
+            if not line.endswith("\n") or not line.strip():
+                raise RouteDiagnosticArtifactError(f"invalid diagnostic JSONL framing at line {line_number}")
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise RouteDiagnosticArtifactError(f"invalid diagnostic JSON at line {line_number}") from exc
+            key = _validate_route_diagnostic_record(self.config, header, record)
+            if key in self._keys:
+                raise RouteDiagnosticArtifactError("duplicate route diagnostic primary key")
+            self._keys.add(key)
+            self._count_route(record)
+
+    def _count_route(self, record: Mapping[str, Any]) -> None:
+        route = record["policy"]["actual_route"]
+        category = "remote" if isinstance(route, int) and not isinstance(route, bool) else str(route)
+        if category not in self._route_counts:
+            raise RouteDiagnosticArtifactError("route diagnostic actual route is invalid")
+        self._route_counts[category] += 1
+
+    def write(self, record: Mapping[str, Any]) -> None:
+        key = _validate_route_diagnostic_record(self.config, self._header, record)
+        if key in self._keys:
+            raise RouteDiagnosticArtifactError("duplicate route diagnostic primary key")
+        encoded = json.dumps(
+            dict(record),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        try:
+            with self.path.open("a", encoding="utf-8", newline="\n") as stream:
+                stream.write(encoded + "\n")
+                stream.flush()
+        except OSError as exc:
+            raise RouteDiagnosticArtifactError(
+                f"failed to append route diagnostic sidecar: {self.path}"
+            ) from exc
+        self._keys.add(key)
+        self._count_route(record)
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "schema_version": ROUTE_DIAGNOSTIC_SCHEMA_VERSION,
+            "path": str(self.path),
+            "sample_count": len(self._keys),
+            "route_counts": dict(self._route_counts),
+        }
+
+
+def inspect_route_diagnostic_artifact(config: RunConfig) -> dict[str, Any]:
+    """Validate diagnostic sidecar identity, alignment, and uniqueness."""
+
+    if not isinstance(config, RunConfig):
+        raise TypeError("config must be a RunConfig")
+    path = Path(config.artifact_paths()["route_diagnostic_samples"])
+    if not path.is_file():
+        raise RouteDiagnosticArtifactError(f"route diagnostic sidecar is absent: {path}")
+    counts = {"local": 0, "remote": 0, "defer": 0}
+    keys: set[tuple[Any, ...]] = set()
+    with path.open("r", encoding="utf-8") as stream:
+        lines = list(stream)
+    if not lines:
+        raise RouteDiagnosticArtifactError("route diagnostic sidecar is empty")
+    try:
+        header = json.loads(lines[0])
+    except json.JSONDecodeError as exc:
+        raise RouteDiagnosticArtifactError("route diagnostic header is invalid JSON") from exc
+    _validate_route_diagnostic_header(config, header)
+    for line_number, line in enumerate(lines[1:], start=2):
+        if not line.endswith("\n") or not line.strip():
+            raise RouteDiagnosticArtifactError(f"invalid diagnostic JSONL framing at line {line_number}")
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise RouteDiagnosticArtifactError(f"invalid diagnostic JSON at line {line_number}") from exc
+        key = _validate_route_diagnostic_record(config, header, record)
+        if key in keys:
+            raise RouteDiagnosticArtifactError("duplicate route diagnostic primary key")
+        keys.add(key)
+        route = record["policy"]["actual_route"]
+        category = "remote" if isinstance(route, int) and not isinstance(route, bool) else str(route)
+        if category not in counts:
+            raise RouteDiagnosticArtifactError("route diagnostic actual route is not local/remote/defer")
+        counts[category] += 1
+    return {
+        "schema_version": ROUTE_DIAGNOSTIC_SCHEMA_VERSION,
+        "path": str(path),
+        "sample_count": len(keys),
+        "route_counts": counts,
+        "primary_key_unique": True,
+        "candidate_alignment": True,
     }
 
 
@@ -1604,6 +1873,10 @@ def write_cagat_mappo_training_artifacts(
     trajectory_path = Path(paths["trajectory_credit_events"])
     if config.training.mappo.trajectory_credit_telemetry_enabled:
         trajectory_summary = inspect_trajectory_credit_artifact(config)
+    route_diagnostic_summary = None
+    route_diagnostic_path = Path(paths["route_diagnostic_samples"])
+    if config.training.mappo.route_diagnostic_samples_enabled:
+        route_diagnostic_summary = inspect_route_diagnostic_artifact(config)
     artifact_paths = (
         snapshot_path,
         raw_path,
@@ -1625,6 +1898,8 @@ def write_cagat_mappo_training_artifacts(
     )
     if trajectory_summary is not None:
         summary["trajectory_credit_telemetry"] = trajectory_summary
+    if route_diagnostic_summary is not None:
+        summary["route_diagnostic_samples"] = route_diagnostic_summary
 
     dashboard_stream = io.BytesIO()
     _plot_dashboard(csv_text, dashboard_stream, summary)
@@ -1665,6 +1940,8 @@ def write_cagat_mappo_training_artifacts(
     artifacts = tuple(str(path) for path in artifact_paths)
     if trajectory_summary is not None:
         artifacts = (*artifacts, str(trajectory_path))
+    if route_diagnostic_summary is not None:
+        artifacts = (*artifacts, str(route_diagnostic_path))
     return TrainingArtifactOutcome(
         artifacts=artifacts,
         smoke_gate_status=smoke_gate_status,
@@ -1682,6 +1959,9 @@ __all__ = [
     "TrainingArtifactOutcome",
     "TrajectoryCreditArtifactError",
     "TrajectoryCreditArtifactWriter",
+    "RouteDiagnosticArtifactError",
+    "RouteDiagnosticArtifactWriter",
     "inspect_trajectory_credit_artifact",
+    "inspect_route_diagnostic_artifact",
     "write_cagat_mappo_training_artifacts",
 ]

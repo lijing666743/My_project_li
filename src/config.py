@@ -548,6 +548,7 @@ class MAPPOConfig:
     checkpoint_interval_steps: int = 50000
     checkpoint_schema_version: int = CHECKPOINT_SCHEMA_VERSION
     trajectory_credit_telemetry_enabled: bool = False
+    route_diagnostic_samples_enabled: bool = False
 
     @property
     def recurrent_chunk_count(self) -> int:
@@ -811,6 +812,12 @@ class RunConfig:
             # false value preserves legacy config hashes and run identities;
             # enabled diagnostic runs receive a distinct canonical identity.
             mappo.pop("trajectory_credit_telemetry_enabled")
+        if isinstance(mappo, dict) and not mappo.get(
+            "route_diagnostic_samples_enabled", False
+        ):
+            # The route-diagnostic sidecar is independently opt-in. Omitting
+            # the historical false value preserves legacy hashes and run IDs.
+            mappo.pop("route_diagnostic_samples_enabled")
         return resolved
 
     def to_dict(self) -> dict[str, Any]:
@@ -868,6 +875,7 @@ class RunConfig:
             "raw_metrics": str(run_dir / self.output.raw_metrics_filename),
             "aggregate_metrics": str(run_dir / self.output.aggregate_metrics_filename),
             "trajectory_credit_events": str(run_dir / "trajectory_credit_events.jsonl"),
+            "route_diagnostic_samples": str(run_dir / "route_diagnostic_samples_v1.jsonl"),
             "dashboard_csv": str(Path(self.output.dashboard_logs_dir) / f"{self.run_id}_metrics.csv"),
             "figure_input": str(Path(self.output.plots_dir) / f"{self.run_id}_figure_input.csv"),
             "dashboard_png": str(Path(self.output.plots_dir) / f"{self.run_id}_dashboard.png"),
@@ -1264,6 +1272,10 @@ class RunConfig:
         if not isinstance(mappo.trajectory_credit_telemetry_enabled, bool):
             raise ConfigError(
                 "training.mappo.trajectory_credit_telemetry_enabled must be boolean"
+            )
+        if not isinstance(mappo.route_diagnostic_samples_enabled, bool):
+            raise ConfigError(
+                "training.mappo.route_diagnostic_samples_enabled must be boolean"
             )
         checkpoint_interval = mappo.checkpoint_interval_steps
         if (

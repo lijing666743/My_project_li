@@ -13,6 +13,7 @@ import math
 from statistics import median
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+import numpy as np
 import torch
 from torch import Tensor, nn
 
@@ -33,6 +34,8 @@ from .ca_gat_mappo_route_nstep import RouteNstepSample
 
 ROUTE_TELEMETRY_SCHEMA_VERSION = 4
 TRAJECTORY_CREDIT_SCHEMA_VERSION = 1
+ROUTE_DIAGNOSTIC_SCHEMA_VERSION = 1
+ROUTE_DIAGNOSTIC_UTILITY_LABEL = "OBSERVABLE_DIAGNOSTIC_UTILITY"
 TRAJECTORY_CREDIT_EVENT_TYPES = ("route", "terminal", "credit")
 TRAJECTORY_LEDGER_TOLERANCE = 1.0e-9
 ROUTE_GRADIENT_STATUSES = ("none", "zero", "finite_nonzero", "nonfinite")
@@ -2175,6 +2178,93 @@ def _safe_float(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def route_diagnostic_schema_header(config: RunConfig) -> dict[str, Any]:
+    """Return the static, versioned contract for the diagnostic sidecar."""
+
+    if not isinstance(config, RunConfig):
+        raise TypeError("config must be a RunConfig")
+    environment = config.environment
+    action = config.action
+    return {
+        "record_type": "schema",
+        "schema_version": ROUTE_DIAGNOSTIC_SCHEMA_VERSION,
+        "sidecar": "route_diagnostic_samples_v1",
+        "utility_label": ROUTE_DIAGNOSTIC_UTILITY_LABEL,
+        "run_id": config.run_id,
+        "config_hash": config.config_hash,
+        "git_commit": config.git_commit,
+        "capture_source": "ActorObservation_and_existing_action_output",
+        "capture_timing": "after_policy_route_decision_before_environment_step",
+        "route_domain_fixed_actions": list(action.route_fixed_actions),
+        "diagnostic_contract": {
+            "slot_duration_s": environment.slot_duration_s,
+            "ru_ids": list(range(1, environment.ru_count + 1)),
+            "ru_bandwidth_hz": environment.ru_bandwidth_hz,
+            "ru_count": environment.ru_count,
+            "uav_count": environment.uav_count,
+            "resource_group_count": environment.resource_group_count,
+            "resource_groups": [list(group) for group in environment.resource_groups],
+            "resource_width_options": list(action.resource_width_options),
+            "power_levels": [float(level) for level in action.power_levels],
+            "reference_transmit_power_w": environment.reference_transmit_power_w,
+            "outage_threshold_linear": environment.outage_threshold_linear,
+            "energy_tolerance_j": environment.energy_tolerance_j,
+            "reference_cpu_frequency_hz": environment.reference_cpu_frequency_hz,
+            "reference_cpu_coefficient": environment.reference_cpu_coefficient,
+        },
+        "ordering": {
+            "agents": "ascending zero-based uav_id",
+            "candidates": "route_domain order excluding fixed string actions",
+            "rus": "ascending one-based contiguous RU IDs",
+            "json": "sorted object keys and one decision per line",
+        },
+        "unavailable_fields": {
+            "task.arrival_slot": "not_exposed_actor_safe",
+            "task.arrival_slot_exact": "not_exposed_actor_safe",
+            "current_true_channel": "forbidden",
+            "current_true_sinr": "forbidden",
+            "future_outcome": "joined_after_capture",
+        },
+    }
+
+
+def _diagnostic_masked_values(
+    values: Sequence[Any],
+    valid: Sequence[Any],
+    *,
+    cast: Callable[[Any], Any] = float,
+) -> list[Any]:
+    return [cast(value) if bool(is_valid) else None for value, is_valid in zip(values, valid)]
+
+
+def _diagnostic_tensor_rows(output: Any, field_name: str, agent_count: int) -> list[Any]:
+    values = getattr(output, field_name, None)
+    if not isinstance(values, Mapping) or "route" not in values:
+        raise RouteTelemetryError(f"route diagnostic output lacks {field_name}['route']")
+    tensor = values["route"]
+    if not isinstance(tensor, Tensor) or tensor.ndim != 4:
+        raise RouteTelemetryError(f"route diagnostic {field_name} must be [B,T,A,D]")
+    if tuple(tensor.shape[:3]) != (1, 1, agent_count):
+        raise RouteTelemetryError(
+            f"route diagnostic {field_name} shape does not match one environment step"
+        )
+    return tensor.detach().cpu().tolist()[0][0]
+
+
+def _diagnostic_agent_tensor(output: Any, field_name: str, agent_count: int) -> list[Any]:
+    values = getattr(output, field_name, None)
+    if not isinstance(values, Mapping) or "route" not in values:
+        raise RouteTelemetryError(f"route diagnostic output lacks {field_name}['route']")
+    tensor = values["route"]
+    if not isinstance(tensor, Tensor) or tensor.ndim != 3:
+        raise RouteTelemetryError(f"route diagnostic {field_name} must be [B,T,A]")
+    if tuple(tensor.shape) != (1, 1, agent_count):
+        raise RouteTelemetryError(
+            f"route diagnostic {field_name} shape does not match one environment step"
+        )
+    return tensor.detach().cpu().tolist()[0][0]
+
+
 @dataclass
 class _RouteDecisionState:
     episode_index: int
@@ -2416,6 +2506,553 @@ class RouteOutcomeTracker:
                 terminal_age_slots=state.terminal_age_slots,
             ))
         return tuple(result)
+
+
+class RouteDiagnosticSampleCollector:
+    """Capture actor-safe route decisions without computing utility in training."""
+
+    def __init__(self, config: RunConfig) -> None:
+        if not isinstance(config, RunConfig):
+            raise TypeError("config must be a RunConfig")
+        self.config = config
+
+    def schema_header(self) -> dict[str, Any]:
+        return route_diagnostic_schema_header(self.config)
+
+    @staticmethod
+    def _source_queue(observation: Any) -> dict[str, Any]:
+        queue = observation.private_queues.unbound
+        if not bool(queue.head_valid_mask):
+            raise RouteTelemetryError(
+                "route-active observation has no actor-visible unbound head task"
+            )
+        slot = int(observation.slot)
+        slack = int(queue.head_slack_slots)
+        return {
+            "task_id": int(queue.head_task_id),
+            "remaining_bits": float(queue.head_remaining_bits),
+            "remaining_cycles": float(queue.head_remaining_cycles),
+            "arrival_slot": None,
+            "arrival_slot_valid": False,
+            "arrival_slot_source": "not_exposed_actor_safe",
+            "deadline_slot": slot + slack - 1,
+            "deadline_slot_valid": True,
+            "deadline_slot_source": "ActorObservation.private_queues.unbound.head_slack_slots",
+            "remaining_deadline_slots": slack,
+            "remaining_deadline_slots_valid": True,
+            "lifecycle": "unbound",
+            "lifecycle_source": "ActorObservation.action_masks.route_branch_active",
+            "head_valid": True,
+            "provenance": {
+                "task_id": "ActorObservation.private_queues.unbound.head_task_id",
+                "remaining_bits": "ActorObservation.private_queues.unbound.head_remaining_bits",
+                "remaining_cycles": "ActorObservation.private_queues.unbound.head_remaining_cycles",
+                "arrival_slot": "not_exposed_actor_safe",
+                "deadline_slot": "ActorObservation.private_queues.unbound.head_slack_slots",
+                "remaining_deadline_slots": "ActorObservation.private_queues.unbound.head_slack_slots",
+            },
+        }
+
+    @staticmethod
+    def _source_primitives(observation: Any) -> dict[str, Any]:
+        resources = observation.self_resources
+        local = observation.private_queues.local_cpu
+        tx = observation.private_queues.tx_by_destination
+        destinations = []
+        for destination in range(tx.count):
+            destinations.append({
+                "destination_uav": destination,
+                "destination_is_self": destination == int(observation.uav_id),
+                "task_count": int(tx.task_count[destination]),
+                "remaining_bits": float(tx.remaining_bits[destination]),
+                "remaining_cycles": float(tx.remaining_cycles[destination]),
+                "provenance": {
+                    "task_count": "ActorObservation.private_queues.tx_by_destination.task_count",
+                    "remaining_bits": "ActorObservation.private_queues.tx_by_destination.remaining_bits",
+                    "remaining_cycles": "ActorObservation.private_queues.tx_by_destination.remaining_cycles",
+                },
+            })
+        return {
+            "residual_energy_j": float(resources.residual_energy_j),
+            "max_transmit_power_w": float(resources.max_transmit_power_w),
+            "max_cpu_frequency_hz": float(resources.max_cpu_frequency_hz),
+            "cpu_coefficient": float(resources.cpu_coefficient),
+            "local_cpu_backlog": {
+                "task_count": int(local.task_count),
+                "remaining_cycles": float(local.remaining_cycles),
+                "provenance": {
+                    "task_count": "ActorObservation.private_queues.local_cpu.task_count",
+                    "remaining_cycles": "ActorObservation.private_queues.local_cpu.remaining_cycles",
+                },
+            },
+            "tx_queue_by_destination": destinations,
+            "provenance": {
+                "residual_energy_j": "ActorObservation.self_resources.residual_energy_j",
+                "max_transmit_power_w": "ActorObservation.self_resources.max_transmit_power_w",
+                "max_cpu_frequency_hz": "ActorObservation.self_resources.max_cpu_frequency_hz",
+                "cpu_coefficient": "ActorObservation.self_resources.cpu_coefficient",
+            },
+        }
+
+    def _candidate(
+        self,
+        observation: Any,
+        destination: int,
+        action_index: int,
+        legal: bool,
+    ) -> dict[str, Any]:
+        public = observation.neighbor_public
+        edge = observation.edge_history
+        helper_valid = bool(public.valid_mask[destination])
+        helper = {
+            "valid": helper_valid,
+            "source": "ActorObservation.neighbor_public" if helper_valid else "not_exposed_actor_safe",
+            "residual_energy_j": float(public.residual_energy_j[destination]) if helper_valid else None,
+            "max_cpu_frequency_hz": (
+                float(public.max_cpu_frequency_ratio[destination])
+                * self.config.environment.reference_cpu_frequency_hz
+                if helper_valid else None
+            ),
+            "cpu_coefficient": (
+                float(public.cpu_coefficient_ratio[destination])
+                * self.config.environment.reference_cpu_coefficient
+                if helper_valid else None
+            ),
+            "cpu_load_task_count": int(public.cpu_load_task_count[destination]) if helper_valid else None,
+            "cpu_load_remaining_cycles": (
+                float(public.cpu_load_remaining_cycles[destination]) if helper_valid else None
+            ),
+            "message_aoi_slots": (
+                int(public.message_aoi_slots[destination])
+                if bool(public.message_aoi_valid_mask[destination]) else None
+            ),
+            "message_aoi_valid": bool(public.message_aoi_valid_mask[destination]),
+            "provenance": {
+                "valid": "ActorObservation.neighbor_public.valid_mask",
+                "residual_energy_j": "ActorObservation.neighbor_public.residual_energy_j",
+                "max_cpu_frequency_hz": "ActorObservation.neighbor_public.max_cpu_frequency_ratio * static reference_cpu_frequency_hz",
+                "cpu_coefficient": "ActorObservation.neighbor_public.cpu_coefficient_ratio * static reference_cpu_coefficient",
+                "cpu_load_task_count": "ActorObservation.neighbor_public.cpu_load_task_count",
+                "cpu_load_remaining_cycles": "ActorObservation.neighbor_public.cpu_load_remaining_cycles",
+                "message_aoi_slots": "ActorObservation.neighbor_public.message_aoi_slots",
+            },
+        }
+        quality_valid = np.asarray(edge.quality_valid_mask[destination], dtype=np.bool_)
+        interference_valid = np.asarray(edge.interference_valid_mask[destination], dtype=np.bool_)
+        visible = bool(edge.visible_mask[destination])
+        csi_valid = bool(edge.csi_valid_mask[destination])
+        link = {
+            "source": "ActorObservation.edge_history",
+            "visible": visible,
+            "estimated_distance_m": float(edge.estimated_distance_m[destination]) if visible else None,
+            "csi_valid": csi_valid,
+            "csi_aoi_slots": int(edge.csi_aoi_slots[destination]) if csi_valid else None,
+            "historical_quality_by_ru": _diagnostic_masked_values(
+                edge.historical_quality[destination], quality_valid
+            ),
+            "historical_quality_valid_mask": quality_valid.tolist(),
+            "historical_interference_w_by_ru": _diagnostic_masked_values(
+                edge.interference_history_w[destination], interference_valid
+            ),
+            "historical_interference_valid_mask": interference_valid.tolist(),
+            "message_aoi_slots": (
+                int(edge.message_aoi_slots[destination])
+                if bool(edge.message_aoi_valid_mask[destination]) else None
+            ),
+            "message_aoi_valid": bool(edge.message_aoi_valid_mask[destination]),
+            "last_effective_rate_bps": (
+                float(edge.last_effective_rate_bps[destination])
+                if bool(edge.last_rate_valid_mask[destination]) else None
+            ),
+            "last_rate_valid": bool(edge.last_rate_valid_mask[destination]),
+            "outage_rate": (
+                float(edge.outage_rate[destination])
+                if bool(edge.outage_valid_mask[destination]) else None
+            ),
+            "outage_valid": bool(edge.outage_valid_mask[destination]),
+            "ru_ids": list(range(1, self.config.environment.ru_count + 1)),
+            "provenance": {
+                "visible": "ActorObservation.edge_history.visible_mask",
+                "estimated_distance_m": "ActorObservation.edge_history.estimated_distance_m",
+                "csi_valid": "ActorObservation.edge_history.csi_valid_mask",
+                "csi_aoi_slots": "ActorObservation.edge_history.csi_aoi_slots",
+                "historical_quality_by_ru": "ActorObservation.edge_history.historical_quality",
+                "historical_quality_valid_mask": "ActorObservation.edge_history.quality_valid_mask",
+                "historical_interference_w_by_ru": "ActorObservation.edge_history.interference_history_w",
+                "historical_interference_valid_mask": "ActorObservation.edge_history.interference_valid_mask",
+                "message_aoi_slots": "ActorObservation.edge_history.message_aoi_slots",
+                "last_effective_rate_bps": "ActorObservation.edge_history.last_effective_rate_bps",
+                "outage_rate": "ActorObservation.edge_history.outage_rate",
+            },
+        }
+        tx = observation.private_queues.tx_by_destination
+        return {
+            "candidate_uav": destination,
+            "route_action_index": action_index,
+            "legal_mask": bool(legal),
+            "topology_available": bool(observation.candidate_neighbor_mask[destination]),
+            "self_excluded": destination == int(observation.uav_id),
+            "helper_public": helper,
+            "link_history": link,
+            "source_tx_queue": {
+                "task_count": int(tx.task_count[destination]),
+                "remaining_bits": float(tx.remaining_bits[destination]),
+                "remaining_cycles": float(tx.remaining_cycles[destination]),
+                "provenance": "ActorObservation.private_queues.tx_by_destination",
+            },
+        }
+
+    def collect(
+        self,
+        *,
+        episode_id: int,
+        global_environment_step: int,
+        policy_version: int,
+        observations: Sequence[Any],
+        proposals: Sequence[ActionProposal],
+        action_output: SequentialActionDistributionOutput,
+    ) -> tuple[dict[str, Any], ...]:
+        """Capture one pre-step sample for every route-active source UAV."""
+
+        if not observations or any(not hasattr(item, "action_masks") for item in observations):
+            raise RouteTelemetryError("route diagnostic capture requires ActorObservation values")
+        if any(int(item.slot) != int(observations[0].slot) for item in observations):
+            raise RouteTelemetryError("route diagnostic observations must share one slot")
+        if len(proposals) != len(observations):
+            raise RouteTelemetryError("route diagnostic proposals are misaligned")
+        if any(proposal.uav_id != index for index, proposal in enumerate(proposals)):
+            raise RouteTelemetryError("route diagnostic proposals must use stable UAV order")
+        for name, value in (
+            ("episode_id", episode_id),
+            ("global_environment_step", global_environment_step),
+            ("policy_version", policy_version),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise RouteTelemetryError(f"{name} must be a non-negative integer")
+
+        agent_count = len(observations)
+        route_logits = _diagnostic_tensor_rows(action_output, "raw_logits", agent_count)
+        route_masks = _diagnostic_tensor_rows(action_output, "action_masks", agent_count)
+        route_probabilities = _diagnostic_tensor_rows(action_output, "probabilities", agent_count)
+        route_indices = _diagnostic_agent_tensor(action_output, "action_indices", agent_count)
+        route_active = _diagnostic_agent_tensor(action_output, "active_branches", agent_count)
+        route_entropy = _diagnostic_agent_tensor(action_output, "branch_entropies", agent_count)
+        records: list[dict[str, Any]] = []
+        for agent_index, (observation, proposal) in enumerate(zip(observations, proposals)):
+            expected_mask = [bool(item) for item in observation.action_masks.route_mask]
+            output_mask = [bool(item) for item in route_masks[agent_index]]
+            if expected_mask != output_mask:
+                raise RouteTelemetryError("route diagnostic action mask differs from ActorObservation")
+            if bool(route_active[agent_index]) != bool(observation.action_masks.route_branch_active):
+                raise RouteTelemetryError("route diagnostic route-active state differs from ActorObservation")
+            if not bool(observation.action_masks.route_branch_active):
+                continue
+            task = self._source_queue(observation)
+            domain = tuple(observation.action_masks.route_domain)
+            candidates = [
+                self._candidate(observation, int(value), action_index, bool(legal))
+                for action_index, (value, legal) in enumerate(zip(domain, expected_mask))
+                if isinstance(value, int) and not isinstance(value, bool)
+            ]
+            route_entries = []
+            for action_index, (value, legal, probability, logit) in enumerate(
+                zip(domain, expected_mask, route_probabilities[agent_index], route_logits[agent_index])
+            ):
+                probability_value = float(probability)
+                raw_logit = float(logit)
+                route_entries.append({
+                    "action": value,
+                    "action_index": action_index,
+                    "legal": bool(legal),
+                    "probability": probability_value,
+                    "raw_logit": raw_logit if math.isfinite(raw_logit) else None,
+                })
+            route_value = proposal.route
+            record = {
+                "record_type": "route_diagnostic_sample",
+                "schema_version": ROUTE_DIAGNOSTIC_SCHEMA_VERSION,
+                "utility_label": ROUTE_DIAGNOSTIC_UTILITY_LABEL,
+                "run_id": self.config.run_id,
+                "config_hash": self.config.config_hash,
+                "git_commit": self.config.git_commit,
+                "episode_id": int(episode_id),
+                "global_environment_step": int(global_environment_step),
+                "route_slot": int(observation.slot),
+                "policy_version": int(policy_version),
+                "source_uav": int(observation.uav_id),
+                "head_task_id": int(task["task_id"]),
+                "primary_key": [
+                    self.config.run_id,
+                    int(episode_id),
+                    int(global_environment_step),
+                    int(observation.uav_id),
+                    int(task["task_id"]),
+                ],
+                "task": task,
+                "source": self._source_primitives(observation),
+                "candidates": candidates,
+                "policy": {
+                    "actual_route": route_value,
+                    "chosen_remote": (
+                        int(route_value)
+                        if isinstance(route_value, int) and not isinstance(route_value, bool)
+                        else None
+                    ),
+                    "route_action_index": int(route_indices[agent_index]),
+                    "route_entries": route_entries,
+                    "local_probability": next(
+                        item["probability"] for item in route_entries if item["action"] == "local"
+                    ),
+                    "defer_probability": next(
+                        item["probability"] for item in route_entries if item["action"] == "defer"
+                    ),
+                    "remote_probability_by_candidate": [
+                        {
+                            "candidate_uav": item["candidate_uav"],
+                            "route_action_index": item["route_action_index"],
+                            "legal": item["legal_mask"],
+                            "probability": next(
+                                entry["probability"]
+                                for entry in route_entries
+                                if entry["action_index"] == item["route_action_index"]
+                            ),
+                        }
+                        for item in candidates
+                    ],
+                    "route_entropy": float(route_entropy[agent_index]),
+                    "provenance": {
+                        "actual_route": "existing_action_output.proposals",
+                        "chosen_remote": "existing_action_output.proposals",
+                        "route_action_index": "existing_action_output.action_indices['route']",
+                        "route_entries.probability": "existing_action_output.probabilities['route']",
+                        "route_entries.raw_logit": "existing_action_output.raw_logits['route']",
+                        "route_entropy": "existing_action_output.branch_entropies['route']",
+                    },
+                },
+                "join": {
+                    "route_decision_occurrence": None,
+                    "route_outcome_sequence_source": "derived_offline_from_route_outcome",
+                    "outcome_status": "not_joined_at_capture",
+                },
+            }
+            records.append(record)
+        return tuple(records)
+
+
+def _diagnostic_contract_value(contract: Mapping[str, Any], name: str) -> Any:
+    try:
+        return contract["diagnostic_contract"][name]
+    except (KeyError, TypeError) as exc:
+        raise RouteTelemetryError(f"diagnostic contract is missing {name!r}") from exc
+
+
+def reconstruct_route_diagnostic_utility(
+    sample: Mapping[str, Any],
+    header: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Pure offline reconstruction from actor-safe sidecar primitives."""
+
+    if not isinstance(sample, Mapping) or sample.get("record_type") != "route_diagnostic_sample":
+        raise RouteTelemetryError("utility reconstruction requires a route diagnostic sample")
+    if not isinstance(header, Mapping) or header.get("record_type") != "schema":
+        raise RouteTelemetryError("utility reconstruction requires the sidecar schema header")
+    task = sample.get("task", {})
+    source = sample.get("source", {})
+    if not isinstance(task, Mapping) or not isinstance(source, Mapping):
+        raise RouteTelemetryError("route diagnostic sample has invalid task/source sections")
+    contract = header
+    slot_duration = float(_diagnostic_contract_value(contract, "slot_duration_s"))
+    ru_count = int(_diagnostic_contract_value(contract, "ru_count"))
+    ru_bandwidth = float(_diagnostic_contract_value(contract, "ru_bandwidth_hz"))
+    reference_power = float(_diagnostic_contract_value(contract, "reference_transmit_power_w"))
+    outage_threshold = float(_diagnostic_contract_value(contract, "outage_threshold_linear"))
+    tolerance = float(_diagnostic_contract_value(contract, "energy_tolerance_j"))
+    groups = [
+        tuple(int(item) for item in group)
+        for group in _diagnostic_contract_value(contract, "resource_groups")
+    ]
+    widths = tuple(int(item) for item in _diagnostic_contract_value(contract, "resource_width_options"))
+    power_levels = tuple(float(item) for item in _diagnostic_contract_value(contract, "power_levels"))
+
+    def positive(value: Any) -> float | None:
+        try:
+            converted = float(value)
+        except (TypeError, ValueError):
+            return None
+        return converted if math.isfinite(converted) and converted > 0.0 else None
+
+    def nonnegative(value: Any) -> float | None:
+        try:
+            converted = float(value)
+        except (TypeError, ValueError):
+            return None
+        return converted if math.isfinite(converted) and converted >= 0.0 else None
+
+    source_frequency = positive(source.get("max_cpu_frequency_hz"))
+    source_kappa = positive(source.get("cpu_coefficient"))
+    source_power = positive(source.get("max_transmit_power_w"))
+    source_energy = nonnegative(source.get("residual_energy_j"))
+    task_cycles = positive(task.get("remaining_cycles"))
+    task_bits = positive(task.get("remaining_bits"))
+    slack = positive(task.get("remaining_deadline_slots"))
+    local_backlog = source.get("local_cpu_backlog", {})
+    backlog_cycles = nonnegative(local_backlog.get("remaining_cycles")) if isinstance(local_backlog, Mapping) else None
+
+    local: dict[str, Any] = {"status": "invalid_source_primitives"}
+    if source_frequency is not None and task_cycles is not None and backlog_cycles is not None:
+        local_time = slot_duration + (backlog_cycles + task_cycles) / source_frequency
+        local_energy = (
+            source_kappa * source_frequency**2 * task_cycles
+            if source_kappa is not None else None
+        )
+        local = {
+            "status": "valid" if local_energy is not None else "energy_unavailable",
+            "T_local_est_s": local_time,
+            "local_deadline_margin_s": (
+                slack * slot_duration - local_time if slack is not None else None
+            ),
+            "E_local_est_j": local_energy,
+            "local_energy_margin_j": (
+                source_energy - local_energy
+                if local_energy is not None and source_energy is not None else None
+            ),
+        }
+
+    remote_results: list[dict[str, Any]] = []
+    for candidate in sample.get("candidates", ()):
+        if not isinstance(candidate, Mapping):
+            continue
+        candidate_id = candidate.get("candidate_uav")
+        result: dict[str, Any] = {
+            "candidate_uav": candidate_id,
+            "status": (
+                "illegal_candidate"
+                if not bool(candidate.get("legal_mask"))
+                else "invalid_primitives"
+            ),
+            "primary_combination": None,
+        }
+        if not bool(candidate.get("legal_mask")):
+            remote_results.append(result)
+            continue
+        helper = candidate.get("helper_public", {})
+        link = candidate.get("link_history", {})
+        tx_queue = candidate.get("source_tx_queue", {})
+        if not isinstance(helper, Mapping) or not isinstance(link, Mapping) or not isinstance(tx_queue, Mapping):
+            remote_results.append(result)
+            continue
+        helper_frequency = positive(helper.get("max_cpu_frequency_hz"))
+        helper_kappa = positive(helper.get("cpu_coefficient"))
+        helper_energy = nonnegative(helper.get("residual_energy_j"))
+        queue_bits = nonnegative(tx_queue.get("remaining_bits"))
+        quality = link.get("historical_quality_by_ru", ())
+        quality_mask = link.get("historical_quality_valid_mask", ())
+        if (
+            source_power is None
+            or source_energy is None
+            or task_bits is None
+            or task_cycles is None
+            or queue_bits is None
+            or len(quality) != ru_count
+            or len(quality_mask) != ru_count
+        ):
+            remote_results.append(result)
+            continue
+        best: tuple[tuple[float, float, int, int], dict[str, Any]] | None = None
+        for group_index in range(1, len(groups) + 1):
+            for width in widths:
+                if width <= 0 or group_index + width - 1 > len(groups):
+                    continue
+                rus = tuple(
+                    ru
+                    for group in groups[group_index - 1:group_index - 1 + width]
+                    for ru in group
+                )
+                if not all(bool(quality_mask[ru - 1]) and quality[ru - 1] is not None for ru in rus):
+                    continue
+                for power_level in power_levels:
+                    if power_level <= 0.0:
+                        continue
+                    total_power = power_level * source_power
+                    if total_power * slot_duration > source_energy + tolerance:
+                        continue
+                    scale = (total_power / reference_power) * (ru_count / len(rus))
+                    rate = 0.0
+                    for ru in rus:
+                        sinr = float(quality[ru - 1]) * scale
+                        if not math.isfinite(sinr) or sinr < 0.0:
+                            rate = 0.0
+                            break
+                        if sinr >= outage_threshold:
+                            rate += ru_bandwidth * math.log2(1.0 + sinr)
+                    if not math.isfinite(rate) or rate <= 0.0:
+                        continue
+                    selection = {
+                        "resource_group": group_index,
+                        "resource_width": width,
+                        "power_level": power_level,
+                        "ru_ids": list(rus),
+                        "primary_rate_proxy_bps": rate,
+                    }
+                    key = (-rate, power_level, group_index, width)
+                    if best is None or key < best[0]:
+                        best = (key, selection)
+        if best is None:
+            result["status"] = "no_valid_rate_or_energy_feasible_combination"
+            remote_results.append(result)
+            continue
+        selection = best[1]
+        rate = float(selection["primary_rate_proxy_bps"])
+        tx_time = (queue_bits + task_bits) / rate
+        helper_wait = (
+            float(helper.get("cpu_load_remaining_cycles")) / helper_frequency
+            if helper_frequency is not None
+            and helper.get("cpu_load_remaining_cycles") is not None
+            else None
+        )
+        cpu_time = task_cycles / helper_frequency if helper_frequency is not None else None
+        total_time = (
+            slot_duration + tx_time + helper_wait + cpu_time
+            if helper_wait is not None and cpu_time is not None else None
+        )
+        tx_power = float(selection["power_level"]) * source_power
+        tx_energy = tx_power * task_bits / rate
+        cpu_energy = (
+            helper_kappa * helper_frequency**2 * task_cycles
+            if helper_kappa is not None and helper_frequency is not None else None
+        )
+        total_energy = tx_energy + cpu_energy if cpu_energy is not None else None
+        result.update({
+            "status": "valid" if total_time is not None else "time_component_unavailable",
+            "primary_combination": selection,
+            "T_tx_est_s": tx_time,
+            "T_helper_wait_est_s": helper_wait,
+            "T_remote_cpu_est_s": cpu_time,
+            "T_remote_total_est_s": total_time,
+            "remote_deadline_margin_s": (
+                slack * slot_duration - total_time
+                if slack is not None and total_time is not None else None
+            ),
+            "E_tx_est_j": tx_energy,
+            "E_remote_cpu_est_j": cpu_energy,
+            "E_remote_total_est_j": total_energy,
+            "remote_source_tx_energy_margin_j": source_energy - tx_energy,
+            "remote_helper_cpu_energy_margin_j": (
+                helper_energy - cpu_energy
+                if helper_energy is not None and cpu_energy is not None else None
+            ),
+        })
+        if total_time is not None and "T_local_est_s" in local:
+            result["relative_delay_margin_s"] = local["T_local_est_s"] - total_time
+        if total_energy is not None and local.get("E_local_est_j") is not None:
+            result["relative_energy_margin_j"] = local["E_local_est_j"] - total_energy
+        remote_results.append(result)
+    return {
+        "utility_label": ROUTE_DIAGNOSTIC_UTILITY_LABEL,
+        "local": local,
+        "remote_by_candidate": remote_results,
+        "estimator_scope": "offline_pure_function_only",
+    }
 
 
 @dataclass(frozen=True)
@@ -3430,6 +4067,8 @@ __all__ = [
     "GradientMeasurement",
     "ROUTE_GRADIENT_STATUSES",
     "ROUTE_TELEMETRY_SCHEMA_VERSION",
+    "ROUTE_DIAGNOSTIC_SCHEMA_VERSION",
+    "ROUTE_DIAGNOSTIC_UTILITY_LABEL",
     "TRAJECTORY_CREDIT_EVENT_TYPES",
     "TRAJECTORY_CREDIT_SCHEMA_VERSION",
     "TRAJECTORY_LEDGER_TOLERANCE",
@@ -3445,11 +4084,14 @@ __all__ = [
     "RouteHeadGradientRowTelemetry",
     "RouteOutcomeAssociation",
     "RouteOutcomeTracker",
+    "RouteDiagnosticSampleCollector",
     "RoutePPODynamics",
     "RoutePPODynamicsGroup",
     "RouteSampleTelemetry",
     "TrajectoryCreditTracker",
     "TrajectoryPreStepCapture",
+    "reconstruct_route_diagnostic_utility",
+    "route_diagnostic_schema_header",
     "aggregate_route_outcomes",
     "compute_route_only_ppo_dynamics",
     "compute_branch_ppo_dynamics",

@@ -278,6 +278,41 @@ def assert_nested_equal(test: unittest.TestCase, left, right) -> None:
 
 
 class StructuredCheckpointTests(unittest.TestCase):
+    def test_route_diagnostic_flag_does_not_enter_training_state_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            control = make_checkpoint_config(root / "control")
+            treatment = replace(
+                control,
+                training=replace(
+                    control.training,
+                    mappo=replace(
+                        control.training.mappo,
+                        route_diagnostic_samples_enabled=True,
+                    ),
+                ),
+            )
+            treatment.validate()
+            torch.manual_seed(3301)
+            torch_state_control = make_payload(control, CHECKPOINT_KIND_PERIODIC_RESUME)[0]
+            torch.manual_seed(3301)
+            torch_state_treatment = make_payload(treatment, CHECKPOINT_KIND_PERIODIC_RESUME)[0]
+            self.assertEqual(tuple(torch_state_control), tuple(torch_state_treatment))
+            self.assertNotEqual(torch_state_control["config_hash"], torch_state_treatment["config_hash"])
+            for field in (
+                "training_state",
+                "model_state",
+                "optimizer_state",
+                "policy_rng_state",
+                "active_rollout_state",
+                "diagnostics_state",
+            ):
+                assert_nested_equal(
+                    self,
+                    torch_state_control[field],
+                    torch_state_treatment[field],
+                )
+
     def test_01_partial_rollout_roundtrip_is_field_exact(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = make_checkpoint_config(

@@ -46,6 +46,7 @@ from .ca_gat_mappo_actions import (
     SequentialActionMaskBatch,
 )
 from .ca_gat_mappo_route_telemetry import (
+    RouteDiagnosticSampleCollector,
     RouteOutcomeTracker,
     TrajectoryCreditTracker,
     TrajectoryPreStepCapture,
@@ -1240,6 +1241,19 @@ class CAGATMAPPOTrainer:
         self.critic.train()
 
         route_outcome_tracker = RouteOutcomeTracker(self.config.environment.slot_duration_s)
+        diagnostic_collector: RouteDiagnosticSampleCollector | None = None
+        diagnostic_writer: Any | None = None
+        if self.config.training.mappo.route_diagnostic_samples_enabled:
+            # The diagnostic sidecar is independent from route-credit telemetry
+            # and is populated only from the already-created actor-safe step.
+            from ..training_artifacts import RouteDiagnosticArtifactWriter
+
+            diagnostic_collector = RouteDiagnosticSampleCollector(self.config)
+            diagnostic_writer = RouteDiagnosticArtifactWriter(
+                self.config,
+                diagnostic_collector.schema_header(),
+                allow_existing=(self._transitions > 0 or self._next_episode_index > 0),
+            )
         trajectory_tracker: TrajectoryCreditTracker | None = None
         if self.config.training.mappo.trajectory_credit_telemetry_enabled:
             # Keep training_artifacts import-order neutral: that module also
@@ -1338,6 +1352,18 @@ class CAGATMAPPOTrainer:
                 )
 
             proposals = tuple(action_output.proposals[0][0])
+            if diagnostic_collector is not None:
+                assert diagnostic_writer is not None
+                diagnostic_records = diagnostic_collector.collect(
+                    episode_id=episode_index,
+                    global_environment_step=self._transitions,
+                    policy_version=step_policy_version,
+                    observations=observations,
+                    proposals=proposals,
+                    action_output=action_output,
+                )
+                for diagnostic_record in diagnostic_records:
+                    diagnostic_writer.write(diagnostic_record)
             trajectory_capture: TrajectoryPreStepCapture | None = None
             if trajectory_tracker is not None:
                 route_action_indices = {
