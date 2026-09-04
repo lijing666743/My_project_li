@@ -19,7 +19,7 @@ import platform
 import re
 import subprocess
 import sys
-from dataclasses import asdict, dataclass, field, fields, is_dataclass
+from dataclasses import InitVar, asdict, dataclass, field, fields, is_dataclass
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
@@ -549,6 +549,24 @@ class MAPPOConfig:
     checkpoint_schema_version: int = CHECKPOINT_SCHEMA_VERSION
     trajectory_credit_telemetry_enabled: bool = False
     route_diagnostic_samples_enabled: bool = False
+    route_oracle_counterfactual_enabled: InitVar[bool] = False
+    route_oracle_selection_rate_ppm: InitVar[int] = 0
+
+    def __post_init__(
+        self,
+        route_oracle_counterfactual_enabled: bool,
+        route_oracle_selection_rate_ppm: int,
+    ) -> None:
+        object.__setattr__(
+            self,
+            "route_oracle_counterfactual_enabled",
+            route_oracle_counterfactual_enabled,
+        )
+        object.__setattr__(
+            self,
+            "route_oracle_selection_rate_ppm",
+            route_oracle_selection_rate_ppm,
+        )
 
     @property
     def recurrent_chunk_count(self) -> int:
@@ -701,6 +719,14 @@ class OutputConfig:
     snapshot_filename: str = "config_snapshot.yaml"
     raw_metrics_filename: str = "raw_metrics.jsonl"
     aggregate_metrics_filename: str = "aggregate_metrics.json"
+    route_oracle_counterfactual_filename: InitVar[str] = "route_oracle_counterfactual_v1.jsonl"
+
+    def __post_init__(self, route_oracle_counterfactual_filename: str) -> None:
+        object.__setattr__(
+            self,
+            "route_oracle_counterfactual_filename",
+            route_oracle_counterfactual_filename,
+        )
 
 
 @dataclass(frozen=True)
@@ -740,6 +766,13 @@ class RunConfig:
             "git_commit",
             "git_dirty",
         })
+        mappo = resolved.get("training", {}).get("mappo")
+        if isinstance(mappo, dict) and self.training.mappo.route_oracle_counterfactual_enabled:
+            mappo["route_oracle_counterfactual_enabled"] = True
+            mappo["route_oracle_selection_rate_ppm"] = self.training.mappo.route_oracle_selection_rate_ppm
+            output = resolved.get("output")
+            if isinstance(output, dict):
+                output["route_oracle_counterfactual_filename"] = self.output.route_oracle_counterfactual_filename
         environment = resolved.get("environment")
         if (
             isinstance(environment, dict)
@@ -818,6 +851,13 @@ class RunConfig:
             # The route-diagnostic sidecar is independently opt-in. Omitting
             # the historical false value preserves legacy hashes and run IDs.
             mappo.pop("route_diagnostic_samples_enabled")
+        if isinstance(mappo, dict) and not mappo.get(
+            "route_oracle_counterfactual_enabled", False
+        ):
+            # Oracle-1 is independently opt-in. Omitting both disabled fields
+            # preserves legacy config hashes and run IDs.
+            mappo.pop("route_oracle_counterfactual_enabled", None)
+            mappo.pop("route_oracle_selection_rate_ppm", None)
         return resolved
 
     def to_dict(self) -> dict[str, Any]:
@@ -876,6 +916,9 @@ class RunConfig:
             "aggregate_metrics": str(run_dir / self.output.aggregate_metrics_filename),
             "trajectory_credit_events": str(run_dir / "trajectory_credit_events.jsonl"),
             "route_diagnostic_samples": str(run_dir / "route_diagnostic_samples_v1.jsonl"),
+            "route_oracle_counterfactual": str(
+                run_dir / self.output.route_oracle_counterfactual_filename
+            ),
             "dashboard_csv": str(Path(self.output.dashboard_logs_dir) / f"{self.run_id}_metrics.csv"),
             "figure_input": str(Path(self.output.plots_dir) / f"{self.run_id}_figure_input.csv"),
             "dashboard_png": str(Path(self.output.plots_dir) / f"{self.run_id}_dashboard.png"),
@@ -1277,6 +1320,23 @@ class RunConfig:
             raise ConfigError(
                 "training.mappo.route_diagnostic_samples_enabled must be boolean"
             )
+        if not isinstance(mappo.route_oracle_counterfactual_enabled, bool):
+            raise ConfigError(
+                "training.mappo.route_oracle_counterfactual_enabled must be boolean"
+            )
+        selection_rate = mappo.route_oracle_selection_rate_ppm
+        if (
+            isinstance(selection_rate, bool)
+            or not isinstance(selection_rate, int)
+            or not 0 <= selection_rate <= 1_000_000
+        ):
+            raise ConfigError(
+                "training.mappo.route_oracle_selection_rate_ppm must be an integer in [0, 1000000]"
+            )
+        if mappo.route_oracle_counterfactual_enabled and selection_rate == 0:
+            raise ConfigError(
+                "enabled Oracle-1 collection requires a positive selection rate"
+            )
         checkpoint_interval = mappo.checkpoint_interval_steps
         if (
             isinstance(checkpoint_interval, bool)
@@ -1660,7 +1720,14 @@ DEFAULT_CONFIG_DATA: dict[str, Any] = {
     "environment": asdict(EnvironmentConfig()),
     "action": asdict(ActionConfig()),
     "reproducibility": asdict(ReproducibilityConfig()),
-    "training": asdict(TrainingConfig()),
+    "training": {
+        **asdict(TrainingConfig()),
+        "mappo": {
+            **asdict(MAPPOConfig()),
+            "route_oracle_counterfactual_enabled": False,
+            "route_oracle_selection_rate_ppm": 0,
+        },
+    },
     "evaluation": asdict(EvaluationConfig()),
     "output": asdict(OutputConfig()),
 }
@@ -1779,11 +1846,15 @@ def _validate_mapping_keys(mapping: Mapping[str, Any], cls: type[Any], *, path: 
     if not isinstance(mapping, Mapping):
         raise ConfigError(f"{path} must be a mapping")
     hints = get_type_hints(cls)
-    allowed = {item.name for item in fields(cls) if item.init}
+    allowed = {
+        item.name
+        for item in cls.__dataclass_fields__.values()
+        if item.init
+    }
     for key, value in mapping.items():
         if key not in allowed:
             raise ConfigError(f"unknown field {path}.{key}")
-        annotation = hints.get(key, item_type(cls, key))
+        annotation = hints[key] if key in hints else item_type(cls, key)
         nested = _nested_dataclass_type(annotation)
         if nested is not None and isinstance(value, Mapping):
             _validate_mapping_keys(value, nested, path=f"{path}.{key}")
@@ -1795,12 +1866,14 @@ def _coerce_dataclass_mapping(mapping: Mapping[str, Any], cls: type[_T], *, path
     _validate_mapping_keys(mapping, cls, path=path)
     hints = get_type_hints(cls)
     result: dict[str, Any] = {}
-    for item in fields(cls):
+    for item in cls.__dataclass_fields__.values():
         if not item.init:
             continue
         if item.name not in mapping:
             continue
         annotation = hints.get(item.name, item.type)
+        if isinstance(annotation, InitVar):
+            annotation = annotation.type
         result[item.name] = _coerce_value(mapping[item.name], annotation, f"{path}.{item.name}")
     return result
 

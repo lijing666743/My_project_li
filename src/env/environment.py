@@ -8,8 +8,13 @@ their frozen causal boundaries.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from collections import defaultdict, deque
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, fields, is_dataclass, replace
+from enum import Enum
+import copy
+import hashlib
+import json
 import math
 from typing import Any
 
@@ -45,6 +50,240 @@ from .traffic import ArrivalBatch, ArrivalEstimate, TrafficProcess
 
 class EnvironmentError(ValueError):
     """Raised when reset/step ordering or a joint proposal is invalid."""
+
+
+class EnvironmentFingerprintError(EnvironmentError):
+    """Raised when a state contains a value without stable fingerprint support."""
+
+
+def _canonical_fingerprint_value(
+    value: Any,
+    *,
+    active: list[Any] | None = None,
+) -> Any:
+    """Convert supported environment state to deterministic JSON data.
+
+    The serializer deliberately has no generic representation fallback.  A
+    project-state value must either expose an explicitly supported stable
+    representation or fail before a diagnostic can claim replay fidelity.
+    """
+
+    active_values = [] if active is None else active
+
+    def enter(container: Any) -> None:
+        if any(container is item for item in active_values):
+            raise EnvironmentFingerprintError(
+                f"cyclic state fingerprint value is unsupported: {type(container).__name__}"
+            )
+        active_values.append(container)
+
+    def leave() -> None:
+        active_values.pop()
+
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise EnvironmentFingerprintError(
+                "state fingerprint encountered a non-finite float"
+            )
+        return value
+    if isinstance(value, np.generic):
+        return {
+            "kind": "numpy_scalar",
+            "dtype": value.dtype.str,
+            "value": _canonical_fingerprint_value(value.item(), active=active_values),
+        }
+    if isinstance(value, np.ndarray):
+        if value.dtype.hasobject:
+            raise EnvironmentFingerprintError(
+                "object-dtype ndarray is unsupported for state fingerprinting"
+            )
+        if np.issubdtype(value.dtype, np.inexact) and not np.all(np.isfinite(value)):
+            raise EnvironmentFingerprintError(
+                "state fingerprint encountered a non-finite array"
+            )
+        array = np.ascontiguousarray(value)
+        return {
+            "kind": "ndarray",
+            "dtype": array.dtype.str,
+            "shape": list(array.shape),
+            "sha256": hashlib.sha256(array.tobytes(order="C")).hexdigest(),
+        }
+    if isinstance(value, np.random.Generator):
+        return {
+            "kind": "numpy_generator",
+            "bit_generator": type(value.bit_generator).__name__,
+            "state": _canonical_fingerprint_value(
+                copy.deepcopy(value.bit_generator.state), active=active_values
+            ),
+        }
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return {
+            "kind": "bytes",
+            "sha256": hashlib.sha256(bytes(value)).hexdigest(),
+            "length": len(value),
+        }
+    if isinstance(value, defaultdict):
+        enter(value)
+        try:
+            factory = value.default_factory
+            if factory is not None:
+                factory_module = getattr(factory, "__module__", None)
+                factory_qualname = getattr(factory, "__qualname__", None)
+                if not isinstance(factory_module, str) or not isinstance(
+                    factory_qualname, str
+                ):
+                    raise EnvironmentFingerprintError(
+                        "defaultdict factory lacks stable callable identity"
+                    )
+                canonical_factory: Any = {
+                    "module": factory_module,
+                    "qualname": factory_qualname,
+                }
+            else:
+                canonical_factory = None
+            items = [
+                (
+                    _canonical_fingerprint_value(key, active=active_values),
+                    _canonical_fingerprint_value(item, active=active_values),
+                )
+                for key, item in value.items()
+            ]
+            items.sort(
+                key=lambda item: json.dumps(
+                    item[0], ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                )
+            )
+            return {
+                "kind": "defaultdict",
+                "default_factory": canonical_factory,
+                "items": items,
+            }
+        finally:
+            leave()
+    if isinstance(value, Mapping):
+        enter(value)
+        try:
+            items = [
+                (
+                    _canonical_fingerprint_value(key, active=active_values),
+                    _canonical_fingerprint_value(item, active=active_values),
+                )
+                for key, item in value.items()
+            ]
+            items.sort(
+                key=lambda item: json.dumps(
+                    item[0], ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                )
+            )
+            return {"kind": "mapping", "items": items}
+        finally:
+            leave()
+    if isinstance(value, (list, tuple)):
+        enter(value)
+        try:
+            return {
+                "kind": "sequence",
+                "type": type(value).__name__,
+                "items": [
+                    _canonical_fingerprint_value(item, active=active_values)
+                    for item in value
+                ],
+            }
+        finally:
+            leave()
+    if isinstance(value, deque):
+        enter(value)
+        try:
+            return {
+                "kind": "deque",
+                "maxlen": value.maxlen,
+                "items": [
+                    _canonical_fingerprint_value(item, active=active_values)
+                    for item in value
+                ],
+            }
+        finally:
+            leave()
+    if isinstance(value, (set, frozenset)):
+        enter(value)
+        try:
+            items = [
+                _canonical_fingerprint_value(item, active=active_values)
+                for item in value
+            ]
+            items.sort(
+                key=lambda item: json.dumps(
+                    item, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                )
+            )
+            return {"kind": "set", "items": items}
+        finally:
+            leave()
+    if isinstance(value, Enum):
+        return {
+            "kind": "enum",
+            "type": type(value).__qualname__,
+            "value": _canonical_fingerprint_value(value.value, active=active_values),
+        }
+
+    if is_dataclass(value):
+        enter(value)
+        try:
+            members = {
+                item.name: _canonical_fingerprint_value(
+                    getattr(value, item.name), active=active_values
+                )
+                for item in fields(value)
+            }
+            if hasattr(value, "__dict__"):
+                declared = {item.name for item in fields(value)}
+                extras = {
+                    name: item
+                    for name, item in vars(value).items()
+                    if name not in declared
+                }
+                for name, item in sorted(extras.items()):
+                    members[f"__extra__.{name}"] = _canonical_fingerprint_value(
+                        item, active=active_values
+                    )
+            return {
+                "kind": "dataclass",
+                "type": f"{type(value).__module__}.{type(value).__qualname__}",
+                "members": members,
+            }
+        finally:
+            leave()
+    elif hasattr(value, "__dict__") and type(value).__module__.startswith("src.env."):
+        enter(value)
+        try:
+            members = {
+                name: _canonical_fingerprint_value(item, active=active_values)
+                for name, item in sorted(vars(value).items())
+            }
+            return {
+                "kind": "object",
+                "type": f"{type(value).__module__}.{type(value).__qualname__}",
+                "members": members,
+            }
+        finally:
+            leave()
+    raise EnvironmentFingerprintError(
+        "unsupported state fingerprint type: "
+        f"{type(value).__module__}.{type(value).__qualname__}"
+    )
+
+
+def _fingerprint_digest(value: Any) -> str:
+    encoded = json.dumps(
+        _canonical_fingerprint_value(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -548,6 +787,131 @@ class U2UMECEnvironment:
                 "outage_valid_mask": outage_mask.tolist(),
             },
             "metrics": self.metrics.snapshot(),
+        }
+
+    def state_fingerprint(self) -> str:
+        """Return a digest of the complete active environment object graph."""
+
+        self._require_initialized()
+        return _fingerprint_digest(self.__dict__)
+
+    def clone_for_shadow(self) -> "U2UMECEnvironment":
+        """Return an isolated copy for a counterfactual shadow rollout."""
+
+        self._require_active()
+        clone = copy.deepcopy(self)
+        if clone.state_fingerprint() != self.state_fingerprint():
+            raise EnvironmentError("shadow clone does not preserve the initial state")
+        root_pairs = (
+            ("lifecycle", self.lifecycle, clone.lifecycle),
+            ("mobility_model", self.mobility_model, clone.mobility_model),
+            ("mobility", self.mobility, clone.mobility),
+            ("topology_model", self.topology_model, clone.topology_model),
+            ("topology", self.topology, clone.topology),
+            ("channel_model", self.channel_model, clone.channel_model),
+            ("channel", self.channel, clone.channel),
+            ("channel_history", self.channel_history, clone.channel_history),
+            ("public_history", self.public_history, clone.public_history),
+            ("public_messages", self.public_messages, clone.public_messages),
+            ("previous_actions", self.previous_actions, clone.previous_actions),
+            ("traffic", self.traffic, clone.traffic),
+            ("executor", self.executor, clone.executor),
+            ("physical_service", self.physical_service, clone.physical_service),
+            ("reward_calculator", self.reward_calculator, clone.reward_calculator),
+            ("metrics", self.metrics, clone.metrics),
+            ("observation_builder", self.observation_builder, clone.observation_builder),
+            ("state_builder", self.state_builder, clone.state_builder),
+        )
+        if any(original is copied for _, original, copied in root_pairs):
+            raise EnvironmentError("shadow clone shares a mutable root object")
+        if clone.resource_states is self.resource_states:
+            raise EnvironmentError("shadow clone shares the resource mapping")
+        if any(
+            clone.resource_states[uav_id] is self.resource_states[uav_id]
+            for uav_id in self.resource_states
+        ):
+            raise EnvironmentError("shadow clone shares a mutable resource state")
+        if clone.executor is None or clone.physical_service is None:
+            raise EnvironmentError("shadow clone lost its service graph")
+        if clone.executor.lifecycle is not clone.lifecycle:
+            raise EnvironmentError("shadow executor lifecycle reference is not local")
+        if clone.physical_service.lifecycle is not clone.lifecycle:
+            raise EnvironmentError("shadow service lifecycle reference is not local")
+        return clone
+
+    def randomness_snapshot(self) -> dict[str, Any]:
+        """Return JSON-safe digests for all environment-owned RNG streams."""
+
+        self._require_initialized()
+        streams = self._environment_rngs()
+        return {
+            "streams": {
+                name: {
+                    "bit_generator": type(rng.bit_generator).__name__,
+                    "state": _canonical_fingerprint_value(
+                        copy.deepcopy(rng.bit_generator.state)
+                    ),
+                    "state_digest": _fingerprint_digest(
+                        copy.deepcopy(rng.bit_generator.state)
+                    ),
+                }
+                for name, rng in streams.items()
+            },
+            "unused_streams": ["interference_measurement"],
+        }
+
+    def rng_fingerprint(self) -> str:
+        """Return a stable digest of the environment RNG snapshot."""
+
+        return _fingerprint_digest(self.randomness_snapshot())
+
+    def exogenous_fingerprint(self) -> str:
+        """Return a digest of state expected to be action-independent."""
+
+        self._require_initialized()
+        assert self.mobility is not None
+        assert self.mobility_model is not None
+        assert self.topology is not None
+        assert self.channel is not None
+        assert self.channel_model is not None
+        assert self.channel_history is not None
+        assert self.traffic is not None
+        payload = {
+            "slot": self.slot,
+            "mobility": self.mobility,
+            "mobility_trajectory": getattr(self.mobility_model, "_trajectory", None),
+            "topology": self.topology,
+            "channel": self.channel,
+            "channel_internal": {
+                "last_slot": getattr(self.channel_model, "_last_slot", None),
+                "previous_positions_m": getattr(
+                    self.channel_model, "_previous_positions_m", None
+                ),
+                "shadowing_db": getattr(self.channel_model, "_shadowing_db", None),
+            },
+            "true_channel_history": getattr(self.channel_history, "_true_channels", None),
+            "csi_features": {
+                "slot": None if self.channel_features is None else self.channel_features.slot,
+                "stale_csi": None if self.channel_features is None else self.channel_features.stale_csi,
+                "csi_valid_mask": None if self.channel_features is None else self.channel_features.csi_valid_mask,
+                "csi_aoi_slots": None if self.channel_features is None else self.channel_features.csi_aoi_slots,
+            },
+            "traffic_history": self.traffic.history_snapshot(),
+            "rng": self.randomness_snapshot(),
+        }
+        return _fingerprint_digest(payload)
+
+    def _environment_rngs(self) -> dict[str, np.random.Generator]:
+        assert self.mobility_model is not None
+        assert self.channel_model is not None
+        assert self.channel_history is not None
+        assert self.traffic is not None
+        return {
+            "reset_mobility": self.mobility_model.rng,
+            "task_arrival": self.traffic.arrival_rng,
+            "task_workload": self.traffic.workload_rng,
+            "channel_fading": self.channel_model.rng,
+            "csi_error": self.channel_history.csi_error_rng,
         }
 
     def assert_invariants(self) -> ConservationSnapshot:

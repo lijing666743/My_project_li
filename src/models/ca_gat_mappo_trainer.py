@@ -32,6 +32,13 @@ from ..config import (
     validate_mappo_checkpoint_contract,
     validate_mappo_training_device,
 )
+from ..evaluation.route_oracle import (
+    FrozenOraclePolicyRunnerCache,
+    Oracle1Collector,
+    OracleCollectionBudget,
+    RouteOracleArtifactWriter,
+    oracle_schema_header,
+)
 from ..env.environment import ResetResult, StepResult, U2UMECEnvironment
 from ..env.randomness import derive_training_episode_seed
 from ..env.reward import AGENT_REWARD_CONSERVATION_TOLERANCE
@@ -661,6 +668,7 @@ class CAGATMAPPOTrainer:
         ]
         | None = None,
         progress_logger: Callable[[str], None] | None = None,
+        oracle_budget: OracleCollectionBudget | None = None,
     ) -> None:
         if not isinstance(config, RunConfig):
             raise TypeError("config must be a RunConfig")
@@ -724,6 +732,11 @@ class CAGATMAPPOTrainer:
         )
         if not callable(self._progress_logger):
             raise TypeError("progress_logger must be callable")
+        if oracle_budget is not None and not isinstance(
+            oracle_budget, OracleCollectionBudget
+        ):
+            raise TypeError("oracle_budget must be OracleCollectionBudget or None")
+        self._oracle_budget = oracle_budget
 
         self.policy_version = MAPPO_INITIAL_POLICY_VERSION
         self._rollout_policy_version: int | None = None
@@ -739,6 +752,9 @@ class CAGATMAPPOTrainer:
         self._unused_final_tail = 0
         self._training_complete = False
         self._prepared_episode: tuple[Any, ResetResult, int] | None = None
+        self._oracle_runner_cache = FrozenOraclePolicyRunnerCache(
+            config, device=self.device
+        )
 
     def _validate_model_placement(self) -> None:
         placements: list[torch.device] = []
@@ -1254,6 +1270,27 @@ class CAGATMAPPOTrainer:
                 diagnostic_collector.schema_header(),
                 allow_existing=(self._transitions > 0 or self._next_episode_index > 0),
             )
+        oracle_collector: Oracle1Collector | None = None
+        oracle_writer: RouteOracleArtifactWriter | None = None
+        if self.config.training.mappo.route_oracle_counterfactual_enabled:
+            oracle_runner = self._oracle_runner_cache.get(
+                self.actor,
+                self.policy_version,
+                git_commit=self.config.git_commit,
+                config_hash=self.config.config_hash,
+                run_id=self.config.run_id,
+            )
+            oracle_collector = Oracle1Collector(
+                self.config,
+                oracle_runner,
+                budget=self._oracle_budget,
+                policy_identity=self._oracle_runner_cache.current_identity,
+            )
+            oracle_writer = RouteOracleArtifactWriter(
+                self.config,
+                oracle_schema_header(self.config, oracle_runner.identity),
+                allow_existing=(self._transitions > 0 or self._next_episode_index > 0),
+            )
         trajectory_tracker: TrajectoryCreditTracker | None = None
         if self.config.training.mappo.trajectory_credit_telemetry_enabled:
             # Keep training_artifacts import-order neutral: that module also
@@ -1364,6 +1401,34 @@ class CAGATMAPPOTrainer:
                 )
                 for diagnostic_record in diagnostic_records:
                     diagnostic_writer.write(diagnostic_record)
+            if oracle_collector is not None:
+                assert oracle_writer is not None
+                oracle_runner = self._oracle_runner_cache.get(
+                    self.actor,
+                    step_policy_version,
+                    git_commit=self.config.git_commit,
+                    config_hash=self.config.config_hash,
+                    run_id=self.config.run_id,
+                )
+                if oracle_collector.runner is not oracle_runner:
+                    oracle_collector = Oracle1Collector(
+                        self.config,
+                        oracle_runner,
+                        budget=self._oracle_budget,
+                        policy_identity=self._oracle_runner_cache.current_identity,
+                    )
+                oracle_decisions = oracle_collector.collect_pre_step(
+                    environment,
+                    observations,
+                    proposals,
+                    action_output.hidden_out.detach().clone(),
+                    episode_id=episode_index,
+                    global_environment_step=self._transitions,
+                    policy_version=step_policy_version,
+                    factual_environment_transitions=self._transitions,
+                )
+                for oracle_decision in oracle_decisions:
+                    oracle_writer.write(oracle_decision)
             trajectory_capture: TrajectoryPreStepCapture | None = None
             if trajectory_tracker is not None:
                 route_action_indices = {

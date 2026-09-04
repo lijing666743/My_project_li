@@ -37,6 +37,76 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(medium.environment.uav_count, 6)
         self.assertEqual(len(medium.environment.profile_assignment), 6)
 
+    def test_oracle_defaults_are_disabled_and_zero_rate(self) -> None:
+        config = load_run_config()
+        self.assertFalse(config.training.mappo.route_oracle_counterfactual_enabled)
+        self.assertEqual(config.training.mappo.route_oracle_selection_rate_ppm, 0)
+
+    def test_oracle_cli_override_accepts_boundary_rates(self) -> None:
+        for selection_rate in (1, 1_000_000):
+            with self.subTest(selection_rate=selection_rate):
+                config = load_run_config(
+                    cli_overrides={
+                        "training.mappo.route_oracle_counterfactual_enabled": True,
+                        "training.mappo.route_oracle_selection_rate_ppm": selection_rate,
+                    }
+                )
+                self.assertTrue(config.training.mappo.route_oracle_counterfactual_enabled)
+                self.assertEqual(config.training.mappo.route_oracle_selection_rate_ppm, selection_rate)
+                resolved_mappo = config.resolved_dict()["training"]["mappo"]
+                self.assertTrue(resolved_mappo["route_oracle_counterfactual_enabled"])
+                self.assertEqual(resolved_mappo["route_oracle_selection_rate_ppm"], selection_rate)
+
+    def test_oracle_enabled_zero_rate_fails_validation(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "positive selection rate"):
+            load_run_config(
+                cli_overrides={
+                    "training.mappo.route_oracle_counterfactual_enabled": True,
+                    "training.mappo.route_oracle_selection_rate_ppm": 0,
+                }
+            )
+
+    def test_oracle_selection_rate_above_maximum_fails_validation(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "must be an integer in"):
+            load_run_config(
+                cli_overrides={
+                    "training.mappo.route_oracle_counterfactual_enabled": True,
+                    "training.mappo.route_oracle_selection_rate_ppm": 1_000_001,
+                }
+            )
+
+    def test_unknown_oracle_config_path_remains_rejected(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "unknown override field"):
+            load_run_config(
+                cli_overrides={"training.mappo.nonexistent_oracle_field": True}
+            )
+
+    def test_oracle_settings_have_scoped_config_identity(self) -> None:
+        default = load_run_config()
+        explicit_disabled = load_run_config(
+            cli_overrides={
+                "training.mappo.route_oracle_counterfactual_enabled": False,
+                "training.mappo.route_oracle_selection_rate_ppm": 0,
+            }
+        )
+        enabled_low = load_run_config(
+            cli_overrides={
+                "training.mappo.route_oracle_counterfactual_enabled": True,
+                "training.mappo.route_oracle_selection_rate_ppm": 1,
+            }
+        )
+        enabled_high = load_run_config(
+            cli_overrides={
+                "training.mappo.route_oracle_counterfactual_enabled": True,
+                "training.mappo.route_oracle_selection_rate_ppm": 1_000_000,
+            }
+        )
+        self.assertEqual(default.config_hash, explicit_disabled.config_hash)
+        self.assertEqual(default.run_id, explicit_disabled.run_id)
+        self.assertNotEqual(enabled_low.config_hash, enabled_high.config_hash)
+        self.assertNotEqual(enabled_low.run_id, enabled_high.run_id)
+        self.assertNotEqual(default.config_hash, enabled_low.config_hash)
+
     def test_file_cli_and_interactive_precedence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
