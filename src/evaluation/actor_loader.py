@@ -42,6 +42,7 @@ class LoadedEvaluationActor:
     actor: CAGATMAPPOActor
     source_checkpoint_path: Path
     source_checkpoint_sha256: str
+    actor_state_digest: str
     source_checkpoint_kind: str
     source_method_id: str
     source_training_config_hash: str
@@ -81,6 +82,48 @@ def load_final_actor_for_evaluation(
     *,
     evaluation_device: str,
 ) -> LoadedEvaluationActor:
+    """Load an evaluation actor without changing the established freeze state."""
+
+    return _load_final_actor_only(
+        config,
+        checkpoint_path,
+        execution_device=evaluation_device,
+        required_mode="evaluation",
+        freeze_parameters=False,
+    )
+
+
+def load_final_actor_for_oracle_diagnostic(
+    config: RunConfig,
+    checkpoint_path: str | Path,
+    *,
+    execution_device: str,
+    expected_checkpoint_sha256: str,
+    expected_actor_digest: str,
+) -> LoadedEvaluationActor:
+    """Strictly load and freeze one FINAL_COMPLETED actor for diagnostics."""
+
+    return _load_final_actor_only(
+        config,
+        checkpoint_path,
+        execution_device=execution_device,
+        required_mode="rl",
+        freeze_parameters=True,
+        expected_checkpoint_sha256=expected_checkpoint_sha256,
+        expected_actor_digest=expected_actor_digest,
+    )
+
+
+def _load_final_actor_only(
+    config: RunConfig,
+    checkpoint_path: str | Path,
+    *,
+    execution_device: str,
+    required_mode: str,
+    freeze_parameters: bool,
+    expected_checkpoint_sha256: str | None = None,
+    expected_actor_digest: str | None = None,
+) -> LoadedEvaluationActor:
     """Load only the actor state from one strict FINAL_COMPLETED payload.
 
     The full structured payload is schema-validated because Checkpoint V1 is a
@@ -91,13 +134,19 @@ def load_final_actor_for_evaluation(
     if not isinstance(config, RunConfig):
         raise TypeError("config must be a RunConfig")
     config.validate()
-    if config.mode != "evaluation" or config.method_id != "ca_gat_mappo":
+    if config.mode != required_mode or config.method_id != "ca_gat_mappo":
         raise EvaluationCheckpointError(
-            "formal actor evaluation requires evaluation/ca_gat_mappo"
+            f"actor-only loading requires {required_mode}/ca_gat_mappo"
         )
-    device = _validate_evaluation_device(evaluation_device)
+    device = _validate_evaluation_device(execution_device)
     target = Path(checkpoint_path)
     source_hash_before = checkpoint_sha256(target)
+    if expected_checkpoint_sha256 is not None:
+        _validate_sha256(expected_checkpoint_sha256, "expected checkpoint SHA256")
+        if source_hash_before != expected_checkpoint_sha256:
+            raise EvaluationCheckpointError(
+                "checkpoint SHA256 does not match the expected digest"
+            )
     try:
         payload = load_checkpoint_payload(target)
     except CheckpointError as exc:
@@ -171,6 +220,22 @@ def load_final_actor_for_evaluation(
     actor.eval()
     if actor.training:
         raise EvaluationCheckpointError("actor did not enter evaluation mode")
+    if freeze_parameters:
+        actor.requires_grad_(False)
+
+    from .route_oracle import actor_state_digest
+
+    loaded_actor_digest = actor_state_digest(actor)
+    if expected_actor_digest is not None:
+        _validate_sha256(expected_actor_digest, "expected actor digest")
+        if loaded_actor_digest != expected_actor_digest:
+            raise EvaluationCheckpointError(
+                "loaded actor digest does not match the expected digest"
+            )
+    if freeze_parameters and any(
+        parameter.requires_grad for parameter in actor.parameters()
+    ):
+        raise EvaluationCheckpointError("diagnostic actor parameters are not frozen")
 
     tensor_spec = MAPPOTensorSpec.from_config(config)
     architecture_identity = {
@@ -185,6 +250,7 @@ def load_final_actor_for_evaluation(
         actor=actor,
         source_checkpoint_path=target.resolve(),
         source_checkpoint_sha256=source_hash_before,
+        actor_state_digest=loaded_actor_digest,
         source_checkpoint_kind=str(payload["checkpoint_kind"]),
         source_method_id=str(payload["method_id"]),
         source_training_config_hash=str(payload["config_hash"]),
@@ -197,6 +263,17 @@ def load_final_actor_for_evaluation(
         actor_architecture_identity=architecture_identity,
         action_domain_identity=action_identity,
     )
+
+
+def _validate_sha256(value: str, name: str) -> None:
+    if not isinstance(value, str) or len(value) != 64:
+        raise EvaluationCheckpointError(f"{name} must be a SHA-256 hex digest")
+    try:
+        int(value, 16)
+    except ValueError as exc:
+        raise EvaluationCheckpointError(
+            f"{name} must be a SHA-256 hex digest"
+        ) from exc
 
 
 def _validate_evaluation_device(value: str) -> torch.device:
@@ -309,4 +386,5 @@ __all__ = [
     "LoadedEvaluationActor",
     "checkpoint_sha256",
     "load_final_actor_for_evaluation",
+    "load_final_actor_for_oracle_diagnostic",
 ]

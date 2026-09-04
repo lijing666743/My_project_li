@@ -43,15 +43,12 @@ from ..env.environment import ResetResult, StepResult, U2UMECEnvironment
 from ..env.randomness import derive_training_episode_seed
 from ..env.reward import AGENT_REWARD_CONSERVATION_TOLERANCE
 from .ca_gat_mappo import (
-    ActorObservationTensorizer,
     CAGATMAPPOActor,
     CentralizedStateTensorizer,
     MAPPOCentralizedCritic,
 )
-from .ca_gat_mappo_actions import (
-    CAGATMAPPOActionDistribution,
-    SequentialActionMaskBatch,
-)
+from .ca_gat_mappo_actions import CAGATMAPPOActionDistribution
+from .ca_gat_mappo_runtime import CAGATMAPPOFactualActorRuntime
 from .ca_gat_mappo_route_telemetry import (
     RouteDiagnosticSampleCollector,
     RouteOutcomeTracker,
@@ -691,15 +688,18 @@ class CAGATMAPPOTrainer:
         self.critic.to(device=self.device, dtype=self.dtype)
         self._validate_model_placement()
 
-        self.actor_tensorizer = ActorObservationTensorizer(config)
+        self.factual_actor_runtime = CAGATMAPPOFactualActorRuntime(
+            self.actor,
+            config,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        self.actor_tensorizer = self.factual_actor_runtime.actor_tensorizer
         self.state_tensorizer = CentralizedStateTensorizer(config)
-        self.action_distribution = CAGATMAPPOActionDistribution(
-            self.actor, config
+        self.action_distribution = (
+            self.factual_actor_runtime.action_distribution
         )
-        self.policy_generator = torch.Generator(device=self.device.type)
-        self.policy_generator.manual_seed(
-            self.action_distribution.policy_seed
-        )
+        self.policy_generator = self.factual_actor_runtime.policy_generator
         self.rollout_buffer = CAGATMAPPORolloutBuffer(config)
         self.environment_factory = (
             U2UMECEnvironment
@@ -1180,6 +1180,9 @@ class CAGATMAPPOTrainer:
             optimizers=trainer._optimizer_bundle(),
             dtype=trainer.dtype,
         )
+        trainer.factual_actor_runtime.policy_generator = (
+            trainer.policy_generator
+        )
         trainer.rollout_buffer = buffer
         trainer.policy_version = training["policy_version"]
         trainer._rollout_policy_version = rollout_version
@@ -1350,15 +1353,6 @@ class CAGATMAPPOTrainer:
                     "slot zero appeared without an episode boundary"
                 )
 
-            actor_batch = self.actor_tensorizer.encode_step(
-                observations,
-                device=self.device,
-                dtype=self.dtype,
-                episode_start=episode_start,
-            )
-            action_masks = SequentialActionMaskBatch.from_observations(
-                observations
-            )
             state_batch = self.state_tensorizer.encode_step(
                 state, device=self.device, dtype=self.dtype
             )
@@ -1371,13 +1365,15 @@ class CAGATMAPPOTrainer:
                     "policy changed during one rollout"
                 )
 
+            factual_actor_step = self.factual_actor_runtime.sample_step(
+                observations,
+                hidden_in,
+                episode_start=episode_start,
+            )
+            actor_batch = factual_actor_step.actor_batch
+            action_masks = factual_actor_step.action_masks
+            action_output = factual_actor_step.action_output
             with torch.no_grad():
-                action_output = self.action_distribution.sample_actions(
-                    actor_batch,
-                    action_masks,
-                    hidden_in,
-                    generator=self.policy_generator,
-                )
                 raw_old_value = self.critic(state_batch)
                 credit_mode = AgentCreditMode(
                     self.config.training.mappo.agent_credit_mode

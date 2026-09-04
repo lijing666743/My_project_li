@@ -492,8 +492,26 @@ class OracleCollectionBudget:
         self._refresh_stop_reason()
 
     def record_selected_decision(self) -> None:
-        if self.should_stop():
+        if not self.can_start_decision():
             raise OracleBudgetExhausted(self.stop_reason or "Oracle budget exhausted")
+        self.complete_selected_decision()
+
+    def can_start_decision(
+        self, *, factual_transitions: int | None = None
+    ) -> bool:
+        """Return whether a new complete decision may be started."""
+
+        return not self.should_stop(factual_transitions=factual_transitions)
+
+    def complete_selected_decision(self) -> None:
+        """Count one decision only after all of its branches have completed."""
+
+        if (
+            self.target_selected_decisions is not None
+            and self.selected_decisions >= self.target_selected_decisions
+        ):
+            self.stop_reason = "TARGET_SELECTED_DECISIONS"
+            raise OracleBudgetExhausted(self.stop_reason)
         self.selected_decisions += 1
         self._refresh_stop_reason()
 
@@ -999,11 +1017,16 @@ class RouteOracleArtifactWriter:
         header: Mapping[str, Any],
         *,
         allow_existing: bool = False,
+        path: str | Path | None = None,
     ) -> None:
         if not config.training.mappo.route_oracle_counterfactual_enabled:
             raise OracleArtifactError("Oracle sidecar writer requires the Oracle flag")
         self.config = config
-        self.path = Path(config.artifact_paths()["route_oracle_counterfactual"])
+        self.path = Path(
+            config.artifact_paths()["route_oracle_counterfactual"]
+            if path is None
+            else path
+        )
         self.header = dict(header)
         self._decision_keys: set[str] = set()
         self._branch_keys: set[tuple[str, str]] = set()
@@ -1080,16 +1103,24 @@ class RouteOracleArtifactWriter:
                 raise OracleArtifactError("existing Oracle sidecar contains an unknown record type")
 
 
-def inspect_route_oracle_artifact(config: RunConfig) -> dict[str, Any]:
+def inspect_route_oracle_artifact(
+    config: RunConfig,
+    *,
+    path: str | Path | None = None,
+) -> dict[str, Any]:
     """Validate the isolated sidecar without modifying it."""
 
-    path = Path(config.artifact_paths()["route_oracle_counterfactual"])
-    if not path.exists():
-        raise OracleArtifactError(f"Oracle sidecar does not exist: {path}")
+    target = Path(
+        config.artifact_paths()["route_oracle_counterfactual"]
+        if path is None
+        else path
+    )
+    if not target.exists():
+        raise OracleArtifactError(f"Oracle sidecar does not exist: {target}")
     try:
         records = [
             json.loads(line)
-            for line in path.read_text(encoding="utf-8").splitlines()
+            for line in target.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
     except (OSError, json.JSONDecodeError) as exc:
@@ -1106,6 +1137,8 @@ def inspect_route_oracle_artifact(config: RunConfig) -> dict[str, Any]:
         raise OracleArtifactError("Oracle sidecar policy identity scope is invalid")
     decisions: set[str] = set()
     branches: set[tuple[str, str]] = set()
+    decision_records: dict[str, Mapping[str, Any]] = {}
+    branch_records: dict[str, dict[str, Mapping[str, Any]]] = {}
     decision_count = branch_count = 0
     for record in records[1:]:
         _assert_finite_json(record)
@@ -1116,20 +1149,58 @@ def inspect_route_oracle_artifact(config: RunConfig) -> dict[str, Any]:
             if key in decisions:
                 raise OracleArtifactError("Oracle sidecar has duplicate decisions")
             decisions.add(key)
+            decision_records[key] = record
             decision_count += 1
         elif record_type == "oracle_branch":
             key = (str(record.get("decision_key")), str(record.get("branch_route")))
             if key in branches:
                 raise OracleArtifactError("Oracle sidecar has duplicate branches")
             branches.add(key)
+            branch_records.setdefault(key[0], {})[key[1]] = record
             branch_count += 1
         else:
             raise OracleArtifactError("Oracle sidecar contains an unknown record type")
+    if set(branch_records).difference(decision_records):
+        raise OracleArtifactError("Oracle sidecar branch references an unknown decision")
+    valid_decision_count = 0
+    invalid_branch_count = 0
+    for decision_key, decision in decision_records.items():
+        expected = tuple(str(route) for route in decision.get("evaluated_route_set", ()))
+        observed_records = branch_records.get(decision_key, {})
+        observed = tuple(observed_records)
+        if len(expected) != len(set(expected)):
+            raise OracleArtifactError("Oracle decision has duplicate evaluated routes")
+        if set(observed) != set(expected):
+            raise OracleArtifactError(
+                "Oracle decision and branch records do not form a complete join"
+            )
+        if decision.get("branch_count") != len(expected):
+            raise OracleArtifactError(
+                "Oracle decision branch_count disagrees with evaluated routes"
+            )
+        for route, branch in observed_records.items():
+            if tuple(str(item) for item in branch.get("evaluated_route_set", ())) != expected:
+                raise OracleArtifactError(
+                    "Oracle branch evaluated routes disagree with its decision"
+                )
+            if str(branch.get("branch_route")) != route:
+                raise OracleArtifactError("Oracle branch route identity is inconsistent")
+        invalid = tuple(
+            branch
+            for branch in observed_records.values()
+            if not bool(branch.get("branch_valid"))
+            or branch.get("branch_validity_status") != VALID_BRANCH_STATUS
+        )
+        invalid_branch_count += len(invalid)
+        if not invalid:
+            valid_decision_count += 1
     return {
-        "path": str(path),
+        "path": str(target),
         "schema_version": ORACLE_SCHEMA_VERSION,
         "decision_count": decision_count,
+        "valid_decision_count": valid_decision_count,
         "branch_count": branch_count,
+        "invalid_branch_count": invalid_branch_count,
         "oracle1_best_route_scope": ORACLE1_BEST_ROUTE_SCOPE,
     }
 
@@ -1306,6 +1377,7 @@ class Oracle1Collector:
         *,
         budget: OracleCollectionBudget | None = None,
         policy_identity: FrozenPolicyIdentity | None = None,
+        selector_run_id: str | None = None,
     ) -> None:
         if not isinstance(config, RunConfig):
             raise TypeError("config must be a RunConfig")
@@ -1314,6 +1386,14 @@ class Oracle1Collector:
         self.config = config
         self.runner = runner
         self.budget = budget
+        self.selector_run_id = (
+            config.run_id if selector_run_id is None else selector_run_id
+        )
+        if (
+            not isinstance(self.selector_run_id, str)
+            or not self.selector_run_id
+        ):
+            raise ValueError("selector_run_id must be a non-empty string")
         self.policy_identity = runner.identity if policy_identity is None else policy_identity
         if self.policy_identity.runner_identity != runner.runner_identity:
             raise OracleReliabilityError(
@@ -1346,7 +1426,7 @@ class Oracle1Collector:
             except ValueError:
                 continue
             if hash_select_oracle_decision(
-                run_id=self.config.run_id,
+                run_id=self.selector_run_id,
                 episode_id=episode_id,
                 global_environment_step=global_environment_step,
                 source_uav=source,
@@ -1356,7 +1436,9 @@ class Oracle1Collector:
                 selected_sources.append(source)
         results: list[OracleDecisionResult] = []
         for source in selected_sources:
-            if self.budget is not None and self.budget.should_stop(factual_transitions=factual_environment_transitions):
+            if self.budget is not None and not self.budget.can_start_decision(
+                factual_transitions=factual_environment_transitions
+            ):
                 break
             result = self._collect_one_selected(
                 environment,
@@ -1391,7 +1473,9 @@ class Oracle1Collector:
             raise TypeError("environment must be U2UMECEnvironment")
         if policy_version is not None and policy_version != self.runner.policy_version:
             raise OracleReliabilityError("collector runner policy version is stale")
-        if self.budget is not None and self.budget.should_stop(factual_transitions=factual_environment_transitions):
+        if self.budget is not None and not self.budget.can_start_decision(
+            factual_transitions=factual_environment_transitions
+        ):
             return None
         if len(observations) != len(factual_proposals):
             raise OracleReliabilityError("observations and factual proposals are misaligned")
@@ -1407,7 +1491,7 @@ class Oracle1Collector:
             except ValueError:
                 continue
             if hash_select_oracle_decision(
-                run_id=self.config.run_id,
+                run_id=self.selector_run_id,
                 episode_id=episode_id,
                 global_environment_step=global_environment_step,
                 source_uav=source,
@@ -1420,8 +1504,6 @@ class Oracle1Collector:
         if selected is None:
             return None
         source, task_id, committed, evaluated = selected
-        if self.budget is not None:
-            self.budget.record_selected_decision()
         factual_route = factual_proposals[source].route
         if factual_route == "idle":
             raise OracleReliabilityError("route-active factual Idle is a reliability failure")
@@ -1434,7 +1516,7 @@ class Oracle1Collector:
         initial_exogenous = environment.exogenous_fingerprint()
         route_slot = int(environment.slot)
         selector = selector_input(
-            run_id=self.config.run_id,
+            run_id=self.selector_run_id,
             episode_id=episode_id,
             global_environment_step=global_environment_step,
             source_uav=source,
@@ -1478,7 +1560,7 @@ class Oracle1Collector:
             slot_duration_s=self.config.environment.slot_duration_s,
             energy_tolerance_j=self.config.environment.energy_tolerance_j,
         )
-        return OracleDecisionResult(
+        decision = OracleDecisionResult(
             decision_key=decision_key,
             episode_id=episode_id,
             global_environment_step=global_environment_step,
@@ -1497,6 +1579,9 @@ class Oracle1Collector:
             classification=classification,
             selector_input=selector,
         )
+        if self.budget is not None:
+            self.budget.complete_selected_decision()
+        return decision
 
     def _rollout_branch(
         self,
