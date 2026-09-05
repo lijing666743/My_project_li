@@ -1088,7 +1088,9 @@ class CAGATMAPPOActor(nn.Module):
         )
         hidden = self.spec.encoder_hidden_dimension
         with torch.random.fork_rng(devices=[]):
-            torch.manual_seed(_derived_torch_seed(config.seed))
+            torch.random.default_generator.manual_seed(
+                _derived_torch_seed(config.seed)
+            )
             self.self_encoder = nn.Sequential(
                 nn.Linear(self.spec.self_feature_dim, hidden),
                 nn.LeakyReLU(),

@@ -536,6 +536,9 @@ class MAPPOConfig:
     route_entropy_start_coefficient: float = 0.03
     route_entropy_schedule_start_step: int = 3072
     route_entropy_schedule_end_step: int = 32768
+    route_choice_stability_enabled: InitVar[bool] = False
+    route_choice_entropy_floor_nats: InitVar[float] = 0.20
+    route_choice_stability_coef: InitVar[float] = 0.0
     gradient_accumulation: bool = False
     mixed_precision: bool = False
     training_device: str = "cuda"
@@ -554,9 +557,27 @@ class MAPPOConfig:
 
     def __post_init__(
         self,
+        route_choice_stability_enabled: bool,
+        route_choice_entropy_floor_nats: float,
+        route_choice_stability_coef: float,
         route_oracle_counterfactual_enabled: bool,
         route_oracle_selection_rate_ppm: int,
     ) -> None:
+        object.__setattr__(
+            self,
+            "route_choice_stability_enabled",
+            route_choice_stability_enabled,
+        )
+        object.__setattr__(
+            self,
+            "route_choice_entropy_floor_nats",
+            route_choice_entropy_floor_nats,
+        )
+        object.__setattr__(
+            self,
+            "route_choice_stability_coef",
+            route_choice_stability_coef,
+        )
         object.__setattr__(
             self,
             "route_oracle_counterfactual_enabled",
@@ -767,6 +788,14 @@ class RunConfig:
             "git_dirty",
         })
         mappo = resolved.get("training", {}).get("mappo")
+        if isinstance(mappo, dict) and self.training.mappo.route_choice_stability_enabled:
+            mappo["route_choice_stability_enabled"] = True
+            mappo["route_choice_entropy_floor_nats"] = (
+                self.training.mappo.route_choice_entropy_floor_nats
+            )
+            mappo["route_choice_stability_coef"] = (
+                self.training.mappo.route_choice_stability_coef
+            )
         if isinstance(mappo, dict) and self.training.mappo.route_oracle_counterfactual_enabled:
             mappo["route_oracle_counterfactual_enabled"] = True
             mappo["route_oracle_selection_rate_ppm"] = self.training.mappo.route_oracle_selection_rate_ppm
@@ -1120,6 +1149,41 @@ class RunConfig:
                 "candidate_aware_v1 requires "
                 "training.mappo.route_credit_mode=shared_gae"
             )
+        if not isinstance(mappo.route_choice_stability_enabled, bool):
+            raise ConfigError(
+                "training.mappo.route_choice_stability_enabled must be boolean"
+            )
+        for name, value in (
+            (
+                "route_choice_entropy_floor_nats",
+                mappo.route_choice_entropy_floor_nats,
+            ),
+            ("route_choice_stability_coef", mappo.route_choice_stability_coef),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) < 0.0
+            ):
+                raise ConfigError(
+                    f"training.mappo.{name} must be finite and non-negative"
+                )
+        if mappo.route_choice_entropy_floor_nats > math.log(2.0):
+            raise ConfigError(
+                "training.mappo.route_choice_entropy_floor_nats must not exceed log(2)"
+            )
+        if mappo.route_choice_stability_enabled:
+            if route_decoder_mode is not RouteDecoderMode.CANDIDATE_AWARE_V1:
+                raise ConfigError(
+                    "route choice stability requires "
+                    "training.mappo.route_decoder_mode=candidate_aware_v1"
+                )
+            if mappo.route_choice_entropy_floor_nats != 0.20:
+                raise ConfigError(
+                    "Route Preference Collapse Fix V1 requires "
+                    "training.mappo.route_choice_entropy_floor_nats=0.20"
+                )
         if (
             isinstance(mappo.route_gae_lambda, bool)
             or not isinstance(mappo.route_gae_lambda, (int, float))

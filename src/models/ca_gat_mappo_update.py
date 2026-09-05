@@ -42,6 +42,7 @@ from .ca_gat_mappo_ppo import (
 from .ca_gat_mappo_route_telemetry import (
     RouteTelemetry,
     collect_route_telemetry,
+    measure_route_head_gradient_rows,
 )
 from .ca_gat_mappo_route_nstep import (
     RouteNstepSample,
@@ -55,6 +56,340 @@ class RecurrentPPOUpdateError(ValueError):
 
 
 _FROZEN_GEOMETRY = (256, 32, 8, 4)
+
+
+@dataclass(frozen=True)
+class RouteChoiceStabilityLossOutput:
+    """Differentiable Candidate-A loss plus detached scalar summaries."""
+
+    unscaled_loss: Tensor
+    scaled_loss: Tensor
+    conditional_remote_mass: float | None
+    remote_local_binary_entropy: float | None
+    floor_violation_fraction: float | None
+    valid_sample_count: int
+    local_sample_count: int
+    remote_sample_count: int
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("unscaled_loss", self.unscaled_loss),
+            ("scaled_loss", self.scaled_loss),
+        ):
+            if not isinstance(value, Tensor) or value.ndim != 0:
+                raise RecurrentPPOUpdateError(f"{name} must be a scalar tensor")
+            if not torch.isfinite(value.detach()):
+                raise RecurrentPPOUpdateError(f"{name} must be finite")
+            if float(value.detach().cpu().item()) < -1.0e-12:
+                raise RecurrentPPOUpdateError(f"{name} must be non-negative")
+        for name, value in (
+            ("valid_sample_count", self.valid_sample_count),
+            ("local_sample_count", self.local_sample_count),
+            ("remote_sample_count", self.remote_sample_count),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise RecurrentPPOUpdateError(f"{name} must be a non-negative integer")
+        summaries = (
+            self.conditional_remote_mass,
+            self.remote_local_binary_entropy,
+            self.floor_violation_fraction,
+        )
+        if self.valid_sample_count == 0:
+            if any(value is not None for value in summaries):
+                raise RecurrentPPOUpdateError(
+                    "stability summaries must be NA when no eligible sample exists"
+                )
+        elif any(value is None for value in summaries):
+            raise RecurrentPPOUpdateError(
+                "stability summaries must be present for eligible samples"
+            )
+        for name, value, upper in (
+            ("conditional_remote_mass", self.conditional_remote_mass, 1.0),
+            (
+                "remote_local_binary_entropy",
+                self.remote_local_binary_entropy,
+                math.log(2.0),
+            ),
+            ("floor_violation_fraction", self.floor_violation_fraction, 1.0),
+        ):
+            if value is not None and (
+                not math.isfinite(value) or not -1.0e-8 <= value <= upper + 1.0e-8
+            ):
+                raise RecurrentPPOUpdateError(f"{name} lies outside its valid range")
+
+
+@dataclass(frozen=True)
+class RouteChoiceStabilityTelemetry:
+    """Detached runtime telemetry for Candidate-A route stabilization."""
+
+    conditional_remote_mass: float | None
+    remote_local_binary_entropy: float | None
+    floor_violation_fraction: float | None
+    unscaled_stability_loss: float
+    scaled_stability_loss: float
+    local_sample_count: int
+    remote_sample_count: int
+    remote_scorer_gradient_norm: float | None
+    local_route_row_gradient_norm: float | None
+    gradient_norm_ratio: float | None
+    valid_sample_count: int
+
+    def __post_init__(self) -> None:
+        scalar_values = (
+            self.unscaled_stability_loss,
+            self.scaled_stability_loss,
+        )
+        if not all(math.isfinite(value) and value >= -1.0e-12 for value in scalar_values):
+            raise RecurrentPPOUpdateError(
+                "route stability loss telemetry must be finite and non-negative"
+            )
+        for value in (
+            self.remote_scorer_gradient_norm,
+            self.local_route_row_gradient_norm,
+            self.gradient_norm_ratio,
+        ):
+            if value is not None and (not math.isfinite(value) or value < 0.0):
+                raise RecurrentPPOUpdateError(
+                    "route stability gradient telemetry must be finite and non-negative"
+                )
+
+    def record(self) -> dict[str, int | float | None]:
+        """Expose stable field names without changing artifact/checkpoint schemas."""
+
+        return {
+            "conditional_remote_mass": self.conditional_remote_mass,
+            "remote_local_binary_entropy": self.remote_local_binary_entropy,
+            "floor_violation_fraction": self.floor_violation_fraction,
+            "unscaled_stability_loss": self.unscaled_stability_loss,
+            "scaled_stability_loss": self.scaled_stability_loss,
+            "local_sample_count": self.local_sample_count,
+            "remote_sample_count": self.remote_sample_count,
+            "remote_scorer_gradient_norm": self.remote_scorer_gradient_norm,
+            "local_route_row_gradient_norm": self.local_route_row_gradient_norm,
+            "gradient_norm_ratio": self.gradient_norm_ratio,
+            "valid_sample_count": self.valid_sample_count,
+        }
+
+
+def compute_route_choice_stability_loss(
+    *,
+    route_logits: Tensor,
+    route_action_masks: Tensor,
+    route_active: Tensor,
+    sequence_valid_mask: Tensor,
+    local_domain_mask: Tensor,
+    remote_domain_mask: Tensor,
+    selected_route_indices: Tensor,
+    entropy_floor_nats: float,
+    coefficient: float,
+) -> RouteChoiceStabilityLossOutput:
+    """Compute the masked conditional Remote-Local entropy-floor penalty."""
+
+    if not isinstance(route_logits, Tensor) or route_logits.ndim != 4:
+        raise RecurrentPPOUpdateError("route_logits must have shape [B,T,A,D]")
+    vector_shape = tuple(route_logits.shape)
+    scalar_shape = vector_shape[:-1]
+    for name, tensor in (
+        ("route_action_masks", route_action_masks),
+        ("local_domain_mask", local_domain_mask),
+        ("remote_domain_mask", remote_domain_mask),
+    ):
+        if not isinstance(tensor, Tensor) or tuple(tensor.shape) != vector_shape:
+            raise RecurrentPPOUpdateError(f"{name} must match route_logits")
+        if tensor.dtype != torch.bool:
+            raise RecurrentPPOUpdateError(f"{name} must be boolean")
+    if (
+        not isinstance(route_active, Tensor)
+        or tuple(route_active.shape) != scalar_shape
+        or route_active.dtype != torch.bool
+    ):
+        raise RecurrentPPOUpdateError("route_active must be boolean [B,T,A]")
+    if (
+        not isinstance(sequence_valid_mask, Tensor)
+        or tuple(sequence_valid_mask.shape) != scalar_shape[:2]
+        or sequence_valid_mask.dtype != torch.bool
+    ):
+        raise RecurrentPPOUpdateError("sequence_valid_mask must be boolean [B,T]")
+    if (
+        not isinstance(selected_route_indices, Tensor)
+        or tuple(selected_route_indices.shape) != scalar_shape
+        or selected_route_indices.dtype != torch.long
+    ):
+        raise RecurrentPPOUpdateError(
+            "selected_route_indices must be int64 [B,T,A]"
+        )
+    if not torch.isfinite(route_logits).all():
+        raise RecurrentPPOUpdateError("route_logits contain NaN or Inf")
+    if torch.any(local_domain_mask & remote_domain_mask):
+        raise RecurrentPPOUpdateError("local and Remote route domains overlap")
+    if torch.any(local_domain_mask.sum(dim=-1) != 1):
+        raise RecurrentPPOUpdateError(
+            "each route domain must contain exactly one Local action"
+        )
+    if torch.any(selected_route_indices < 0) or torch.any(
+        selected_route_indices >= vector_shape[-1]
+    ):
+        raise RecurrentPPOUpdateError("selected route index lies outside its domain")
+    for name, value in (
+        ("entropy_floor_nats", entropy_floor_nats),
+        ("coefficient", coefficient),
+    ):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+        ):
+            raise RecurrentPPOUpdateError(f"{name} must be finite and non-negative")
+    if float(entropy_floor_nats) > math.log(2.0):
+        raise RecurrentPPOUpdateError("entropy_floor_nats must not exceed log(2)")
+
+    valid_actor = sequence_valid_mask.to(route_logits.device).unsqueeze(-1).expand(
+        scalar_shape
+    )
+    active = route_active & valid_actor
+    selected = selected_route_indices.unsqueeze(-1)
+    selected_local = torch.gather(local_domain_mask, -1, selected).squeeze(-1)
+    selected_remote = torch.gather(remote_domain_mask, -1, selected).squeeze(-1)
+    local_sample_count = int((active & selected_local).sum().detach().cpu().item())
+    remote_sample_count = int((active & selected_remote).sum().detach().cpu().item())
+
+    legal_local = route_action_masks & local_domain_mask
+    legal_remote = route_action_masks & remote_domain_mask
+    eligible = active & legal_local.any(dim=-1) & legal_remote.any(dim=-1)
+    valid_sample_count = int(eligible.sum().detach().cpu().item())
+    if valid_sample_count == 0:
+        zero = route_logits.reshape(-1)[0] * 0.0
+        return RouteChoiceStabilityLossOutput(
+            unscaled_loss=zero,
+            scaled_loss=zero,
+            conditional_remote_mass=None,
+            remote_local_binary_entropy=None,
+            floor_violation_fraction=None,
+            valid_sample_count=0,
+            local_sample_count=local_sample_count,
+            remote_sample_count=remote_sample_count,
+        )
+
+    eligible_logits = route_logits[eligible]
+    eligible_remote = legal_remote[eligible]
+    eligible_local_domain = local_domain_mask[eligible]
+    remote_logit = torch.logsumexp(
+        eligible_logits.masked_fill(~eligible_remote, -torch.inf),
+        dim=-1,
+    )
+    local_indices = eligible_local_domain.to(torch.long).argmax(dim=-1)
+    local_logit = torch.gather(
+        eligible_logits, -1, local_indices.unsqueeze(-1)
+    ).squeeze(-1)
+    delta = remote_logit - local_logit
+    conditional_remote_mass = torch.sigmoid(delta)
+    absolute_delta = delta.abs()
+    minority_mass = torch.sigmoid(-absolute_delta)
+    binary_entropy = (
+        torch.log1p(torch.exp(-absolute_delta))
+        + minority_mass * absolute_delta
+    )
+    violation = torch.relu(
+        binary_entropy.new_tensor(float(entropy_floor_nats)) - binary_entropy
+    )
+    unscaled_loss = violation.square().mean()
+    scaled_loss = unscaled_loss * float(coefficient)
+    if not torch.isfinite(unscaled_loss) or not torch.isfinite(scaled_loss):
+        raise RecurrentPPOUpdateError("route stability loss is NaN or Inf")
+    return RouteChoiceStabilityLossOutput(
+        unscaled_loss=unscaled_loss,
+        scaled_loss=scaled_loss,
+        conditional_remote_mass=float(
+            conditional_remote_mass.detach().mean().cpu().item()
+        ),
+        remote_local_binary_entropy=float(binary_entropy.detach().mean().cpu().item()),
+        floor_violation_fraction=float(
+            (violation.detach() > 0.0).to(route_logits.dtype).mean().cpu().item()
+        ),
+        valid_sample_count=valid_sample_count,
+        local_sample_count=local_sample_count,
+        remote_sample_count=remote_sample_count,
+    )
+
+
+def _route_semantic_domain_masks(
+    action_mask_batch: SequentialActionMaskBatch,
+    route_logits: Tensor,
+) -> tuple[Tensor, Tensor]:
+    contracts = action_mask_batch.flattened()
+    expected_rows = math.prod(route_logits.shape[:-1])
+    if len(contracts) != expected_rows:
+        raise RecurrentPPOUpdateError(
+            "route contracts differ from evaluated policy axes"
+        )
+    local_rows: list[list[bool]] = []
+    remote_rows: list[list[bool]] = []
+    for contract in contracts:
+        domain = tuple(contract.route_domain)
+        if len(domain) != route_logits.shape[-1]:
+            raise RecurrentPPOUpdateError(
+                "route contract domain differs from evaluated logits"
+            )
+        local_rows.append(
+            [type(value) is str and value == "local" for value in domain]
+        )
+        remote_rows.append(
+            [isinstance(value, int) and not isinstance(value, bool) for value in domain]
+        )
+    shape = tuple(route_logits.shape)
+    local = torch.tensor(
+        local_rows,
+        dtype=torch.bool,
+        device=route_logits.device,
+    ).reshape(shape)
+    remote = torch.tensor(
+        remote_rows,
+        dtype=torch.bool,
+        device=route_logits.device,
+    ).reshape(shape)
+    return local, remote
+
+
+def _route_choice_stability_telemetry(
+    loss: RouteChoiceStabilityLossOutput,
+    route_head: nn.Module,
+    action_mask_batch: SequentialActionMaskBatch,
+) -> RouteChoiceStabilityTelemetry:
+    route_domains = tuple(
+        tuple(contract.route_domain) for contract in action_mask_batch.flattened()
+    )
+    gradient_rows = measure_route_head_gradient_rows(route_head, route_domains)
+    local_rows = tuple(
+        row for row in gradient_rows if row.semantic_role == "local"
+    )
+    remote_rows = tuple(
+        row for row in gradient_rows if row.semantic_role == "remote"
+    )
+    if len(local_rows) != 1 or len(remote_rows) != 1:
+        raise RecurrentPPOUpdateError(
+            "candidate-aware route gradients require one Local and one Remote row"
+        )
+    local_norm = local_rows[0].grad_norm
+    remote_norm = remote_rows[0].grad_norm
+    gradient_ratio = (
+        None
+        if local_norm is None or remote_norm is None or local_norm <= 0.0
+        else remote_norm / local_norm
+    )
+    return RouteChoiceStabilityTelemetry(
+        conditional_remote_mass=loss.conditional_remote_mass,
+        remote_local_binary_entropy=loss.remote_local_binary_entropy,
+        floor_violation_fraction=loss.floor_violation_fraction,
+        unscaled_stability_loss=float(loss.unscaled_loss.detach().cpu().item()),
+        scaled_stability_loss=float(loss.scaled_loss.detach().cpu().item()),
+        local_sample_count=loss.local_sample_count,
+        remote_sample_count=loss.remote_sample_count,
+        remote_scorer_gradient_norm=remote_norm,
+        local_route_row_gradient_norm=local_norm,
+        gradient_norm_ratio=gradient_ratio,
+        valid_sample_count=loss.valid_sample_count,
+    )
 
 
 def _validate_frozen_contract(config: RunConfig) -> None:
@@ -973,6 +1308,7 @@ class RecurrentPPOEpochDiagnostics:
     collected_environment_steps: int | None = None
     route_telemetry: RouteTelemetry | None = None
     agent_credit_telemetry: AgentCreditPPOEpochTelemetry | None = None
+    route_choice_stability: RouteChoiceStabilityTelemetry | None = None
 
     def __post_init__(self) -> None:
         if self.epoch_index not in range(4):
@@ -1066,6 +1402,12 @@ class RecurrentPPOEpochDiagnostics:
         ):
             raise TypeError(
                 "agent_credit_telemetry must be AgentCreditPPOEpochTelemetry or None"
+            )
+        if self.route_choice_stability is not None and not isinstance(
+            self.route_choice_stability, RouteChoiceStabilityTelemetry
+        ):
+            raise TypeError(
+                "route_choice_stability must be RouteChoiceStabilityTelemetry or None"
             )
 
 
@@ -1286,7 +1628,31 @@ class CAGATMAPPORecurrentPPOUpdater:
                 collected_environment_steps=collected_environment_steps,
                 route_advantage=prepared.route_advantage,
             )
-            loss.total_loss.backward()
+            stability_loss = None
+            optimized_actor_loss = loss.actor_loss
+            optimized_total_loss = loss.total_loss
+            if mappo.route_choice_stability_enabled:
+                local_domain_mask, remote_domain_mask = (
+                    _route_semantic_domain_masks(
+                        prepared.action_mask_batch,
+                        evaluation.policy.raw_logits["route"],
+                    )
+                )
+                stability_loss = compute_route_choice_stability_loss(
+                    route_logits=evaluation.policy.raw_logits["route"],
+                    route_action_masks=evaluation.policy.action_masks["route"],
+                    route_active=evaluation.policy.active_branches["route"],
+                    sequence_valid_mask=prepared.sequence_valid_mask,
+                    local_domain_mask=local_domain_mask,
+                    remote_domain_mask=remote_domain_mask,
+                    selected_route_indices=evaluation.policy.action_indices["route"],
+                    entropy_floor_nats=mappo.route_choice_entropy_floor_nats,
+                    coefficient=mappo.route_choice_stability_coef,
+                )
+                if mappo.route_choice_stability_coef != 0.0:
+                    optimized_actor_loss = loss.actor_loss + stability_loss.scaled_loss
+                    optimized_total_loss = loss.total_loss + stability_loss.scaled_loss
+            optimized_total_loss.backward()
             route_telemetry = None
             if self.route_telemetry_enabled:
                 route_telemetry = collect_route_telemetry(
@@ -1322,6 +1688,13 @@ class CAGATMAPPORecurrentPPOUpdater:
                         )
                     ),
                     route_nstep_samples=prepared.route_nstep_samples,
+                )
+            route_choice_stability = None
+            if stability_loss is not None:
+                route_choice_stability = _route_choice_stability_telemetry(
+                    stability_loss,
+                    self.actor.action_heads["route"],
+                    prepared.action_mask_batch,
                 )
             agent_credit_telemetry = None
             if (
@@ -1364,10 +1737,10 @@ class CAGATMAPPORecurrentPPOUpdater:
             epoch_diagnostics.append(
                 RecurrentPPOEpochDiagnostics(
                     epoch_index=epoch_index,
-                    actor_loss=float(loss.actor_loss.detach().cpu().item()),
+                    actor_loss=float(optimized_actor_loss.detach().cpu().item()),
                     critic_loss=float(loss.critic_loss.detach().cpu().item()),
                     entropy_mean=float(loss.entropy_mean.detach().cpu().item()),
-                    total_loss=float(loss.total_loss.detach().cpu().item()),
+                    total_loss=float(optimized_total_loss.detach().cpu().item()),
                     ratio_mean=loss.diagnostics.ratio_mean,
                     actor_grad_norm_before_clip=actor_grad_norm,
                     critic_grad_norm_before_clip=critic_grad_norm,
@@ -1410,6 +1783,7 @@ class CAGATMAPPORecurrentPPOUpdater:
                     collected_environment_steps=collected_environment_steps,
                     route_telemetry=route_telemetry,
                     agent_credit_telemetry=agent_credit_telemetry,
+                    route_choice_stability=route_choice_stability,
                 )
             )
         return RecurrentPPOUpdateOutput(
@@ -1431,7 +1805,10 @@ __all__ = [
     "RecurrentPPOEvaluation",
     "RecurrentPPOUpdateError",
     "RecurrentPPOUpdateOutput",
+    "RouteChoiceStabilityLossOutput",
+    "RouteChoiceStabilityTelemetry",
     "build_ca_gat_mappo_optimizers",
     "build_recurrent_ppo_minibatch",
     "compute_configured_batched_ppo_objective_and_loss",
+    "compute_route_choice_stability_loss",
 ]
