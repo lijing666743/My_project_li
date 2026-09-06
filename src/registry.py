@@ -218,6 +218,7 @@ def ca_gat_mappo_training_handler(
     """Run the real production CA-GAT-MAPPO Trainer through its public API."""
 
     context = validate_execution_context(config, execution_context)
+    live_diagnostic_path: str | None = None
     try:
         if config.launch_profile == "rl-formal":
             preflight_formal_training_artifacts(
@@ -233,7 +234,27 @@ def ca_gat_mappo_training_handler(
             )
             training = trainer.train_with_checkpoints()
         else:
-            trainer = CAGATMAPPOTrainer(config)
+            matched_writer = None
+            if config.training.mappo.route_choice_stability_enabled:
+                from .matched_short_diagnostics import (
+                    LiveTrainingDiagnosticsWriter,
+                    live_diagnostics_path,
+                    matched_group_from_config,
+                )
+
+                matched_writer = LiveTrainingDiagnosticsWriter(
+                    config,
+                    group=matched_group_from_config(config),
+                )
+                live_diagnostic_path = str(live_diagnostics_path(config))
+            trainer = (
+                CAGATMAPPOTrainer(config)
+                if matched_writer is None
+                else CAGATMAPPOTrainer(
+                    config,
+                    matched_diagnostic_writer=matched_writer,
+                )
+            )
             if config.launch_profile == "rl-formal":
                 training = trainer.train_with_checkpoints()
             else:
@@ -245,6 +266,9 @@ def ca_gat_mappo_training_handler(
             mode=config.mode,
             method_id=config.method_id,
             message=f"CA-GAT-MAPPO training failed before completion: {exc}",
+            artifacts=(
+                () if live_diagnostic_path is None else (live_diagnostic_path,)
+            ),
         )
     try:
         from .training_artifacts import write_cagat_mappo_training_artifacts
@@ -259,6 +283,9 @@ def ca_gat_mappo_training_handler(
             message=(
                 "CA-GAT-MAPPO training completed but diagnostic artifact generation "
                 f"failed: {exc}"
+            ),
+            artifacts=(
+                () if live_diagnostic_path is None else (live_diagnostic_path,)
             ),
         )
     status = "completed" if diagnostics.smoke_gate_status == "pass" else "failed"
@@ -279,7 +306,11 @@ def ca_gat_mappo_training_handler(
             f"smoke_gate={diagnostics.smoke_gate_status}, "
             f"signal_gate={diagnostics.signal_gate_status}"
         ),
-        artifacts=diagnostics.artifacts,
+        artifacts=(
+            diagnostics.artifacts
+            if live_diagnostic_path is None
+            else (*diagnostics.artifacts, live_diagnostic_path)
+        ),
     )
 
 

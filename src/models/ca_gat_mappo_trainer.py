@@ -666,6 +666,7 @@ class CAGATMAPPOTrainer:
         | None = None,
         progress_logger: Callable[[str], None] | None = None,
         oracle_budget: OracleCollectionBudget | None = None,
+        matched_diagnostic_writer: Any | None = None,
     ) -> None:
         if not isinstance(config, RunConfig):
             raise TypeError("config must be a RunConfig")
@@ -737,6 +738,13 @@ class CAGATMAPPOTrainer:
         ):
             raise TypeError("oracle_budget must be OracleCollectionBudget or None")
         self._oracle_budget = oracle_budget
+        if matched_diagnostic_writer is not None:
+            for method in ("write_update", "write_episode"):
+                if not callable(getattr(matched_diagnostic_writer, method, None)):
+                    raise TypeError(
+                        "matched_diagnostic_writer must expose write_update and write_episode"
+                    )
+        self._matched_diagnostic_writer = matched_diagnostic_writer
 
         self.policy_version = MAPPO_INITIAL_POLICY_VERSION
         self._rollout_policy_version: int | None = None
@@ -976,6 +984,16 @@ class CAGATMAPPOTrainer:
                 "updater changed Trainer policy version"
             )
         update_index = len(updates)
+        matched_diagnostic_writer = getattr(
+            self, "_matched_diagnostic_writer", None
+        )
+        if matched_diagnostic_writer is not None:
+            matched_diagnostic_writer.write_update(
+                output,
+                update_index=update_index,
+                environment_step=self._transitions,
+                uav_count=self.actor.spec.uav_count,
+            )
         self.policy_version += 1
         if trajectory_tracker is not None:
             rollout_length = self.config.training.mappo.rollout_length_slots
@@ -1539,6 +1557,23 @@ class CAGATMAPPOTrainer:
                 self._completed_episodes += 1
                 self._next_episode_index = episode_index + 1
                 episode_active = False
+                matched_diagnostic_writer = getattr(
+                    self, "_matched_diagnostic_writer", None
+                )
+                if matched_diagnostic_writer is not None:
+                    metrics = step_result.info.get("metrics")
+                    if not isinstance(metrics, Mapping):
+                        raise CAGATMAPPOTrainerError(
+                            "matched episode diagnostics require StepResult.info metrics"
+                        )
+                    matched_diagnostic_writer.write_episode(
+                        episode_index=episode_index,
+                        environment_step=self._transitions,
+                        transition_count=episode_transitions,
+                        episode_return=episode_diagnostics.reward.reward.total,
+                        metrics=metrics,
+                        route_outcomes=route_outcome_tracker.finalize(),
+                    )
                 if self.rollout_buffer.full:
                     self._perform_update(self._updates, trajectory_tracker)
                     self._optimized += rollout_length
