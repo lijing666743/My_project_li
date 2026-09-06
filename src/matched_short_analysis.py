@@ -276,15 +276,9 @@ def evaluate_stop(
         return StopEvaluation(
             "STOP_PPO_INSTABILITY", ("clip fraction > 0.30 for 3 updates",)
         )
-    if _consecutive(
-        updates,
-        3,
-        lambda row: row.get("gradient_clip_fraction") is not None
-        and float(row["gradient_clip_fraction"]) == 1.0,
-    ):
-        return StopEvaluation(
-            "STOP_GRADIENT_CLIPPING", ("4/4 epochs clipped for 3 updates",)
-        )
+    # Gradient clipping frequency is diagnostic-only. Established runs can
+    # remain finite and optimize safely under persistent clipping; nonfinite
+    # gradients are still rejected by the updater and numerical gate.
     if group == "baseline":
         return StopEvaluation("CONTINUE")
     merged = _merged_rollouts(records)

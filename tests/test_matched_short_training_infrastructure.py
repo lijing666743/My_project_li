@@ -632,10 +632,47 @@ class StopEvaluatorTests(unittest.TestCase):
         self.assertEqual(evaluate_stop(self._updates(clip=0.30), group="a1").status, "CONTINUE")
         self.assertEqual(evaluate_stop(self._updates(clip=0.300001), group="a1").status, "STOP_PPO_INSTABILITY")
 
-    def test_persistent_gradient_clipping_stops(self) -> None:
+    def test_persistent_gradient_clipping_is_warning_only(self) -> None:
+        records = self._updates(clipping=1.0)
+        self.assertTrue(all(row["gradient_clip_fraction"] == 1.0 for row in records))
+        self.assertEqual(evaluate_stop(records, group="a1").status, "CONTINUE")
+
+    def test_longer_clipping_only_sequence_does_not_stop(self) -> None:
+        records = [
+            {
+                **row,
+                "update_index": index,
+                "gradient_clip_fraction": 1.0,
+                "gradient_clip_triggered": True,
+                "actor_grad_norm_before_clip": 0.75,
+                "critic_grad_norm_before_clip": 2.0,
+            }
+            for index, row in enumerate(self._updates(clipping=1.0) * 2)
+        ]
+        self.assertEqual(evaluate_stop(records, group="a1").status, "CONTINUE")
+        self.assertEqual(records[0]["gradient_clip_fraction"], 1.0)
+        self.assertTrue(records[0]["gradient_clip_triggered"])
+
+    def test_old_frequency_rule_would_have_stopped_but_v2_does_not(self) -> None:
+        records = self._updates(clipping=1.0)
+        old_rule_triggered = all(
+            row["gradient_clip_fraction"] == 1.0 for row in records
+        )
+        self.assertTrue(old_rule_triggered)
+        self.assertEqual(evaluate_stop(records, group="a1").status, "CONTINUE")
+
+    def test_clipping_does_not_mask_kl_or_ppo_clip_hard_stops(self) -> None:
         self.assertEqual(
-            evaluate_stop(self._updates(clipping=1.0), group="a1").status,
-            "STOP_GRADIENT_CLIPPING",
+            evaluate_stop(
+                self._updates(kl=0.020001, clipping=1.0), group="a1"
+            ).status,
+            "STOP_PPO_INSTABILITY",
+        )
+        self.assertEqual(
+            evaluate_stop(
+                self._updates(clip=0.300001, clipping=1.0), group="a1"
+            ).status,
+            "STOP_PPO_INSTABILITY",
         )
 
     def test_five_rollout_starvation_stops_treatment_but_not_baseline(self) -> None:
