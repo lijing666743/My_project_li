@@ -17,6 +17,7 @@ import random
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -49,6 +50,11 @@ DIAGNOSTIC_BUDGET = 32000
 DIAGNOSTIC_CHECKPOINT_INTERVAL = 4000
 EXTENSION_BUDGET = 42500
 EXTENSION_CHECKPOINT_INTERVAL = 4000
+MATCHED_SCENARIO_ID = "small"
+MATCHED_COOPERATION_RADIUS_M = 525.0
+MATCHED_ROUTE_DECODER = "candidate_aware_v1"
+MATCHED_EPISODE_HORIZON = 500
+MATCHED_ROLLOUT_CAPACITY = 256
 PERIODIC_PARTIAL_ROLLOUT_BEHAVIOR = "serialized_in_periodic_resume"
 FINAL_PARTIAL_ROLLOUT_BEHAVIOR = (
     "record_unused_tail_then_clear_without_partial_ppo_update"
@@ -96,6 +102,88 @@ MATCHED_SHORT_BUDGET_SPECS = {
         fresh_campaign_required=True,
     ),
 }
+
+
+def _enum_value(value: Any) -> Any:
+    return getattr(value, "value", value)
+
+
+def _protocol_common_fields(config: RunConfig) -> dict[str, Any]:
+    mappo = config.training.mappo
+    return {
+        "scenario": config.scenario_id,
+        "seed": config.seed,
+        "cooperation_radius_m": config.environment.candidate_neighbor_radius_m,
+        "route_decoder": _enum_value(mappo.route_decoder_mode),
+        "route_credit_mode": _enum_value(mappo.route_credit_mode),
+        "actor_ratio_mode": _enum_value(mappo.actor_ratio_mode),
+        "agent_credit_mode": _enum_value(mappo.agent_credit_mode),
+        "gamma": mappo.gamma,
+        "gae_lambda": mappo.gae_lambda,
+        "ppo_clip_epsilon": mappo.ppo_clip_epsilon,
+        "advantage_normalization": mappo.advantage_normalization,
+        "action_sampling": "stochastic_categorical",
+    }
+
+
+def build_group_definitions(
+    configs: Mapping[str, RunConfig],
+    *,
+    expected_seed: int | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Build explicit matched-group provenance without changing config identity."""
+
+    if set(configs) != set(MATCHED_GROUP_COEFFICIENTS):
+        raise MatchedPreflightError(
+            "group definitions require baseline, a1, and a2"
+        )
+    definitions: dict[str, dict[str, Any]] = {}
+    labels = {"baseline": "Baseline", "a1": "A1", "a2": "A2"}
+    for group, expected_coefficient in MATCHED_GROUP_COEFFICIENTS.items():
+        config = configs[group]
+        config.validate()
+        mappo = config.training.mappo
+        common = _protocol_common_fields(config)
+        if common["scenario"] != MATCHED_SCENARIO_ID:
+            raise MatchedPreflightError(
+                f"{group} scenario must be {MATCHED_SCENARIO_ID!r}"
+            )
+        if expected_seed is not None and common["seed"] != expected_seed:
+            raise MatchedPreflightError(f"{group} seed does not match Stage-0 seed")
+        if common["cooperation_radius_m"] != MATCHED_COOPERATION_RADIUS_M:
+            raise MatchedPreflightError(
+                f"{group} cooperation radius must be {MATCHED_COOPERATION_RADIUS_M}"
+            )
+        if common["route_decoder"] != MATCHED_ROUTE_DECODER:
+            raise MatchedPreflightError(
+                f"{group} route decoder must be {MATCHED_ROUTE_DECODER!r}"
+            )
+        if not mappo.route_choice_stability_enabled:
+            raise MatchedPreflightError(f"{group} stability must be enabled")
+        if mappo.route_choice_entropy_floor_nats != 0.20:
+            raise MatchedPreflightError(f"{group} entropy floor must equal 0.20")
+        definitions[group] = {
+            "label": labels[group],
+            "route_choice_stability_enabled": True,
+            "route_choice_entropy_floor_nats": 0.20,
+            "route_choice_stability_coef": expected_coefficient,
+            **common,
+        }
+    common_keys = tuple(
+        key
+        for key in definitions["baseline"]
+        if key not in {"label", "route_choice_stability_coef"}
+    )
+    for key in common_keys:
+        values = {
+            _canonical_json(definitions[group][key])
+            for group in MATCHED_GROUP_COEFFICIENTS
+        }
+        if len(values) != 1:
+            raise MatchedPreflightError(
+                f"STOP_GROUP_DEFINITION_DIFF: {key} differs across groups"
+            )
+    return definitions
 
 
 def joint_lossless_boundary(episode_horizon: int, rollout_capacity: int) -> int:
@@ -229,6 +317,251 @@ def _canonical_json(value: Any) -> bytes:
 
 def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _budget_phase_plan(
+    spec: MatchedBudgetSpec,
+    *,
+    episode_horizon: int,
+    rollout_capacity: int,
+) -> dict[str, Any]:
+    episodes, episode_tail = divmod(spec.total_steps, episode_horizon)
+    full_rollouts, rollout_tail = divmod(spec.total_steps, rollout_capacity)
+    if episode_tail != 0:
+        raise MatchedPreflightError(
+            f"{spec.name} budget is not episode-boundary aligned"
+        )
+    if spec.checkpoint_interval % episode_horizon != 0:
+        raise MatchedPreflightError(
+            f"{spec.name} checkpoint interval is not episode-boundary aligned"
+        )
+    if spec.checkpoint_interval >= spec.total_steps:
+        raise MatchedPreflightError(
+            f"{spec.name} checkpoint interval must be less than budget"
+        )
+    values = {
+        "budget": spec.total_steps,
+        "checkpoint_interval": spec.checkpoint_interval,
+        "episodes": episodes,
+        "full_rollouts": full_rollouts,
+        "optimized_steps": full_rollouts * rollout_capacity,
+        "unused_final_tail": rollout_tail,
+        "lossless": rollout_tail == 0,
+        "fresh_campaign_only": spec.fresh_campaign_required,
+        "purpose": spec.purpose,
+    }
+    expected = {
+        "smoke": (1500, 500, 3, 5, 1280, 220),
+        "diagnostic": (32000, 4000, 64, 125, 32000, 0),
+        "extension": (42500, 4000, 85, 166, 42496, 4),
+    }[spec.name]
+    actual = (
+        values["budget"],
+        values["checkpoint_interval"],
+        values["episodes"],
+        values["full_rollouts"],
+        values["optimized_steps"],
+        values["unused_final_tail"],
+    )
+    if actual != expected:
+        raise MatchedPreflightError(
+            f"{spec.name} budget geometry differs from frozen protocol"
+        )
+    return values
+
+
+def matched_budget_plan(config: RunConfig) -> dict[str, Any]:
+    """Return the complete frozen smoke/diagnostic/extension geometry."""
+
+    if not isinstance(config, RunConfig):
+        raise TypeError("config must be a RunConfig")
+    config.validate()
+    episode_horizon = config.environment.episode_horizon
+    rollout_capacity = config.training.mappo.rollout_length_slots
+    if episode_horizon != MATCHED_EPISODE_HORIZON:
+        raise MatchedPreflightError(
+            f"episode horizon must be {MATCHED_EPISODE_HORIZON}"
+        )
+    if rollout_capacity != MATCHED_ROLLOUT_CAPACITY:
+        raise MatchedPreflightError(
+            f"rollout capacity must be {MATCHED_ROLLOUT_CAPACITY}"
+        )
+    phases = {
+        name: _budget_phase_plan(
+            spec,
+            episode_horizon=episode_horizon,
+            rollout_capacity=rollout_capacity,
+        )
+        for name, spec in MATCHED_SHORT_BUDGET_SPECS.items()
+    }
+    return {
+        "episode_horizon": episode_horizon,
+        "rollout_capacity": rollout_capacity,
+        "lcm_episode_rollout": joint_lossless_boundary(
+            episode_horizon, rollout_capacity
+        ),
+        "next_lossless_boundary": next_joint_lossless_boundary(
+            DIAGNOSTIC_BUDGET, episode_horizon, rollout_capacity
+        ),
+        **phases,
+        "legacy_invalid": {
+            str(budget): {
+                "supported": budget % episode_horizon == 0,
+                "reason": "not_episode_boundary",
+            }
+            for budget in (32768, 40960)
+        },
+    }
+
+
+def inspect_output_collision(output_root: str | Path) -> dict[str, Any]:
+    """Validate a destination without creating or overwriting anything."""
+
+    root = Path(output_root)
+    existed_before = root.exists()
+    was_empty_if_existing: bool | None = None
+    if existed_before:
+        if not root.is_dir():
+            raise MatchedPreflightError(
+                f"STOP_OUTPUT_COLLISION: target is not a directory: {root}"
+            )
+        was_empty_if_existing = not any(root.iterdir())
+        if not was_empty_if_existing:
+            raise MatchedPreflightError(
+                f"STOP_OUTPUT_COLLISION: target directory is non-empty: {root}"
+            )
+    return {
+        "status": "PASS",
+        "target_path": str(root.resolve()),
+        "existed_before": existed_before,
+        "was_empty_if_existing": was_empty_if_existing,
+        "overwrite_performed": False,
+    }
+
+
+def validate_preflight_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    """Fail closed when a successful manifest misses required provenance."""
+
+    required = (
+        "status",
+        "timestamp",
+        "group_definitions",
+        "budget_plan",
+        "output_collision_result",
+    )
+    missing = tuple(field for field in required if field not in manifest)
+    if missing:
+        raise MatchedPreflightError(
+            "STOP_MANIFEST_CONTRACT: missing required fields "
+            + ", ".join(missing)
+        )
+    timestamp = manifest["timestamp"]
+    if not isinstance(timestamp, str):
+        raise MatchedPreflightError("STOP_MANIFEST_CONTRACT: timestamp must be a string")
+    try:
+        parsed_timestamp = datetime.fromisoformat(timestamp)
+    except ValueError as exc:
+        raise MatchedPreflightError(
+            "STOP_MANIFEST_CONTRACT: timestamp must be ISO-8601"
+        ) from exc
+    if parsed_timestamp.tzinfo is None or parsed_timestamp.utcoffset() is None:
+        raise MatchedPreflightError(
+            "STOP_MANIFEST_CONTRACT: timestamp must include timezone"
+        )
+    definitions = manifest["group_definitions"]
+    if not isinstance(definitions, Mapping) or set(definitions) != set(
+        MATCHED_GROUP_COEFFICIENTS
+    ):
+        raise MatchedPreflightError(
+            "STOP_MANIFEST_CONTRACT: group_definitions must contain baseline, a1, a2"
+        )
+    for group, coefficient in MATCHED_GROUP_COEFFICIENTS.items():
+        definition = definitions[group]
+        if not isinstance(definition, Mapping):
+            raise MatchedPreflightError(
+                f"STOP_MANIFEST_CONTRACT: {group} definition must be an object"
+            )
+        expected = {
+            "route_choice_stability_enabled": True,
+            "route_choice_entropy_floor_nats": 0.20,
+            "route_choice_stability_coef": coefficient,
+            "scenario": MATCHED_SCENARIO_ID,
+            "cooperation_radius_m": MATCHED_COOPERATION_RADIUS_M,
+            "route_decoder": MATCHED_ROUTE_DECODER,
+        }
+        for field, value in expected.items():
+            if definition.get(field) != value:
+                raise MatchedPreflightError(
+                    f"STOP_MANIFEST_CONTRACT: {group}.{field} is invalid"
+                )
+    budget_plan = manifest["budget_plan"]
+    if not isinstance(budget_plan, Mapping):
+        raise MatchedPreflightError(
+            "STOP_MANIFEST_CONTRACT: budget_plan must be an object"
+        )
+    if (
+        budget_plan.get("episode_horizon") != MATCHED_EPISODE_HORIZON
+        or budget_plan.get("rollout_capacity") != MATCHED_ROLLOUT_CAPACITY
+        or budget_plan.get("lcm_episode_rollout") != 32000
+        or budget_plan.get("next_lossless_boundary") != 64000
+    ):
+        raise MatchedPreflightError(
+            "STOP_MANIFEST_CONTRACT: budget geometry is invalid"
+        )
+    expected_phases = {
+        "smoke": (1500, 500, 3, 5, 1280, 220),
+        "diagnostic": (32000, 4000, 64, 125, 32000, 0),
+        "extension": (42500, 4000, 85, 166, 42496, 4),
+    }
+    for name, expected_values in expected_phases.items():
+        phase = budget_plan.get(name)
+        if not isinstance(phase, Mapping):
+            raise MatchedPreflightError(
+                f"STOP_MANIFEST_CONTRACT: budget_plan.{name} is missing"
+            )
+        fields = (
+            "budget",
+            "checkpoint_interval",
+            "episodes",
+            "full_rollouts",
+            "optimized_steps",
+            "unused_final_tail",
+        )
+        if tuple(phase.get(field) for field in fields) != expected_values:
+            raise MatchedPreflightError(
+                f"STOP_MANIFEST_CONTRACT: budget_plan.{name} is invalid"
+            )
+    if budget_plan["diagnostic"].get("lossless") is not True:
+        raise MatchedPreflightError(
+            "STOP_MANIFEST_CONTRACT: diagnostic budget must be lossless"
+        )
+    if budget_plan["extension"].get("fresh_campaign_only") is not True:
+        raise MatchedPreflightError(
+            "STOP_MANIFEST_CONTRACT: extension must require a fresh campaign"
+        )
+    for invalid in ("32768", "40960"):
+        if budget_plan.get("legacy_invalid", {}).get(invalid, {}).get(
+            "supported"
+        ) is not False:
+            raise MatchedPreflightError(
+                f"STOP_MANIFEST_CONTRACT: legacy budget {invalid} must be unsupported"
+            )
+    collision = manifest["output_collision_result"]
+    if not isinstance(collision, Mapping):
+        raise MatchedPreflightError(
+            "STOP_MANIFEST_CONTRACT: output_collision_result must be an object"
+        )
+    if (
+        collision.get("status") != "PASS"
+        or not isinstance(collision.get("target_path"), str)
+        or not isinstance(collision.get("existed_before"), bool)
+        or "was_empty_if_existing" not in collision
+        or collision.get("overwrite_performed") is not False
+    ):
+        raise MatchedPreflightError(
+            "STOP_MANIFEST_CONTRACT: output collision result is invalid"
+        )
+    return {"status": "PASS", "required_fields": list(required)}
 
 
 def _tensor_bytes(tensor: Tensor) -> bytes:
@@ -695,15 +1028,18 @@ def run_matched_preflight(
     """Run the complete Stage-0 gate and write one immutable manifest."""
 
     root = Path(output_root)
+    collision_result = inspect_output_collision(root)
     manifest_path = root / "matched_preflight_manifest.json"
     if manifest_path.exists():
         raise MatchedPreflightError(f"preflight manifest already exists: {manifest_path}")
     payload: dict[str, Any] = {
         "schema_version": 1,
         "status": "FAIL",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "seed": seed,
         "expected_head": expected_head,
         "expected_branch": expected_branch,
+        "output_collision_result": collision_result,
     }
     error: Exception | None = None
     try:
@@ -720,9 +1056,13 @@ def run_matched_preflight(
         if head != expected_head or branch != expected_branch or not status["acceptable"]:
             raise MatchedPreflightError("Git provenance gate failed")
         config_gate = validate_matched_configs(configs)
+        group_definitions = build_group_definitions(configs, expected_seed=seed)
+        budget_plan = matched_budget_plan(configs["baseline"])
         identities = {group: capture_initial_identity(config) for group, config in configs.items()}
         identity_gate = validate_initial_identities(identities)
         payload["config_whitelist"] = config_gate
+        payload["group_definitions"] = group_definitions
+        payload["budget_plan"] = budget_plan
         payload["initial_identity_gate"] = identity_gate
         payload["initial_identity"] = identities
         payload["synthetic_stability_gate"] = synthetic_stability_gate()
@@ -798,6 +1138,13 @@ def run_matched_preflight(
     except Exception as exc:
         error = exc
         payload["error"] = f"{type(exc).__name__}: {exc}"
+    if error is None:
+        try:
+            payload["manifest_contract_gate"] = validate_preflight_manifest(payload)
+        except Exception as exc:
+            error = exc
+            payload["status"] = "FAIL"
+            payload["error"] = f"{type(exc).__name__}: {exc}"
     _exclusive_json_write(manifest_path, payload)
     if error is not None:
         raise MatchedPreflightError(
@@ -809,12 +1156,31 @@ def run_matched_preflight(
 __all__ = [
     "ALLOWED_CONFIG_DIFF_PATHS",
     "CheckpointPlan",
+    "DIAGNOSTIC_BUDGET",
+    "DIAGNOSTIC_CHECKPOINT_INTERVAL",
+    "EXTENSION_BUDGET",
+    "EXTENSION_CHECKPOINT_INTERVAL",
+    "FINAL_PARTIAL_ROLLOUT_BEHAVIOR",
+    "MATCHED_SHORT_BUDGET_SPECS",
     "MATCHED_GROUP_COEFFICIENTS",
+    "MATCHED_COOPERATION_RADIUS_M",
+    "MATCHED_EPISODE_HORIZON",
+    "MATCHED_ROLLOUT_CAPACITY",
+    "MATCHED_ROUTE_DECODER",
+    "MATCHED_SCENARIO_ID",
     "MatchedPreflightError",
+    "PERIODIC_PARTIAL_ROLLOUT_BEHAVIOR",
+    "SMOKE_BUDGET",
+    "SMOKE_CHECKPOINT_INTERVAL",
+    "build_group_definitions",
     "canonical_config_differences",
     "capture_initial_identity",
     "checkpoint_plan",
+    "inspect_output_collision",
+    "joint_lossless_boundary",
+    "matched_budget_plan",
     "module_digest",
+    "next_joint_lossless_boundary",
     "normalized_optimizer_digest",
     "rng_digests",
     "run_matched_preflight",
@@ -823,4 +1189,5 @@ __all__ = [
     "validate_exact_final_checkpoint_plan",
     "validate_initial_identities",
     "validate_matched_configs",
+    "validate_preflight_manifest",
 ]

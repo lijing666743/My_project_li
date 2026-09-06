@@ -13,6 +13,7 @@ import random
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -49,9 +50,12 @@ from src.matched_short_preflight import (
     SMOKE_BUDGET,
     SMOKE_CHECKPOINT_INTERVAL,
     MatchedPreflightError,
+    build_group_definitions,
     capture_initial_identity,
     checkpoint_plan,
+    inspect_output_collision,
     joint_lossless_boundary,
+    matched_budget_plan,
     module_digest,
     next_joint_lossless_boundary,
     normalized_optimizer_digest,
@@ -61,6 +65,7 @@ from src.matched_short_preflight import (
     validate_exact_final_checkpoint_plan,
     validate_initial_identities,
     validate_matched_configs,
+    validate_preflight_manifest,
 )
 from src.models.ca_gat_mappo import CAGATMAPPOActor, MAPPOCentralizedCritic
 from src.models.ca_gat_mappo_trainer import CAGATMAPPOTrainer
@@ -812,6 +817,148 @@ class MatchedAnalyzerTests(unittest.TestCase):
             )
             self.assertEqual(len(plots), 10)
             self.assertTrue(all(Path(path).is_file() for path in plots))
+
+
+class ManifestContractTests(unittest.TestCase):
+    def _protocol_configs(self) -> dict[str, RunConfig]:
+        configs = triplet(budget=32000)
+        return {
+            group: replace(
+                config,
+                environment=replace(
+                    config.environment,
+                    candidate_neighbor_radius_m=525.0,
+                ),
+            )
+            for group, config in configs.items()
+        }
+
+    def _valid_manifest(self, output_root: Path) -> dict[str, object]:
+        configs = self._protocol_configs()
+        collision = inspect_output_collision(output_root)
+        return {
+            "status": "PASS",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "group_definitions": build_group_definitions(
+                configs, expected_seed=42
+            ),
+            "budget_plan": matched_budget_plan(configs["baseline"]),
+            "output_collision_result": collision,
+        }
+
+    def test_timestamp_is_iso8601_timezone_aware_and_not_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = self._valid_manifest(Path(directory) / "new")
+        parsed = datetime.fromisoformat(str(manifest["timestamp"]))
+        self.assertIsNotNone(parsed.tzinfo)
+        self.assertIsNotNone(parsed.utcoffset())
+        identities = identity_fixture()
+        identities["baseline"]["timestamp"] = str(manifest["timestamp"])
+        identities["a1"]["timestamp"] = "different-metadata"
+        self.assertEqual(validate_initial_identities(identities)["status"], "PASS")
+
+    def test_group_definitions_are_explicit_and_do_not_replace_whitelist(self) -> None:
+        configs = self._protocol_configs()
+        definitions = build_group_definitions(configs, expected_seed=42)
+        self.assertEqual(set(definitions), {"baseline", "a1", "a2"})
+        self.assertEqual(
+            {
+                group: definition["route_choice_stability_coef"]
+                for group, definition in definitions.items()
+            },
+            {"baseline": 0.0, "a1": 0.02, "a2": 0.05},
+        )
+        for field in (
+            "route_choice_stability_enabled",
+            "route_choice_entropy_floor_nats",
+            "scenario",
+            "seed",
+            "cooperation_radius_m",
+            "route_decoder",
+        ):
+            self.assertEqual(
+                {definition[field] for definition in definitions.values()},
+                {definitions["baseline"][field]},
+            )
+        self.assertEqual(validate_matched_configs(configs)["status"], "PASS")
+
+    def test_budget_plan_contains_all_frozen_phases_and_legacy_rejections(self) -> None:
+        plan = matched_budget_plan(self._protocol_configs()["baseline"])
+        self.assertEqual(
+            {
+                phase: (
+                    plan[phase]["budget"],
+                    plan[phase]["checkpoint_interval"],
+                    plan[phase]["episodes"],
+                    plan[phase]["full_rollouts"],
+                    plan[phase]["optimized_steps"],
+                    plan[phase]["unused_final_tail"],
+                )
+                for phase in ("smoke", "diagnostic", "extension")
+            },
+            {
+                "smoke": (1500, 500, 3, 5, 1280, 220),
+                "diagnostic": (32000, 4000, 64, 125, 32000, 0),
+                "extension": (42500, 4000, 85, 166, 42496, 4),
+            },
+        )
+        self.assertTrue(plan["diagnostic"]["lossless"])
+        self.assertTrue(plan["extension"]["fresh_campaign_only"])
+        self.assertEqual(plan["episode_horizon"], 500)
+        self.assertEqual(plan["rollout_capacity"], 256)
+        self.assertEqual(plan["lcm_episode_rollout"], 32000)
+        self.assertEqual(plan["next_lossless_boundary"], 64000)
+        self.assertFalse(plan["legacy_invalid"]["32768"]["supported"])
+        self.assertFalse(plan["legacy_invalid"]["40960"]["supported"])
+
+    def test_output_collision_new_empty_and_nonempty_destinations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            new_result = inspect_output_collision(root / "new")
+            self.assertEqual(new_result["status"], "PASS")
+            self.assertFalse(new_result["existed_before"])
+            self.assertIsNone(new_result["was_empty_if_existing"])
+            self.assertFalse(new_result["overwrite_performed"])
+
+            empty = root / "empty"
+            empty.mkdir()
+            empty_result = inspect_output_collision(empty)
+            self.assertEqual(empty_result["status"], "PASS")
+            self.assertTrue(empty_result["existed_before"])
+            self.assertTrue(empty_result["was_empty_if_existing"])
+            self.assertFalse(empty_result["overwrite_performed"])
+
+            nonempty = root / "nonempty"
+            nonempty.mkdir()
+            (nonempty / "history.json").write_text("fixture", encoding="utf-8")
+            with self.assertRaisesRegex(
+                MatchedPreflightError, "STOP_OUTPUT_COLLISION"
+            ):
+                inspect_output_collision(nonempty)
+
+    def test_manifest_validator_fails_closed_for_each_required_field(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = self._valid_manifest(Path(directory) / "new")
+        self.assertEqual(validate_preflight_manifest(manifest)["status"], "PASS")
+        for field in (
+            "timestamp",
+            "group_definitions",
+            "budget_plan",
+            "output_collision_result",
+        ):
+            incomplete = dict(manifest)
+            del incomplete[field]
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(
+                    MatchedPreflightError, "STOP_MANIFEST_CONTRACT"
+                ):
+                    validate_preflight_manifest(incomplete)
+        naive = dict(manifest)
+        naive["timestamp"] = "2026-09-06T00:00:00"
+        with self.assertRaisesRegex(
+            MatchedPreflightError, "timestamp must include timezone"
+        ):
+            validate_preflight_manifest(naive)
 
 
 class CheckpointPlanTests(unittest.TestCase):
