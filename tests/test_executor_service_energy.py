@@ -8,7 +8,7 @@ from dataclasses import replace
 
 import numpy as np
 
-from src.config import EnvironmentConfig, RunConfig
+from src.config import ChannelAblationMode, EnvironmentConfig, RunConfig
 from src.env.actions import ActionError, ActionProposal, ProposalAdapter
 from src.env.energy import UavEnergyState
 from src.env.executor import DeterministicExecutor
@@ -368,6 +368,76 @@ class PhysicalLayerAndServiceTests(unittest.TestCase):
         self.assertAlmostEqual(link.sinr_linear[0], expected_sinr)
         self.assertTrue(result.interference_measurement_mask[1, 0])
         self.assertAlmostEqual(result.interference_measurement_w[1, 0], expected_interference)
+
+    def test_simplified_same_ru_reuse_zeroes_only_interference_and_keeps_attempt_mask(self) -> None:
+        def run(mode: ChannelAblationMode):
+            config = make_config(4, channel_ablation_mode=mode)
+            manager = LifecycleManager()
+            add_tx_task(manager, 0, 1, bits=100.0)
+            add_tx_task(manager, 2, 3, bits=100.0)
+            states = make_states((0, 2))
+            execution = DeterministicExecutor(config, manager, states).execute(
+                2,
+                [tx_proposal(0, 1), tx_proposal(2, 3)],
+            )
+            result = PhysicalService(config, manager, states).execute(
+                execution,
+                true_channel(config),
+                settle_deadlines=False,
+            )
+            return execution, result
+
+        full_execution, full = run(ChannelAblationMode.FULL)
+        simplified_execution, simplified = run(
+            ChannelAblationMode.SIMPLIFIED_DETERMINISTIC
+        )
+        self.assertEqual(full_execution.executed_links, simplified_execution.executed_links)
+        self.assertTrue(any(value > 0.0 for link in full.links for value in link.interference_w))
+        self.assertTrue(
+            all(value == 0.0 for link in simplified.links for value in link.interference_w)
+        )
+        np.testing.assert_array_equal(
+            simplified.interference_measurement_w,
+            0.0,
+        )
+        np.testing.assert_array_equal(
+            full.interference_measurement_mask,
+            simplified.interference_measurement_mask,
+        )
+        self.assertEqual(
+            int(np.count_nonzero(simplified.interference_measurement_mask)),
+            sum(len(link.ru_indices) for link in simplified.links),
+        )
+
+    def test_simplified_mode_retains_remote_tx_cpu_terminal_lifecycle(self) -> None:
+        config = make_config(
+            2,
+            channel_ablation_mode=ChannelAblationMode.SIMPLIFIED_DETERMINISTIC,
+        )
+        manager = LifecycleManager()
+        task = add_tx_task(manager, 0, 1, bits=1.0, cycles=1.0, deadline=10)
+        states = make_states((0, 1))
+        tx_execution = DeterministicExecutor(config, manager, states).execute(
+            2,
+            [tx_proposal(0, 1), idle_proposal(1)],
+        )
+        PhysicalService(config, manager, states).execute(
+            tx_execution,
+            true_channel(config),
+            settle_deadlines=False,
+        )
+        self.assertEqual(task.status, TaskStatus.CPU)
+
+        cpu_execution = DeterministicExecutor(config, manager, states).execute(
+            3,
+            [idle_proposal(0), idle_proposal(1, cpu_queue=0, cpu_frequency=1.0)],
+        )
+        PhysicalService(config, manager, states).execute(
+            cpu_execution,
+            true_channel(config),
+        )
+        self.assertEqual(task.status, TaskStatus.DONE)
+        self.assertEqual(task.outcome, TaskOutcome.DONE)
 
     def test_rejected_transmitter_produces_no_interference_service_energy_or_attempt(self) -> None:
         config = make_config(3)

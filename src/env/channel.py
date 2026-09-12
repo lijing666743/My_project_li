@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Iterable
 
 import numpy as np
 
-from ..config import BuildingConfig, EnvironmentConfig
+from ..config import BuildingConfig, ChannelAblationMode, EnvironmentConfig
 from .randomness import rng_from_run_config
 from .topology import pairwise_distances
 
@@ -201,6 +201,10 @@ class PhysicalChannelModel:
     def __init__(self, config: EnvironmentConfig, rng: np.random.Generator) -> None:
         self.config = config
         self.rng = rng
+        self._simplified_deterministic = (
+            config.channel_ablation_mode
+            == ChannelAblationMode.SIMPLIFIED_DETERMINISTIC
+        )
         if not isinstance(rng, np.random.Generator):
             raise TypeError("channel rng must be an explicit numpy.random.Generator")
         self.buildings = tuple(BuildingPrism.from_config(item) for item in config.building_layout)
@@ -239,7 +243,12 @@ class PhysicalChannelModel:
             raise ChannelError("every directed non-self link must have strictly positive distance")
 
         blocked = building_blockage_mask(positions, self.buildings)
-        if slot == 0:
+        if self._simplified_deterministic:
+            shadowing = np.zeros(
+                (self.config.uav_count, self.config.uav_count),
+                dtype=np.float64,
+            )
+        elif slot == 0:
             shadowing = self._sample_initial_shadowing()
         else:
             if self._previous_positions_m is None or self._shadowing_db is None:
@@ -275,6 +284,9 @@ class PhysicalChannelModel:
                 )
                 path_loss[source, destination] = link_path_loss
                 amplitude = math.sqrt(combined_antenna_gain * float(db_to_power_ratio(-link_path_loss)))
+                if self._simplified_deterministic:
+                    channels[source, destination, :] = complex(amplitude, 0.0)
+                    continue
                 for ru in range(self.config.ru_count):
                     real, imaginary = self.rng.normal(0.0, math.sqrt(0.5), size=2)
                     innovation = complex(real, imaginary)

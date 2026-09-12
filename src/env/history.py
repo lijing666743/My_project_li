@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from ..config import EnvironmentConfig
+from ..config import ChannelAblationMode, EnvironmentConfig
 from .channel import ChannelSnapshot, db_to_amplitude_ratio, receiver_noise_power_w
 from .randomness import rng_from_run_config
 
@@ -259,6 +259,10 @@ class ChannelHistory:
             raise HistoryError("reference_transmit_power_w must be finite and positive")
         self.config = config
         self.csi_error_rng = csi_error_rng
+        self._simplified_deterministic = (
+            config.channel_ablation_mode
+            == ChannelAblationMode.SIMPLIFIED_DETERMINISTIC
+        )
         self.noise_power_w = receiver_noise_power_w(config)
         self.interference = InterferenceHistory(
             config.uav_count,
@@ -316,7 +320,8 @@ class ChannelHistory:
         if not np.all(np.isfinite(tensor)):
             raise HistoryError("true channel must contain only finite values")
         self._true_channels[slot] = np.array(tensor, dtype=np.complex128, copy=True)
-        capacity = self.config.fixed_csi_aoi_slots + 1
+        effective_aoi_slots = 0 if self._simplified_deterministic else self.config.fixed_csi_aoi_slots
+        capacity = effective_aoi_slots + 1
         while len(self._true_channels) > capacity:
             self._true_channels.popitem(last=False)
         self._last_physical_slot = slot
@@ -338,23 +343,26 @@ class ChannelHistory:
 
         count = self.config.uav_count
         ru_count = self.config.ru_count
-        stale_index = slot - self.config.fixed_csi_aoi_slots
+        effective_aoi_slots = 0 if self._simplified_deterministic else self.config.fixed_csi_aoi_slots
+        stale_index = slot - effective_aoi_slots
         stale = np.zeros((count, count, ru_count), dtype=np.complex128)
         csi_valid = np.zeros((count, count), dtype=np.bool_)
         source = self._true_channels.get(stale_index) if stale_index >= 0 else None
 
-        # The complete directed-link/RU error tensor is sampled in fixed order
-        # even when the stale lookup is unavailable.  The mask alone controls use.
+        # Full mode samples the complete directed-link/RU error tensor in its
+        # historical fixed order even when the stale lookup is unavailable.
+        # Simplified mode has zero CSI error and intentionally consumes no RNG.
         error_db = np.zeros((count, count, ru_count), dtype=np.float64)
-        for source_id in range(count):
-            for destination_id in range(count):
-                if source_id == destination_id:
-                    continue
-                for ru in range(ru_count):
-                    error_db[source_id, destination_id, ru] = self.csi_error_rng.normal(
-                        0.0,
-                        self.config.csi_error_std_db,
-                    )
+        if not self._simplified_deterministic:
+            for source_id in range(count):
+                for destination_id in range(count):
+                    if source_id == destination_id:
+                        continue
+                    for ru in range(ru_count):
+                        error_db[source_id, destination_id, ru] = self.csi_error_rng.normal(
+                            0.0,
+                            self.config.csi_error_std_db,
+                        )
         if source is not None:
             csi_valid[:] = True
             np.fill_diagonal(csi_valid, False)
@@ -380,7 +388,7 @@ class ChannelHistory:
         quality[quality_valid] = raw_quality[quality_valid]
         csi_aoi = np.full(
             (count, count),
-            self.config.fixed_csi_aoi_slots,
+            effective_aoi_slots,
             dtype=np.int64,
         )
         np.fill_diagonal(csi_aoi, 0)

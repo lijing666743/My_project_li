@@ -209,6 +209,13 @@ class WorkloadTimingMode(str, Enum):
     ROUTE_SLOT_PRE_ROUTE = "route_slot_pre_route"
 
 
+class ChannelAblationMode(str, Enum):
+    """Select the physical-channel uncertainty profile."""
+
+    FULL = "full"
+    SIMPLIFIED_DETERMINISTIC = "simplified_deterministic"
+
+
 class ActorRatioMode(str, Enum):
     """Select the PPO importance-ratio credit boundary."""
 
@@ -352,6 +359,7 @@ class BuildingConfig:
 class EnvironmentConfig:
     """Frozen Section 4 environment values used by the future backend."""
 
+    channel_ablation_mode: ChannelAblationMode = ChannelAblationMode.FULL
     episode_horizon: int = 500
     slot_duration_s: float = 0.020
     height_m: float = 80.0
@@ -843,6 +851,15 @@ class RunConfig:
         environment = resolved.get("environment")
         if (
             isinstance(environment, dict)
+            and environment.get("channel_ablation_mode")
+            == ChannelAblationMode.FULL.value
+        ):
+            # ``full`` is the historical channel behavior.  Keep its omitted
+            # selector outside the canonical payload so legacy configs and
+            # explicit-full configs retain their exact pre-ablation identity.
+            environment.pop("channel_ablation_mode")
+        if (
+            isinstance(environment, dict)
             and environment.get("workload_timing_mode")
             == WorkloadTimingMode.LEGACY_POST_ROUTE.value
         ):
@@ -952,6 +969,11 @@ class RunConfig:
         """Return a serializable snapshot with provenance and run metadata."""
 
         snapshot = self.resolved_dict()
+        environment = snapshot.get("environment")
+        if isinstance(environment, dict):
+            # Record the effective mode even though historical Full omits the
+            # selector from the canonical hash payload.
+            environment["channel_ablation_mode"] = self.environment.channel_ablation_mode.value
         snapshot["_metadata"] = {
             "source_config_path": self.source_config_path,
             "cli_overrides": _jsonable(dict(self.cli_overrides)),
@@ -1034,6 +1056,14 @@ class RunConfig:
             if self.method_id not in SUPPORTED_METHODS:
                 raise ConfigError(f"unsupported method for mode {self.mode!r}")
         env = self.environment
+        try:
+            ChannelAblationMode(env.channel_ablation_mode)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(
+                "environment.channel_ablation_mode must be one of "
+                f"{tuple(mode.value for mode in ChannelAblationMode)}, "
+                f"got {env.channel_ablation_mode!r}"
+            ) from exc
         try:
             WorkloadTimingMode(env.workload_timing_mode)
         except (TypeError, ValueError) as exc:
@@ -2228,6 +2258,7 @@ __all__ = [
     "ActionConfig",
     "AgentCreditMode",
     "ActorRatioMode",
+    "ChannelAblationMode",
     "CHECKPOINT_KIND_FINAL_COMPLETED",
     "CHECKPOINT_KIND_PERIODIC_RESUME",
     "CHECKPOINT_SCHEMA_VERSION",

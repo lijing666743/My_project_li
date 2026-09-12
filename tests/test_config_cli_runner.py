@@ -13,7 +13,12 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 from src.cli import MENU_ROUTES, build_arg_parser, build_run_config_from_args, main
-from src.config import ConfigError, _detected_runtime_versions, load_run_config
+from src.config import (
+    ChannelAblationMode,
+    ConfigError,
+    _detected_runtime_versions,
+    load_run_config,
+)
 from src.execution import ExecutionContext
 from src.registry import RunResult, build_default_registry, ca_gat_mappo_training_handler
 from src.runner import Runner
@@ -36,6 +41,39 @@ class ConfigTests(unittest.TestCase):
         medium = load_run_config(cli_overrides={"scenario_id": "medium"})
         self.assertEqual(medium.environment.uav_count, 6)
         self.assertEqual(len(medium.environment.profile_assignment), 6)
+
+    def test_channel_ablation_mode_loading_identity_snapshot_and_validation(self) -> None:
+        default = load_run_config()
+        explicit_full = load_run_config(
+            cli_overrides={"environment.channel_ablation_mode": "full"}
+        )
+        simplified = load_run_config(
+            cli_overrides={
+                "environment.channel_ablation_mode": "simplified_deterministic"
+            }
+        )
+
+        self.assertEqual(default.environment.channel_ablation_mode, ChannelAblationMode.FULL)
+        self.assertEqual(explicit_full.environment.channel_ablation_mode, ChannelAblationMode.FULL)
+        self.assertEqual(
+            simplified.environment.channel_ablation_mode,
+            ChannelAblationMode.SIMPLIFIED_DETERMINISTIC,
+        )
+        self.assertEqual(default.config_hash, explicit_full.config_hash)
+        self.assertNotEqual(default.config_hash, simplified.config_hash)
+        self.assertNotIn("channel_ablation_mode", default.resolved_dict()["environment"])
+        self.assertEqual(
+            default.snapshot_dict()["environment"]["channel_ablation_mode"],
+            "full",
+        )
+        self.assertEqual(
+            simplified.snapshot_dict()["environment"]["channel_ablation_mode"],
+            "simplified_deterministic",
+        )
+        with self.assertRaisesRegex(ConfigError, "channel_ablation_mode"):
+            load_run_config(
+                cli_overrides={"environment.channel_ablation_mode": "invalid"}
+            )
 
     def test_oracle_defaults_are_disabled_and_zero_rate(self) -> None:
         config = load_run_config()

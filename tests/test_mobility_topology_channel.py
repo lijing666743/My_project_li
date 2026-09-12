@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import unittest
 from dataclasses import replace
 
 import numpy as np
 
-from src.config import BoundsConfig, BuildingConfig, EnvironmentConfig
+from src.config import (
+    BoundsConfig,
+    BuildingConfig,
+    ChannelAblationMode,
+    EnvironmentConfig,
+)
 from src.env.channel import (
     BuildingPrism,
     ChannelError,
@@ -248,6 +254,72 @@ class PhysicalChannelTests(unittest.TestCase):
         self.assertGreater(np.unique(first.channel[0, 1]).size, 1)
         np.testing.assert_array_equal(np.diagonal(first.channel, axis1=0, axis2=1), 0.0)
 
+    def test_full_channel_matches_pre_ablation_golden_rng_and_numerics(self) -> None:
+        config = EnvironmentConfig()
+        positions = np.array(
+            [
+                [0.0, 0.0, 80.0],
+                [100.0, 0.0, 80.0],
+                [0.0, 150.0, 80.0],
+                [150.0, 150.0, 80.0],
+            ]
+        )
+        rng = make_rng(42, 40)
+        model = PhysicalChannelModel(config, rng)
+        slot_0 = model.reset(positions)
+        slot_1 = model.generate(1, positions)
+
+        digest = lambda values: hashlib.sha256(  # noqa: E731
+            np.ascontiguousarray(values).tobytes()
+        ).hexdigest()
+        self.assertEqual(
+            digest(slot_0.channel),
+            "9f9e0eddb05233884559b259916a546893512c635a8d9d9379397ee24b4cdbe9",
+        )
+        self.assertEqual(
+            digest(slot_0.shadowing_db),
+            "5cc531701fe378461255e395081b2e82f58deae436ed80c29d19ead5e5d7fd1d",
+        )
+        self.assertEqual(
+            digest(slot_0.path_loss_db),
+            "4638b996907a2ff4e4363700e992d5265feeb7362aecc3ab32a4cbb8d7ae4faa",
+        )
+        self.assertEqual(
+            digest(slot_1.channel),
+            "50b22fe9a0633a1747f3a7577db8bbe366e149a367dba258eeda8c5d20b89061",
+        )
+        self.assertEqual(
+            rng.bit_generator.state["state"]["state"],
+            80934111541331465111921140916389443600,
+        )
+
+    def test_simplified_channel_is_seed_independent_and_retains_blockage_loss(self) -> None:
+        building = BuildingConfig("B", 40.0, 60.0, -10.0, 10.0, 100.0)
+        config = environment_config(
+            ru_count=3,
+            channel_ablation_mode=ChannelAblationMode.SIMPLIFIED_DETERMINISTIC,
+            building_layout=(building,),
+        )
+        positions = np.array([[0.0, 0.0, 80.0], [100.0, 0.0, 80.0]])
+        first_rng = make_rng(42, 40)
+        second_rng = make_rng(99, 40)
+        first_state = first_rng.bit_generator.state
+        second_state = second_rng.bit_generator.state
+
+        first = PhysicalChannelModel(config, first_rng).reset(positions)
+        second = PhysicalChannelModel(config, second_rng).reset(positions)
+
+        np.testing.assert_array_equal(first.channel, second.channel)
+        np.testing.assert_array_equal(first.shadowing_db, 0.0)
+        self.assertTrue(first.blocked_links[0, 1])
+        fspl_db = 20.0 * np.log10(
+            4.0 * np.pi * config.carrier_frequency_hz * 100.0 / 299_792_458.0
+        )
+        self.assertAlmostEqual(first.path_loss_db[0, 1], fspl_db + config.building_loss_db)
+        np.testing.assert_array_equal(first.channel[0, 1], first.channel[0, 1, 0])
+        self.assertEqual(first_rng.bit_generator.state, first_state)
+        self.assertEqual(second_rng.bit_generator.state, second_state)
+
     def test_channel_rejects_invalid_distance_and_nonsequential_slot(self) -> None:
         config = environment_config(uav_count=2, ru_count=2)
         duplicate = np.array([[0.0, 0.0, 80.0], [0.0, 0.0, 80.0]])
@@ -310,6 +382,27 @@ class StaleCsiAndHistoryTests(unittest.TestCase):
             abs(first_features.stale_csi[0, 1, 0]),
             abs(channel[0, 1, 0]) * expected_factor,
         )
+
+    def test_simplified_csi_is_current_exact_and_consumes_no_rng(self) -> None:
+        config = environment_config(
+            ru_count=2,
+            fixed_csi_aoi_slots=3,
+            csi_error_std_db=2.0,
+            channel_ablation_mode=ChannelAblationMode.SIMPLIFIED_DETERMINISTIC,
+        )
+        channel = true_channel(config, 3.0 + 0.0j)
+        rng = make_rng(42, 50)
+        rng_state = rng.bit_generator.state
+        history = ChannelHistory(config, rng)
+        history.record_physical_channel(0, channel)
+        features = history.actor_features(0)
+
+        np.testing.assert_array_equal(features.stale_csi, channel)
+        self.assertTrue(np.all(features.csi_valid_mask[~np.eye(2, dtype=bool)]))
+        self.assertTrue(np.all(features.csi_aoi_slots == 0))
+        self.assertEqual(features.stale_csi.shape, channel.shape)
+        self.assertEqual(features.stale_csi.dtype, np.complex128)
+        self.assertEqual(rng.bit_generator.state, rng_state)
 
     def test_actor_stale_tensor_is_a_copy_and_true_channel_is_not_in_feature_contract(self) -> None:
         config = environment_config(ru_count=1, fixed_csi_aoi_slots=0, csi_error_std_db=0.0)

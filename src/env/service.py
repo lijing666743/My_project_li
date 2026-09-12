@@ -8,7 +8,7 @@ from typing import Mapping
 
 import numpy as np
 
-from ..config import RunConfig
+from ..config import ChannelAblationMode, RunConfig
 from .channel import receiver_noise_power_w
 from .energy import (
     ActualEnergyDebit,
@@ -104,6 +104,10 @@ class PhysicalService:
         self.lifecycle = lifecycle
         self.resource_states = dict(resource_states)
         self.noise_power_w = receiver_noise_power_w(config.environment)
+        self._simplified_deterministic = (
+            config.environment.channel_ablation_mode
+            == ChannelAblationMode.SIMPLIFIED_DETERMINISTIC
+        )
 
     def execute(
         self,
@@ -214,18 +218,19 @@ class PhysicalService:
         for ru_one_based in communication.executed_ru_indices:
             ru = ru_one_based - 1
             interference = 0.0
-            for other in all_links:
-                if (
-                    other.sender_uav == sender
-                    and other.receiver_uav == receiver
-                ):
-                    continue
-                if ru_one_based not in other.executed_ru_indices:
-                    continue
-                interference += (
-                    other.per_ru_power_w
-                    * abs(channel[other.sender_uav, receiver, ru]) ** 2
-                )
+            if not self._simplified_deterministic:
+                for other in all_links:
+                    if (
+                        other.sender_uav == sender
+                        and other.receiver_uav == receiver
+                    ):
+                        continue
+                    if ru_one_based not in other.executed_ru_indices:
+                        continue
+                    interference += (
+                        other.per_ru_power_w
+                        * abs(channel[other.sender_uav, receiver, ru]) ** 2
+                    )
             desired = per_ru_power * abs(channel[sender, receiver, ru]) ** 2
             sinr = desired / (self.noise_power_w + interference)
             if not math.isfinite(sinr) or sinr < 0.0:
