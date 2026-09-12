@@ -223,6 +223,39 @@ class AgentCreditMode(str, Enum):
     ROLE_DECOMPOSED = "role_decomposed"
 
 
+class CreditAssignmentMode(str, Enum):
+    """Select terminal-task credit allocation without changing team reward."""
+
+    LEGACY = "legacy"
+    RESPONSIBILITY_TERMINAL = "responsibility_terminal"
+
+
+@dataclass(frozen=True)
+class RewardCreditConfig:
+    """Fixed participant credit parameters; legacy remains the default."""
+
+    credit_assignment_mode: CreditAssignmentMode = CreditAssignmentMode.LEGACY
+    beta_completion_credit: float = 0.5
+    mu_expiration_credit: float = 0.5
+
+    def __post_init__(self) -> None:
+        try:
+            mode = CreditAssignmentMode(self.credit_assignment_mode)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError("reward.credit_assignment_mode is invalid") from exc
+        object.__setattr__(self, "credit_assignment_mode", mode)
+        for name in ("beta_completion_credit", "mu_expiration_credit"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or not 0.0 <= value <= 1.0
+            ):
+                raise ConfigError(f"reward.{name} must be finite and lie in [0, 1]")
+            object.__setattr__(self, name, float(value))
+
+
 class RouteDecoderMode(str, Enum):
     """Select the actor route-logit decoder architecture."""
 
@@ -766,6 +799,7 @@ class RunConfig:
     training: TrainingConfig = field(default_factory=TrainingConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
+    reward: RewardCreditConfig = field(default_factory=RewardCreditConfig)
 
     # Provenance is attached after schema parsing and is deliberately excluded
     # from the resolved config hash.  It is still present in snapshots.
@@ -787,6 +821,10 @@ class RunConfig:
             "git_commit",
             "git_dirty",
         })
+        if self.reward == RewardCreditConfig():
+            # Omitted historical settings must retain their exact identity.
+            # Every non-default mode or coefficient enters the config hash.
+            resolved.pop("reward")
         mappo = resolved.get("training", {}).get("mappo")
         if isinstance(mappo, dict) and self.training.mappo.route_choice_stability_enabled:
             mappo["route_choice_stability_enabled"] = True
@@ -1109,6 +1147,17 @@ class RunConfig:
         if tuple(self.action.cpu_frequency_levels) != (0.0, 0.25, 0.5, 1.0):
             raise ConfigError("action.cpu_frequency_levels must be (0.0, 0.25, 0.5, 1.0)")
         mappo = self.training.mappo
+        if not isinstance(self.reward, RewardCreditConfig):
+            raise ConfigError("reward must be a RewardCreditConfig")
+        if (
+            self.reward.credit_assignment_mode
+            is CreditAssignmentMode.RESPONSIBILITY_TERMINAL
+            and mappo.agent_credit_mode != AgentCreditMode.ROLE_DECOMPOSED
+        ):
+            raise ConfigError(
+                "responsibility_terminal requires "
+                "training.mappo.agent_credit_mode='role_decomposed'"
+            )
         try:
             ActorRatioMode(mappo.actor_ratio_mode)
         except (TypeError, ValueError) as exc:
@@ -1782,6 +1831,7 @@ DEFAULT_CONFIG_DATA: dict[str, Any] = {
     "launch_profile": None,
     "seed": DEFAULT_SEED,
     "environment": asdict(EnvironmentConfig()),
+    "reward": asdict(RewardCreditConfig()),
     "action": asdict(ActionConfig()),
     "reproducibility": asdict(ReproducibilityConfig()),
     "training": {
@@ -2196,6 +2246,7 @@ __all__ = [
     "CHECKPOINT_V1_TRAINING_STATE_FIELDS",
     "CHECKPOINT_V1_TRANSITION_FIELDS",
     "ConfigError",
+    "CreditAssignmentMode",
     "DEFAULT_SEED",
     "EnvironmentConfig",
     "EVALUATION_SNAPSHOT_V1_EXCLUDED_FIELDS",
@@ -2206,6 +2257,7 @@ __all__ = [
     "MAPPO_INITIAL_POLICY_VERSION",
     "OutputConfig",
     "QMIXConfig",
+    "RewardCreditConfig",
     "RouteDecoderMode",
     "RouteCreditMode",
     "RouteEntropySchedulePoint",

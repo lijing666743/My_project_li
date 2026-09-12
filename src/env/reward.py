@@ -13,6 +13,7 @@ import math
 from dataclasses import dataclass
 from typing import Iterable, Mapping
 
+from ..config import CreditAssignmentMode, RewardCreditConfig
 from .tasks import Task, TaskOutcome
 
 
@@ -170,6 +171,54 @@ class RemoteCompletionAttribution:
 
 
 @dataclass(frozen=True)
+class TaskTerminalAttribution:
+    """One settled task's participant shares and lifecycle responsibility."""
+
+    task_id: int
+    source_uav: int
+    destination_uav: int | None
+    terminal_state: str
+    completion_source_share: float
+    completion_destination_share: float
+    expiration_source_share: float
+    expiration_destination_share: float
+    completion_reward: float
+    expiration_penalty: float
+    cpu_entry_slot: int | None
+    service_eligible_slot: int | None
+    deadline_slot: int
+    cpu_service_window: bool
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "task_id": self.task_id,
+            "source_uav": self.source_uav,
+            "destination_uav": self.destination_uav,
+            "terminal_state": self.terminal_state,
+            "completion_allocation": {
+                "source_share": self.completion_source_share,
+                "destination_share": self.completion_destination_share,
+                "source_reward": self.completion_source_share * self.completion_reward,
+                "destination_reward": (
+                    self.completion_destination_share * self.completion_reward
+                ),
+            },
+            "expiration_allocation": {
+                "source_share": self.expiration_source_share,
+                "destination_share": self.expiration_destination_share,
+                "source_penalty": self.expiration_source_share * self.expiration_penalty,
+                "destination_penalty": (
+                    self.expiration_destination_share * self.expiration_penalty
+                ),
+            },
+            "cpu_entry_slot": self.cpu_entry_slot,
+            "service_eligible_slot": self.service_eligible_slot,
+            "deadline_slot": self.deadline_slot,
+            "cpu_service_window": self.cpu_service_window,
+        }
+
+
+@dataclass(frozen=True)
 class AgentRewardTerms:
     """Role-based per-agent accounting that exactly conserves team reward."""
 
@@ -191,6 +240,10 @@ class AgentRewardTerms:
     energy_penalty: tuple[float, ...]
     conservation_residual: float
     remote_completions: tuple[RemoteCompletionAttribution, ...]
+    terminal_attributions: tuple[TaskTerminalAttribution, ...] = ()
+    credit_assignment_mode: str = CreditAssignmentMode.LEGACY.value
+    beta_completion_credit: float = 0.5
+    mu_expiration_credit: float = 0.5
 
     def __post_init__(self) -> None:
         if isinstance(self.uav_count, bool) or not isinstance(self.uav_count, int):
@@ -261,6 +314,10 @@ class AgentRewardTerms:
             "conservation_residual": self.conservation_residual,
             "conservation_tolerance": AGENT_REWARD_CONSERVATION_TOLERANCE,
             "remote_completions": [item.to_dict() for item in self.remote_completions],
+            "terminal_attributions": [item.to_dict() for item in self.terminal_attributions],
+            "credit_assignment_mode": self.credit_assignment_mode,
+            "beta_completion_credit": self.beta_completion_credit,
+            "mu_expiration_credit": self.mu_expiration_credit,
             "destination": destination,
         }
 
@@ -361,9 +418,16 @@ class RewardCalculator:
         agent_transmit_energy_j: Mapping[int, float],
         agent_cpu_energy_j: Mapping[int, float],
         workload_snapshots: Mapping[int, TaskWorkloadSnapshot] | None = None,
+        credit_config: RewardCreditConfig | None = None,
     ) -> AgentRewardTerms:
         """Decompose existing team accounting without redefining its formula."""
 
+        credit = RewardCreditConfig() if credit_config is None else credit_config
+        if not isinstance(credit, RewardCreditConfig):
+            raise TypeError("credit_config must be a RewardCreditConfig")
+        responsibility = (
+            credit.credit_assignment_mode is CreditAssignmentMode.RESPONSIBILITY_TERMINAL
+        )
         if isinstance(uav_count, bool) or not isinstance(uav_count, int) or uav_count <= 0:
             raise RewardError("uav_count must be a positive integer")
         if not isinstance(team_terms, RewardTerms) or team_terms.slot != slot:
@@ -383,35 +447,79 @@ class RewardCalculator:
         communication_parts: list[list[float]] = [[] for _ in range(uav_count)]
         computation_parts: list[list[float]] = [[] for _ in range(uav_count)]
         remote_completions: list[RemoteCompletionAttribution] = []
+        terminal_attributions: list[TaskTerminalAttribution] = []
         refs = self.references
 
         for task in settled:
             source = self._agent_id(task.source_uav, uav_count, "task.source_uav")
-            if task.outcome is TaskOutcome.EXPIRED:
-                expiration_parts[source].append(1.0)
-                continue
             destination = self._agent_id(
                 task.source_uav if task.destination is None else task.destination,
                 uav_count,
                 "task.destination",
             )
-            if destination == source:
-                completion_parts[source].append(1.0)
-                continue
-            communication_reference = task.data_bits / refs.reference_rate_bps
-            computation_reference = task.cpu_cycles / refs.reference_cpu_frequency_hz
-            eta = communication_reference / (
-                communication_reference + computation_reference
+            remote = destination != source
+            # A lifecycle service window is not a claim of sufficient capacity
+            # or actual service. Never gate responsibility on received cycles:
+            # otherwise an executor could avoid it by idling until expiration.
+            cpu_service_window = (
+                remote
+                and task.cpu_entry_slot is not None
+                and task.service_eligible_slot is not None
+                and task.service_eligible_slot <= task.deadline_slot
             )
-            completion_parts[source].append(eta)
-            completion_parts[destination].append(1.0 - eta)
-            remote_completions.append(
-                RemoteCompletionAttribution(
+            completion_source = completion_destination = 0.0
+            expiration_source = expiration_destination = 0.0
+            if task.outcome is TaskOutcome.EXPIRED:
+                expiration_destination = (
+                    credit.mu_expiration_credit
+                    if responsibility and cpu_service_window
+                    else 0.0
+                )
+                expiration_source = 1.0 - expiration_destination
+                expiration_parts[source].append(expiration_source)
+                if remote:
+                    expiration_parts[destination].append(expiration_destination)
+            elif not remote:
+                completion_source = 1.0
+                completion_parts[source].append(completion_source)
+            else:
+                communication_reference = task.data_bits / refs.reference_rate_bps
+                computation_reference = task.cpu_cycles / refs.reference_cpu_frequency_hz
+                eta = communication_reference / (
+                    communication_reference + computation_reference
+                )
+                completion_source = eta
+                if responsibility:
+                    beta = credit.beta_completion_credit
+                    completion_source = (1.0 - beta) * eta + beta / 2.0
+                completion_destination = 1.0 - completion_source
+                completion_parts[source].append(completion_source)
+                completion_parts[destination].append(completion_destination)
+                remote_completions.append(
+                    RemoteCompletionAttribution(
+                        task_id=task.task_id,
+                        source_uav=source,
+                        destination_uav=destination,
+                        source_share=completion_source,
+                        destination_share=completion_destination,
+                    )
+                )
+            terminal_attributions.append(
+                TaskTerminalAttribution(
                     task_id=task.task_id,
                     source_uav=source,
-                    destination_uav=destination,
-                    source_share=eta,
-                    destination_share=1.0 - eta,
+                    destination_uav=task.destination,
+                    terminal_state=task.outcome.name,
+                    completion_source_share=completion_source,
+                    completion_destination_share=completion_destination,
+                    expiration_source_share=expiration_source,
+                    expiration_destination_share=expiration_destination,
+                    completion_reward=self.weights.completion / refs.task_count_reference,
+                    expiration_penalty=self.weights.expiration / refs.task_count_reference,
+                    cpu_entry_slot=task.cpu_entry_slot,
+                    service_eligible_slot=task.service_eligible_slot,
+                    deadline_slot=task.deadline_slot,
+                    cpu_service_window=cpu_service_window,
                 )
             )
 
@@ -521,6 +629,10 @@ class RewardCalculator:
             energy_penalty=energy_penalty,
             conservation_residual=residual,
             remote_completions=tuple(remote_completions),
+            terminal_attributions=tuple(terminal_attributions),
+            credit_assignment_mode=credit.credit_assignment_mode.value,
+            beta_completion_credit=credit.beta_completion_credit,
+            mu_expiration_credit=credit.mu_expiration_credit,
         )
 
     @staticmethod
@@ -636,6 +748,7 @@ __all__ = [
     "RewardReferences",
     "RewardTerms",
     "RewardWeights",
+    "TaskTerminalAttribution",
     "TaskWorkloadSnapshot",
     "compute_reward",
 ]

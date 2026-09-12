@@ -628,6 +628,7 @@ class U2UMECEnvironment:
                     for debit in physical.energy_debits
                 },
                 workload_snapshots=reward_workload_snapshots,
+                credit_config=self.config.reward,
             )
         slot_outage = self._update_rate_and_outage_history(physical)
         self.channel_history.update_with_measurement(
