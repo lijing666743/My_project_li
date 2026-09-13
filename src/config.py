@@ -268,6 +268,7 @@ class RouteDecoderMode(str, Enum):
 
     LEGACY = "legacy"
     CANDIDATE_AWARE_V1 = "candidate_aware_v1"
+    OPTION_AWARE_V1 = "option_aware_v1"
 
 
 class RouteCreditMode(str, Enum):
@@ -1221,11 +1222,15 @@ class RunConfig:
                 f"got {mappo.route_credit_mode!r}"
             ) from exc
         if (
-            route_decoder_mode is RouteDecoderMode.CANDIDATE_AWARE_V1
+            route_decoder_mode
+            in {
+                RouteDecoderMode.CANDIDATE_AWARE_V1,
+                RouteDecoderMode.OPTION_AWARE_V1,
+            }
             and route_credit_mode is not RouteCreditMode.SHARED_GAE
         ):
             raise ConfigError(
-                "candidate_aware_v1 requires "
+                f"{route_decoder_mode.value} requires "
                 "training.mappo.route_credit_mode=shared_gae"
             )
         if not isinstance(mappo.route_choice_stability_enabled, bool):

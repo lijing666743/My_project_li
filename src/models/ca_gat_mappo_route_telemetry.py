@@ -24,6 +24,7 @@ from ..env.tasks import Task, TaskOutcome
 from .ca_gat_mappo import (
     ACTION_BRANCH_ORDER,
     CandidateAwareRouteDecoderV1,
+    OptionAwareRouteDecoderV1,
 )
 from .ca_gat_mappo_actions import (
     SequentialActionDistributionOutput,
@@ -735,12 +736,111 @@ def _candidate_route_gradient_rows(
     return tuple(rows)
 
 
+def _option_route_gradient_rows(
+    route_head: OptionAwareRouteDecoderV1,
+    route_domains: Any,
+) -> tuple[RouteHeadGradientRowTelemetry, ...]:
+    domains = list(route_domains or ())
+    if domains and isinstance(domains[0], str):
+        domains = [tuple(domains)]
+
+    def row(
+        *,
+        row_index: int,
+        semantic_role: str,
+        destinations: tuple[int, ...],
+        weight_gradient: Tensor | None,
+        bias_gradient: Tensor | None,
+    ) -> RouteHeadGradientRowTelemetry:
+        measurement = _gradient_tensor_measurement(weight_gradient)
+        bias_value = (
+            None
+            if bias_gradient is None
+            else float(bias_gradient.detach().reshape(-1)[0].cpu().item())
+        )
+        return RouteHeadGradientRowTelemetry(
+            row_index=row_index,
+            semantic_role=semantic_role,
+            destination_uavs=destinations,
+            grad_status=measurement.status,
+            grad_norm=measurement.norm,
+            grad_mean=measurement.mean,
+            grad_signed_sum=measurement.signed_sum,
+            bias_grad=bias_value,
+            parameter_update_direction_mean=(
+                -measurement.mean if measurement.mean is not None else None
+            ),
+            parameter_update_direction_signed_sum=(
+                -measurement.signed_sum
+                if measurement.signed_sum is not None
+                else None
+            ),
+            bias_update_direction=(
+                -bias_value if bias_value is not None else None
+            ),
+        )
+
+    control_weight = route_head.control_head.weight.grad
+    control_bias = route_head.control_head.bias.grad
+    rows = [
+        row(
+            row_index=0,
+            semantic_role="idle",
+            destinations=(),
+            weight_gradient=(
+                None if control_weight is None else control_weight[0]
+            ),
+            bias_gradient=None if control_bias is None else control_bias[0],
+        ),
+        row(
+            row_index=2,
+            semantic_role="defer",
+            destinations=(),
+            weight_gradient=(
+                None if control_weight is None else control_weight[1]
+            ),
+            bias_gradient=None if control_bias is None else control_bias[1],
+        ),
+    ]
+    destinations = tuple(
+        sorted(
+            {
+                value
+                for domain in domains
+                for value in domain
+                if isinstance(value, int) and not isinstance(value, bool)
+            }
+            or set(range(route_head.uav_count))
+        )
+    )
+    final_scorer = route_head.shared_option_scorer[-1]
+    if not isinstance(final_scorer, nn.Linear) or final_scorer.bias is None:
+        raise RouteTelemetryError("option-aware shared scorer has an invalid final layer")
+    rows.insert(
+        1,
+        row(
+            row_index=1,
+            semantic_role="local_remote_shared",
+            destinations=destinations,
+            weight_gradient=(
+                None
+                if final_scorer.weight.grad is None
+                else final_scorer.weight.grad[0]
+            ),
+            bias_gradient=final_scorer.bias.grad,
+        ),
+    )
+    return tuple(rows)
+
+
 def measure_route_head_gradients(
     route_head: nn.Module, route_domains: Any = None
 ) -> RouteHeadGradientTelemetry:
     """Read existing route-head gradients without changing or clipping them."""
 
-    if isinstance(route_head, CandidateAwareRouteDecoderV1):
+    if isinstance(
+        route_head, (CandidateAwareRouteDecoderV1, OptionAwareRouteDecoderV1)
+    ):
         named_parameters = tuple(route_head.named_parameters())
         weight_parameters = tuple(
             parameter
@@ -759,11 +859,16 @@ def measure_route_head_gradients(
                 total=_aggregate_gradient_measurement(
                     tuple(parameter for _, parameter in named_parameters)
                 ),
-                rows=_candidate_route_gradient_rows(route_head, route_domains),
+                rows=(
+                    _candidate_route_gradient_rows(route_head, route_domains)
+                    if isinstance(route_head, CandidateAwareRouteDecoderV1)
+                    else _option_route_gradient_rows(route_head, route_domains)
+                ),
             )
     if not isinstance(route_head, nn.Linear) or route_head.bias is None:
         raise TypeError(
-            "route_head must be a Linear or CandidateAwareRouteDecoderV1"
+            "route_head must be a Linear, CandidateAwareRouteDecoderV1, "
+            "or OptionAwareRouteDecoderV1"
         )
     with torch.no_grad():
         weight = _gradient_measurement(route_head.weight)
@@ -795,6 +900,9 @@ def measure_route_head_gradient_rows(
     if isinstance(route_head, CandidateAwareRouteDecoderV1):
         with torch.no_grad():
             return _candidate_route_gradient_rows(route_head, route_domains)
+    if isinstance(route_head, OptionAwareRouteDecoderV1):
+        with torch.no_grad():
+            return _option_route_gradient_rows(route_head, route_domains)
     if not isinstance(route_head, nn.Linear) or route_head.bias is None:
         raise TypeError("route_head has an unsupported module type")
     domains = list(route_domains or ())

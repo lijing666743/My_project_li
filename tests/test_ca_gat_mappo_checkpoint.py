@@ -14,7 +14,10 @@ import torch
 from src.config import (
     CHECKPOINT_KIND_FINAL_COMPLETED,
     CHECKPOINT_KIND_PERIODIC_RESUME,
+    CHECKPOINT_SCHEMA_VERSION,
+    ChannelAblationMode,
     RunConfig,
+    RouteDecoderMode,
 )
 from src.models.ca_gat_mappo import (
     ActorObservationTensorizer,
@@ -36,6 +39,7 @@ from src.models.ca_gat_mappo_checkpoint import (
     serialize_active_rollout,
     serialize_rollout_transition,
     validate_checkpoint_payload,
+    validate_periodic_checkpoint_compatibility,
 )
 from src.models.ca_gat_mappo_rollout import CAGATMAPPORolloutBuffer
 from src.models.ca_gat_mappo_trainer import (
@@ -395,6 +399,85 @@ class StructuredCheckpointTests(unittest.TestCase):
                 )
             self.assertEqual(proposals_a, proposals_b)
             self.assertTrue(torch.equal(first.get_state(), second.get_state()))
+
+
+class CheckpointIdentityRegressionTests(unittest.TestCase):
+    """Keep historical default elision strict and narrowly scoped."""
+
+    def _payload(self, current: RunConfig, source: RunConfig) -> dict:
+        snapshot = copy.deepcopy(source.snapshot_dict())
+        snapshot["_metadata"]["config_hash"] = current.config_hash
+        snapshot["_metadata"]["run_id"] = current.run_id
+        return {
+            "schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "checkpoint_kind": CHECKPOINT_KIND_PERIODIC_RESUME,
+            "method_id": current.method_id,
+            "git_commit": current.git_commit,
+            "config_hash": current.config_hash,
+            "config_snapshot": snapshot,
+            "runtime_provenance": {
+                "device_type": "cpu",
+                "dtype": "torch.float32",
+            },
+        }
+
+    def _config(self, *, channel: ChannelAblationMode, route: RouteDecoderMode) -> RunConfig:
+        base = make_checkpoint_config(Path("identity-regression"))
+        config = replace(
+            base,
+            environment=replace(base.environment, channel_ablation_mode=channel),
+            training=replace(
+                base.training,
+                mappo=replace(base.training.mappo, route_decoder_mode=route),
+            ),
+        )
+        config.validate()
+        return config
+
+    def _validate(self, current: RunConfig, source: RunConfig) -> None:
+        payload = self._payload(current, source)
+        with patch(
+            "src.models.ca_gat_mappo_checkpoint.validate_checkpoint_payload",
+            side_effect=lambda value, config=None: value,
+        ):
+            validate_periodic_checkpoint_compatibility(
+                current,
+                payload,
+                dtype=torch.float32,
+                cuda_available=False,
+            )
+
+    def test_default_channel_elision_and_decoder_identity_are_strict(self) -> None:
+        legacy_full = self._config(
+            channel=ChannelAblationMode.FULL,
+            route=RouteDecoderMode.LEGACY,
+        )
+        simplified_legacy = self._config(
+            channel=ChannelAblationMode.SIMPLIFIED_DETERMINISTIC,
+            route=RouteDecoderMode.LEGACY,
+        )
+        option_full = self._config(
+            channel=ChannelAblationMode.FULL,
+            route=RouteDecoderMode.OPTION_AWARE_V1,
+        )
+
+        with self.subTest(case="full snapshot vs omitted canonical default"):
+            self._validate(legacy_full, legacy_full)
+        with self.subTest(case="simplified snapshot vs omitted canonical default"):
+            with self.assertRaisesRegex(
+                CheckpointError, "checkpoint config snapshot differs"
+            ):
+                self._validate(legacy_full, simplified_legacy)
+        with self.subTest(case="full snapshot vs simplified current config"):
+            with self.assertRaisesRegex(
+                CheckpointError, "checkpoint config snapshot differs"
+            ):
+                self._validate(simplified_legacy, legacy_full)
+        with self.subTest(case="legacy snapshot vs option-aware current config"):
+            with self.assertRaisesRegex(
+                CheckpointError, "route_decoder_mode mismatch"
+            ):
+                self._validate(option_full, legacy_full)
 
 
 class AtomicAndCompatibilityTests(unittest.TestCase):

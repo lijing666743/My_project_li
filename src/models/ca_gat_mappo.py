@@ -44,6 +44,260 @@ ACTION_BRANCH_DEPENDENCIES: Mapping[str, tuple[str, ...]] = {
 }
 _ACTIVE_TASK_STATUSES = ("unbound", "local", "tx", "cpu")
 _QUEUE_KINDS = ("unbound", "local", "tx", "cpu")
+_SELF_RESOURCE_FEATURE_DIM = 9
+_QUEUE_SUMMARY_FEATURE_DIM = 8
+_PUBLIC_FEATURE_DIM = 17
+_TASK_OPTION_FEATURE_DIM = 5
+_SOURCE_OPTION_FEATURE_DIM = 14
+_BURDEN_OPTION_FEATURE_DIM = 10
+_OPTION_VALIDITY_FEATURE_DIM = 4
+
+
+class RouteOptionFeatureExtractor:
+    """Central semantic view over the frozen actor tensor layouts."""
+
+    _RESOURCE = {
+        "residual_energy_ratio": 2,
+        "max_transmit_power_ratio": 4,
+        "max_cpu_frequency_ratio": 6,
+        "cpu_coefficient_ratio": 8,
+    }
+    _QUEUE = {
+        "task_count": 0,
+        "remaining_bits": 1,
+        "remaining_cycles": 2,
+        "head_remaining_bits": 4,
+        "head_remaining_cycles": 5,
+        "head_slack": 6,
+        "head_valid": 7,
+    }
+    _PUBLIC = {
+        "valid": 0,
+        "max_cpu_frequency_ratio": 10,
+        "cpu_load_task_count": 12,
+        "cpu_load_remaining_cycles": 13,
+    }
+    _EDGE = {
+        "visible": 0,
+        "last_rate": -4,
+        "last_rate_valid": -3,
+        "outage_rate": -2,
+        "outage_valid": -1,
+    }
+
+    def __init__(self, spec: "MAPPOTensorSpec") -> None:
+        self.uav_count = spec.uav_count
+        self.self_feature_dim = spec.self_feature_dim
+        self.public_feature_dim = spec.neighbor_public_feature_dim
+        self.edge_feature_dim = spec.edge_feature_dim
+        expected_self = (
+            _SELF_RESOURCE_FEATURE_DIM
+            + 2 * _QUEUE_SUMMARY_FEATURE_DIM
+            + 2 * self.uav_count * _QUEUE_SUMMARY_FEATURE_DIM
+            + 2
+            + 2 * self.uav_count
+            + sum(spec.action_dimensions.values())
+            + 2 * self.uav_count
+            + 7
+        )
+        if self.self_feature_dim != expected_self:
+            raise MAPPONetworkError(
+                "route option extractor differs from the frozen self-feature layout"
+            )
+        if self.public_feature_dim != _PUBLIC_FEATURE_DIM:
+            raise MAPPONetworkError(
+                "route option extractor differs from the frozen public-feature layout"
+            )
+        if self.edge_feature_dim < 4:
+            raise MAPPONetworkError("route option extractor requires edge history tails")
+
+        self.unbound_start = _SELF_RESOURCE_FEATURE_DIM
+        self.local_start = self.unbound_start + _QUEUE_SUMMARY_FEATURE_DIM
+        self.tx_start = self.local_start + _QUEUE_SUMMARY_FEATURE_DIM
+        self.cpu_start = self.tx_start + self.uav_count * _QUEUE_SUMMARY_FEATURE_DIM
+        self.arrival_start = self.cpu_start + self.uav_count * _QUEUE_SUMMARY_FEATURE_DIM
+
+    @staticmethod
+    def _safe_pressure(
+        queued_cycles: Tensor,
+        task_cycles: Tensor,
+        cpu_ratio: Tensor,
+        valid: Tensor,
+    ) -> Tensor:
+        epsilon = torch.finfo(cpu_ratio.dtype).eps
+        pressure = (queued_cycles + task_cycles) / cpu_ratio.clamp_min(epsilon)
+        return torch.where(valid > 0.5, pressure, torch.zeros_like(pressure))
+
+    def _queue(self, self_features: Tensor, start: int) -> Tensor:
+        return self_features[..., start : start + _QUEUE_SUMMARY_FEATURE_DIM]
+
+    def _indexed_queues(self, self_features: Tensor, start: int) -> Tensor:
+        end = start + self.uav_count * _QUEUE_SUMMARY_FEATURE_DIM
+        return self_features[..., start:end].reshape(
+            *self_features.shape[:-1],
+            self.uav_count,
+            _QUEUE_SUMMARY_FEATURE_DIM,
+        )
+
+    def _gather_candidates(self, values: Tensor, candidate_ids: Tensor) -> Tensor:
+        batch, time, agents, _, features = values.shape
+        index = candidate_ids.view(
+            1, 1, agents, self.uav_count - 1, 1
+        ).expand(batch, time, agents, self.uav_count - 1, features)
+        return torch.gather(values, -2, index)
+
+    def extract(
+        self,
+        self_features: Tensor,
+        public_features: Tensor,
+        edge_features: Tensor,
+        candidate_ids: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Return task/source plus aligned local and remote burden blocks."""
+
+        if self_features.ndim != 4 or self_features.shape[-1] != self.self_feature_dim:
+            raise MAPPONetworkError("route option self features have an invalid shape")
+        batch, time, agents, _ = self_features.shape
+        expected_public = (
+            batch,
+            time,
+            agents,
+            self.uav_count,
+            self.public_feature_dim,
+        )
+        expected_edge = (
+            batch,
+            time,
+            agents,
+            self.uav_count,
+            self.edge_feature_dim,
+        )
+        if agents != self.uav_count or tuple(public_features.shape) != expected_public:
+            raise MAPPONetworkError("route option public features have an invalid shape")
+        if tuple(edge_features.shape) != expected_edge:
+            raise MAPPONetworkError("route option edge features have an invalid shape")
+        if tuple(candidate_ids.shape) != (self.uav_count, self.uav_count - 1):
+            raise MAPPONetworkError("route option candidate IDs have an invalid shape")
+
+        resources = self_features[..., :_SELF_RESOURCE_FEATURE_DIM]
+        unbound = self._queue(self_features, self.unbound_start)
+        local = self._queue(self_features, self.local_start)
+        tx = self._indexed_queues(self_features, self.tx_start)
+        arrival = self_features[..., self.arrival_start : self.arrival_start + 2]
+
+        task_bits = unbound[..., self._QUEUE["head_remaining_bits"]]
+        task_cycles = unbound[..., self._QUEUE["head_remaining_cycles"]]
+        task_valid = unbound[..., self._QUEUE["head_valid"]]
+        epsilon = torch.finfo(task_bits.dtype).eps
+        cycles_per_bit = torch.where(
+            (task_valid > 0.5) & (task_bits > epsilon),
+            task_cycles / task_bits.clamp_min(epsilon),
+            torch.zeros_like(task_bits),
+        )
+        task = torch.stack(
+            [
+                task_bits,
+                task_cycles,
+                cycles_per_bit,
+                unbound[..., self._QUEUE["head_slack"]],
+                task_valid,
+            ],
+            dim=-1,
+        )
+
+        source = torch.stack(
+            [
+                resources[..., self._RESOURCE["residual_energy_ratio"]],
+                resources[..., self._RESOURCE["max_transmit_power_ratio"]],
+                resources[..., self._RESOURCE["max_cpu_frequency_ratio"]],
+                resources[..., self._RESOURCE["cpu_coefficient_ratio"]],
+                local[..., self._QUEUE["task_count"]],
+                local[..., self._QUEUE["remaining_cycles"]],
+                local[..., self._QUEUE["head_remaining_cycles"]],
+                local[..., self._QUEUE["head_slack"]],
+                local[..., self._QUEUE["head_valid"]],
+                unbound[..., self._QUEUE["task_count"]],
+                unbound[..., self._QUEUE["remaining_bits"]],
+                unbound[..., self._QUEUE["remaining_cycles"]],
+                arrival[..., 0],
+                arrival[..., 1],
+            ],
+            dim=-1,
+        )
+
+        local_cpu = resources[..., self._RESOURCE["max_cpu_frequency_ratio"]]
+        local_pressure = self._safe_pressure(
+            local[..., self._QUEUE["remaining_cycles"]],
+            task_cycles,
+            local_cpu,
+            torch.ones_like(task_valid),
+        )
+        zeros = torch.zeros_like(task_cycles)
+        local_burden = torch.stack(
+            [
+                local[..., self._QUEUE["task_count"]],
+                local[..., self._QUEUE["remaining_cycles"]],
+                task_cycles,
+                local_cpu,
+                local_pressure,
+                zeros,
+                zeros,
+                zeros,
+                zeros,
+                zeros,
+            ],
+            dim=-1,
+        )
+        local_validity = torch.stack(
+            [task_valid, torch.ones_like(task_valid), zeros, zeros], dim=-1
+        )
+
+        remote_public = self._gather_candidates(public_features, candidate_ids)
+        remote_edge = self._gather_candidates(edge_features, candidate_ids)
+        remote_tx = self._gather_candidates(tx, candidate_ids)
+        remote_task_cycles = task_cycles.unsqueeze(-1).expand(
+            batch, time, agents, self.uav_count - 1
+        )
+        endpoint_valid = remote_public[..., self._PUBLIC["valid"]]
+        remote_cpu = remote_public[..., self._PUBLIC["max_cpu_frequency_ratio"]]
+        remote_pressure = self._safe_pressure(
+            remote_public[..., self._PUBLIC["cpu_load_remaining_cycles"]],
+            remote_task_cycles,
+            remote_cpu,
+            endpoint_valid,
+        )
+        remote_burden = torch.stack(
+            [
+                remote_public[..., self._PUBLIC["cpu_load_task_count"]],
+                remote_public[..., self._PUBLIC["cpu_load_remaining_cycles"]],
+                remote_task_cycles,
+                remote_cpu,
+                remote_pressure,
+                remote_tx[..., self._QUEUE["remaining_bits"]],
+                remote_edge[..., self._EDGE["last_rate"]],
+                remote_edge[..., self._EDGE["last_rate_valid"]],
+                remote_edge[..., self._EDGE["outage_rate"]],
+                remote_edge[..., self._EDGE["outage_valid"]],
+            ],
+            dim=-1,
+        )
+        remote_validity = torch.stack(
+            [
+                task_valid.unsqueeze(-1).expand_as(endpoint_valid),
+                endpoint_valid,
+                remote_edge[..., self._EDGE["visible"]],
+                remote_edge[..., self._EDGE["last_rate_valid"]],
+            ],
+            dim=-1,
+        )
+        return (
+            task,
+            source,
+            local_burden,
+            remote_burden,
+            local_validity,
+            remote_validity,
+        )
 
 
 def _derived_torch_seed(master_seed: int) -> int:
@@ -864,7 +1118,9 @@ class CAGATv2Layer(nn.Module):
         neighbor_public_state: Tensor,
         edge_features: Tensor,
         neighbor_mask: Tensor,
-    ) -> Tensor:
+        *,
+        return_candidate_values: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor, Tensor]:
         if self_state.ndim != 2:
             raise MAPPONetworkError("CA-GAT self state must be [item,hidden]")
         items, hidden = self_state.shape
@@ -881,6 +1137,8 @@ class CAGATv2Layer(nn.Module):
             raise MAPPONetworkError("CA-GAT neighbor mask mismatch")
 
         outputs: list[Tensor] = []
+        self_values: list[Tensor] = []
+        candidate_values: list[Tensor] = []
         for head in range(self.heads):
             edge_state = self.edge_projection[head](edge_features)
             neighbor_pair = torch.cat([neighbor_public_state, edge_state], dim=-1)
@@ -895,6 +1153,9 @@ class CAGATv2Layer(nn.Module):
             self_pair = torch.cat([self_state, self_edge], dim=-1)
             self_key = self.key[head](self_pair)
             self_value = self.value[head](self_pair)
+            if return_candidate_values:
+                self_values.append(self_value)
+                candidate_values.append(value)
             self_score = torch.sum(
                 self.attention_vector[head]
                 * torch.nn.functional.leaky_relu(query + self_key),
@@ -920,7 +1181,14 @@ class CAGATv2Layer(nn.Module):
             outputs.append(torch.sum(attention[..., None] * all_values, dim=1))
         aggregate = torch.cat(outputs, dim=-1)
         update = torch.nn.functional.leaky_relu(self.output_projection(aggregate))
-        return self.normalization(self_state + update)
+        result = self.normalization(self_state + update)
+        if return_candidate_values:
+            return (
+                result,
+                torch.cat(self_values, dim=-1),
+                torch.cat(candidate_values, dim=-1),
+            )
+        return result
 
 
 class CandidateAwareRouteDecoderV1(nn.Module):
@@ -1055,6 +1323,209 @@ class CandidateAwareRouteDecoderV1(nn.Module):
         return logits
 
 
+class OptionAwareRouteDecoderV1(nn.Module):
+    """Score Local and every Remote option with one shared final scorer."""
+
+    _BLOCK_DIMENSION = 32
+    _OPTION_TYPE_DIMENSION = 8
+    _SCORER_HIDDEN_DIMENSION = 64
+
+    def __init__(self, *, spec: MAPPOTensorSpec) -> None:
+        super().__init__()
+        if spec.uav_count < 2:
+            raise MAPPONetworkError(
+                "option-aware decoder requires at least two UAVs"
+            )
+        self.uav_count = spec.uav_count
+        self.recurrent_dimension = spec.gru_hidden_dimension
+        self.option_dimension = spec.encoder_hidden_dimension
+        self.feature_extractor = RouteOptionFeatureExtractor(spec)
+
+        def projection(input_dimension: int) -> nn.Sequential:
+            return nn.Sequential(
+                nn.Linear(input_dimension, self._BLOCK_DIMENSION),
+                nn.LayerNorm(self._BLOCK_DIMENSION),
+                nn.LeakyReLU(),
+            )
+
+        self.recurrent_projection = projection(self.recurrent_dimension)
+        self.cooperative_projection = projection(self.option_dimension)
+        self.task_projection = projection(_TASK_OPTION_FEATURE_DIM)
+        self.source_projection = projection(_SOURCE_OPTION_FEATURE_DIM)
+        self.endpoint_projection = projection(self.option_dimension)
+        self.burden_projection = projection(_BURDEN_OPTION_FEATURE_DIM)
+        self.option_type_embedding = nn.Embedding(2, self._OPTION_TYPE_DIMENSION)
+        fusion_dimension = (
+            6 * self._BLOCK_DIMENSION
+            + self._OPTION_TYPE_DIMENSION
+            + _OPTION_VALIDITY_FEATURE_DIM
+        )
+        self.fusion_normalization = nn.LayerNorm(fusion_dimension)
+        self.shared_option_scorer = nn.Sequential(
+            nn.Linear(fusion_dimension, self._SCORER_HIDDEN_DIMENSION),
+            nn.LeakyReLU(),
+            nn.Linear(self._SCORER_HIDDEN_DIMENSION, 1),
+        )
+        self.control_head = nn.Linear(self.recurrent_dimension, 2)
+        self.register_buffer(
+            "remote_candidate_ids",
+            torch.tensor(
+                [
+                    [candidate for candidate in range(self.uav_count) if candidate != ego]
+                    for ego in range(self.uav_count)
+                ],
+                dtype=torch.long,
+            ),
+            persistent=False,
+        )
+
+    def _gather_remote_endpoints(self, candidate_endpoints: Tensor) -> Tensor:
+        batch, time, agents, _, features = candidate_endpoints.shape
+        index = self.remote_candidate_ids.view(
+            1, 1, agents, self.uav_count - 1, 1
+        ).expand(batch, time, agents, self.uav_count - 1, features)
+        return torch.gather(candidate_endpoints, -2, index)
+
+    def forward(
+        self,
+        recurrent_features: Tensor,
+        cooperative_features: Tensor,
+        local_endpoint_features: Tensor,
+        candidate_endpoint_features: Tensor,
+        self_features: Tensor,
+        candidate_public_features: Tensor,
+        candidate_edge_features: Tensor,
+    ) -> Tensor:
+        if recurrent_features.ndim != 4:
+            raise MAPPONetworkError(
+                "option-aware recurrent features must be [batch,time,agent,hidden]"
+            )
+        batch, time, agents, recurrent_dimension = recurrent_features.shape
+        common_shape = (batch, time, agents)
+        expected_shapes = (
+            (cooperative_features, (*common_shape, self.option_dimension)),
+            (local_endpoint_features, (*common_shape, self.option_dimension)),
+            (
+                candidate_endpoint_features,
+                (*common_shape, self.uav_count, self.option_dimension),
+            ),
+            (self_features, (*common_shape, self.feature_extractor.self_feature_dim)),
+            (
+                candidate_public_features,
+                (
+                    *common_shape,
+                    self.uav_count,
+                    self.feature_extractor.public_feature_dim,
+                ),
+            ),
+            (
+                candidate_edge_features,
+                (
+                    *common_shape,
+                    self.uav_count,
+                    self.feature_extractor.edge_feature_dim,
+                ),
+            ),
+        )
+        if agents != self.uav_count or recurrent_dimension != self.recurrent_dimension:
+            raise MAPPONetworkError(
+                "option-aware recurrent features differ from decoder spec"
+            )
+        if any(tuple(tensor.shape) != shape for tensor, shape in expected_shapes):
+            raise MAPPONetworkError("option-aware input features differ from decoder spec")
+        tensors = (recurrent_features,) + tuple(
+            tensor for tensor, _ in expected_shapes
+        )
+        if any(not tensor.is_floating_point() for tensor in tensors):
+            raise MAPPONetworkError("option-aware inputs must be floating tensors")
+        if any(
+            tensor.device != recurrent_features.device
+            or tensor.dtype != recurrent_features.dtype
+            for tensor in tensors[1:]
+        ):
+            raise MAPPONetworkError(
+                "option-aware inputs must share device and dtype"
+            )
+        if any(not torch.isfinite(tensor).all() for tensor in tensors):
+            raise MAPPONetworkError("option-aware inputs contain NaN or Inf")
+
+        (
+            task_features,
+            source_features,
+            local_burden,
+            remote_burden,
+            local_validity,
+            remote_validity,
+        ) = self.feature_extractor.extract(
+            self_features,
+            candidate_public_features,
+            candidate_edge_features,
+            self.remote_candidate_ids,
+        )
+        remote_endpoints = self._gather_remote_endpoints(
+            candidate_endpoint_features
+        )
+        option_endpoints = torch.cat(
+            [local_endpoint_features.unsqueeze(-2), remote_endpoints], dim=-2
+        )
+        option_burdens = torch.cat(
+            [local_burden.unsqueeze(-2), remote_burden], dim=-2
+        )
+        option_validity = torch.cat(
+            [local_validity.unsqueeze(-2), remote_validity], dim=-2
+        )
+        option_count = self.uav_count
+
+        def expand_options(features: Tensor) -> Tensor:
+            return features.unsqueeze(-2).expand(
+                batch, time, agents, option_count, features.shape[-1]
+            )
+
+        option_type_ids = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.long, device=recurrent_features.device),
+                torch.ones(
+                    option_count - 1,
+                    dtype=torch.long,
+                    device=recurrent_features.device,
+                ),
+            ]
+        )
+        option_types = self.option_type_embedding(option_type_ids).view(
+            1, 1, 1, option_count, self._OPTION_TYPE_DIMENSION
+        ).expand(batch, time, agents, -1, -1)
+        fused = self.fusion_normalization(
+            torch.cat(
+                [
+                    expand_options(self.recurrent_projection(recurrent_features)),
+                    expand_options(self.cooperative_projection(cooperative_features)),
+                    expand_options(self.task_projection(task_features)),
+                    expand_options(self.source_projection(source_features)),
+                    self.endpoint_projection(option_endpoints),
+                    self.burden_projection(option_burdens),
+                    option_types,
+                    option_validity,
+                ],
+                dim=-1,
+            )
+        )
+        option_logits = self.shared_option_scorer(fused).squeeze(-1)
+        control_logits = self.control_head(recurrent_features)
+        logits = torch.cat(
+            [
+                control_logits[..., :1],
+                option_logits[..., :1],
+                control_logits[..., 1:],
+                option_logits[..., 1:],
+            ],
+            dim=-1,
+        )
+        expected_logits = (batch, time, agents, self.uav_count + 2)
+        if tuple(logits.shape) != expected_logits or not torch.isfinite(logits).all():
+            raise MAPPONetworkError("option-aware route logits are invalid")
+        return logits
+
+
 @dataclass(frozen=True)
 class ActorNetworkOutput:
     """Raw seven-head logits, validated masks, and recurrent output."""
@@ -1137,12 +1608,18 @@ class CAGATMAPPOActor(nn.Module):
             route_head: nn.Module
             if self.route_decoder_mode is RouteDecoderMode.LEGACY:
                 route_head = legacy_route_head
-            else:
+            elif self.route_decoder_mode is RouteDecoderMode.CANDIDATE_AWARE_V1:
                 route_head = CandidateAwareRouteDecoderV1(
                     uav_count=self.spec.uav_count,
                     recurrent_dimension=self.spec.gru_hidden_dimension,
                     candidate_dimension=self.spec.encoder_hidden_dimension,
                     edge_dimension=self.spec.edge_feature_dim,
+                )
+            elif self.route_decoder_mode is RouteDecoderMode.OPTION_AWARE_V1:
+                route_head = OptionAwareRouteDecoderV1(spec=self.spec)
+            else:
+                raise MAPPONetworkError(
+                    f"unsupported route decoder mode {self.route_decoder_mode.value!r}"
                 )
             self.action_heads = nn.ModuleDict(
                 {"route": route_head, **non_route_heads}
@@ -1173,8 +1650,13 @@ class CAGATMAPPOActor(nn.Module):
     def route_logits(
         self,
         recurrent_features: Tensor,
-        candidate_public_features: Tensor,
-        candidate_edge_features: Tensor,
+        candidate_public_features: Tensor | None = None,
+        candidate_edge_features: Tensor | None = None,
+        *,
+        cooperative_features: Tensor | None = None,
+        local_endpoint_features: Tensor | None = None,
+        candidate_endpoint_features: Tensor | None = None,
+        self_features: Tensor | None = None,
     ) -> Tensor:
         """Return raw route logits for the configured decoder architecture."""
 
@@ -1191,17 +1673,50 @@ class CAGATMAPPOActor(nn.Module):
             if not isinstance(route_head, nn.Linear):
                 raise MAPPONetworkError("legacy route decoder must be Linear")
             logits = route_head(recurrent_features)
-        else:
+        elif self.route_decoder_mode is RouteDecoderMode.CANDIDATE_AWARE_V1:
             route_decoder = self.route_decoder
             if not isinstance(route_decoder, CandidateAwareRouteDecoderV1):
                 raise MAPPONetworkError(
                     "candidate-aware route decoder has an invalid module type"
+                )
+            if candidate_public_features is None or candidate_edge_features is None:
+                raise MAPPONetworkError(
+                    "candidate-aware route logits require candidate features"
                 )
             logits = route_decoder(
                 recurrent_features,
                 candidate_public_features,
                 candidate_edge_features,
             )
+        elif self.route_decoder_mode is RouteDecoderMode.OPTION_AWARE_V1:
+            route_decoder = self.route_decoder
+            if not isinstance(route_decoder, OptionAwareRouteDecoderV1):
+                raise MAPPONetworkError(
+                    "option-aware route decoder has an invalid module type"
+                )
+            required = (
+                cooperative_features,
+                local_endpoint_features,
+                candidate_endpoint_features,
+                self_features,
+                candidate_public_features,
+                candidate_edge_features,
+            )
+            if any(tensor is None for tensor in required):
+                raise MAPPONetworkError(
+                    "option-aware route logits require recurrent, graph, and semantic features"
+                )
+            logits = route_decoder(
+                recurrent_features,
+                cooperative_features,
+                local_endpoint_features,
+                candidate_endpoint_features,
+                self_features,
+                candidate_public_features,
+                candidate_edge_features,
+            )
+        else:
+            raise MAPPONetworkError("unsupported route decoder mode")
         if tuple(logits.shape) != expected or not torch.isfinite(logits).all():
             raise MAPPONetworkError("route logits are invalid")
         return logits
@@ -1218,7 +1733,7 @@ class CAGATMAPPOActor(nn.Module):
             raise MAPPONetworkError(f"unknown action branch {branch!r}")
         if branch == "route" and self.route_decoder_mode is not RouteDecoderMode.LEGACY:
             raise MAPPONetworkError(
-                "candidate-aware route logits require explicit candidate features"
+                "structured route logits require explicit candidate features"
             )
         if recurrent_features.ndim != 4:
             raise MAPPONetworkError(
@@ -1301,14 +1816,45 @@ class CAGATMAPPOActor(nn.Module):
                 self.spec.neighbor_public_feature_dim,
             )
         )
-        spatial = self.graph_encoder(
+        graph_arguments = (
             self_state,
             public_state,
             batch.edge_features.reshape(
                 item_count, self.spec.uav_count, self.spec.edge_feature_dim
             ),
             batch.neighbor_mask.reshape(item_count, self.spec.uav_count),
-        ).reshape(
+        )
+        local_endpoint_features: Tensor | None = None
+        candidate_endpoint_features: Tensor | None = None
+        if self.route_decoder_mode is RouteDecoderMode.OPTION_AWARE_V1:
+            graph_result = self.graph_encoder(
+                *graph_arguments,
+                return_candidate_values=True,
+            )
+            if not isinstance(graph_result, tuple):
+                raise MAPPONetworkError(
+                    "option-aware graph encoder did not expose candidate values"
+                )
+            spatial_flat, local_endpoint_flat, candidate_endpoint_flat = graph_result
+            local_endpoint_features = local_endpoint_flat.reshape(
+                batch_size,
+                time,
+                agents,
+                self.spec.encoder_hidden_dimension,
+            )
+            candidate_endpoint_features = candidate_endpoint_flat.reshape(
+                batch_size,
+                time,
+                agents,
+                self.spec.uav_count,
+                self.spec.encoder_hidden_dimension,
+            )
+        else:
+            graph_result = self.graph_encoder(*graph_arguments)
+            if not isinstance(graph_result, Tensor):
+                raise MAPPONetworkError("graph encoder returned an invalid result")
+            spatial_flat = graph_result
+        spatial = spatial_flat.reshape(
             batch_size,
             time,
             agents,
@@ -1340,9 +1886,20 @@ class CAGATMAPPOActor(nn.Module):
             self.spec.uav_count,
             self.spec.encoder_hidden_dimension,
         )
+        route_public_features = (
+            batch.neighbor_public_features
+            if self.route_decoder_mode is RouteDecoderMode.OPTION_AWARE_V1
+            else candidate_public_state
+        )
         logits = {
             "route": self.route_logits(
-                recurrent, candidate_public_state, batch.edge_features
+                recurrent,
+                route_public_features,
+                batch.edge_features,
+                cooperative_features=spatial,
+                local_endpoint_features=local_endpoint_features,
+                candidate_endpoint_features=candidate_endpoint_features,
+                self_features=batch.self_features,
             )
         }
         logits.update(
@@ -1420,6 +1977,8 @@ __all__ = [
     "MAPPONetworkError",
     "MAPPOCentralizedCritic",
     "MAPPOTensorSpec",
+    "OptionAwareRouteDecoderV1",
+    "RouteOptionFeatureExtractor",
     "stack_actor_time",
     "stack_centralized_time",
 ]
