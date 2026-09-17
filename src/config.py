@@ -269,6 +269,7 @@ class RouteDecoderMode(str, Enum):
     LEGACY = "legacy"
     CANDIDATE_AWARE_V1 = "candidate_aware_v1"
     OPTION_AWARE_V1 = "option_aware_v1"
+    HIERARCHICAL_OPTION_AWARE_V1 = "hierarchical_option_aware_v1"
 
 
 class RouteCreditMode(str, Enum):
@@ -1127,6 +1128,7 @@ class RunConfig:
             in {
                 RouteDecoderMode.CANDIDATE_AWARE_V1,
                 RouteDecoderMode.OPTION_AWARE_V1,
+                RouteDecoderMode.HIERARCHICAL_OPTION_AWARE_V1,
             }
             and route_credit_mode is not RouteCreditMode.SHARED_GAE
         ):

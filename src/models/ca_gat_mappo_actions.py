@@ -15,7 +15,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from ..config import RunConfig, STREAM_IDS
+from ..config import RouteDecoderMode, RunConfig, STREAM_IDS
 from ..env.actions import ActionProposal
 from ..env.observation import ActionMasks, ActorObservation
 from .ca_gat_mappo import (
@@ -242,6 +242,145 @@ class SequentialActionDistributionOutput:
         return self.proposals[batch][time][agent]
 
 
+def _hierarchical_route_statistics(
+    masked_logits: Tensor,
+    action_mask: Tensor,
+    contracts: tuple[ActionMasks, ...],
+    shape: tuple[int, int, int],
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Return flat leaf probabilities and explicit hierarchical statistics."""
+
+    dimension = masked_logits.shape[-1]
+    if tuple(masked_logits.shape) != (*shape, dimension):
+        raise ActionDistributionError("hierarchical route logits have an invalid shape")
+    if tuple(action_mask.shape) != tuple(masked_logits.shape):
+        raise ActionDistributionError("hierarchical route mask differs from logits")
+    remote_rows: list[list[bool]] = []
+    for contract in contracts:
+        domain = tuple(contract.route_domain)
+        if (
+            len(domain) != dimension
+            or domain[:3] != ("idle", "local", "defer")
+            or any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in domain[3:]
+            )
+        ):
+            raise ActionDistributionError(
+                "hierarchical route domain must be "
+                "[idle,local,defer,remote...]"
+            )
+        remote_rows.append(
+            [
+                isinstance(value, int) and not isinstance(value, bool)
+                for value in domain
+            ]
+        )
+    remote_domain = torch.as_tensor(
+        np.asarray(remote_rows, dtype=np.bool_).reshape(*shape, dimension),
+        dtype=torch.bool,
+        device=masked_logits.device,
+    )
+    remote_legal = remote_domain & action_mask
+    remote_available = torch.any(remote_legal, dim=-1)
+
+    leaf_log_probabilities = torch.log_softmax(masked_logits, dim=-1)
+    leaf_probabilities = torch.exp(leaf_log_probabilities)
+    remote_fallback = torch.nn.functional.one_hot(
+        remote_domain.to(torch.long).argmax(dim=-1),
+        num_classes=dimension,
+    ).bool()
+    safe_remote_legal = torch.where(
+        remote_available.unsqueeze(-1), remote_legal, remote_fallback
+    )
+    safe_remote_terms = torch.where(
+        remote_available.unsqueeze(-1),
+        leaf_log_probabilities,
+        torch.zeros_like(leaf_log_probabilities),
+    ).masked_fill(~safe_remote_legal, -torch.inf)
+    safe_remote_log_probability = torch.logsumexp(
+        safe_remote_terms,
+        dim=-1,
+    )
+    remote_log_probability = torch.where(
+        remote_available,
+        safe_remote_log_probability,
+        torch.full_like(safe_remote_log_probability, -torch.inf),
+    )
+    top_level_log_probabilities = torch.stack(
+        [
+            leaf_log_probabilities[..., 0],
+            leaf_log_probabilities[..., 1],
+            leaf_log_probabilities[..., 2],
+            remote_log_probability,
+        ],
+        dim=-1,
+    )
+    top_level_probabilities = torch.exp(top_level_log_probabilities)
+    conditional_normalizer = torch.where(
+        remote_available,
+        remote_log_probability,
+        torch.zeros_like(remote_log_probability),
+    )
+    conditional_remote_log_probabilities = torch.where(
+        remote_legal,
+        leaf_log_probabilities - conditional_normalizer.unsqueeze(-1),
+        torch.full_like(leaf_log_probabilities, -torch.inf),
+    )
+    conditional_remote_probabilities = torch.where(
+        remote_legal,
+        torch.exp(conditional_remote_log_probabilities),
+        torch.zeros_like(leaf_probabilities),
+    )
+
+    safe_top_level_logs = torch.where(
+        top_level_probabilities > 0.0,
+        top_level_log_probabilities,
+        torch.zeros_like(top_level_log_probabilities),
+    )
+    top_level_entropy = -torch.sum(
+        top_level_probabilities * safe_top_level_logs, dim=-1
+    )
+    safe_conditional_logs = torch.where(
+        conditional_remote_probabilities > 0.0,
+        conditional_remote_log_probabilities,
+        torch.zeros_like(conditional_remote_log_probabilities),
+    )
+    conditional_remote_entropy = -torch.sum(
+        conditional_remote_probabilities * safe_conditional_logs, dim=-1
+    )
+    entropy = (
+        top_level_entropy
+        + top_level_probabilities[..., 3] * conditional_remote_entropy
+    ).clamp_min(0.0)
+    if (
+        not torch.isfinite(leaf_probabilities).all()
+        or not torch.isfinite(top_level_probabilities).all()
+        or not torch.isfinite(conditional_remote_probabilities).all()
+        or not torch.isfinite(entropy).all()
+    ):
+        raise ActionDistributionError(
+            "hierarchical route distribution contains NaN or Inf"
+        )
+    if not torch.allclose(
+        leaf_probabilities.sum(dim=-1),
+        torch.ones_like(entropy),
+    ):
+        raise ActionDistributionError(
+            "hierarchical route leaf probabilities do not sum to one"
+        )
+    return (
+        leaf_probabilities,
+        top_level_probabilities,
+        conditional_remote_probabilities,
+        top_level_log_probabilities,
+        conditional_remote_log_probabilities,
+        remote_domain,
+        remote_available,
+        entropy,
+    )
+
+
 class CAGATMAPPOActionDistribution:
     """Shared sequential masked distribution for sampling and PPO re-evaluation."""
 
@@ -256,6 +395,9 @@ class CAGATMAPPOActionDistribution:
             raise ActionDistributionError("actor and config tensor specs differ")
         self.actor = actor
         self.spec = expected_spec
+        self.route_decoder_mode = RouteDecoderMode(
+            config.training.mappo.route_decoder_mode
+        )
         self.master_seed = config.seed
         self.policy_stream_id = int(config.reproducibility.stream_ids["torch_policy_sampling"])
         if self.policy_stream_id != STREAM_IDS["torch_policy_sampling"]:
@@ -388,11 +530,34 @@ class CAGATMAPPOActionDistribution:
                 device=recurrent.device,
             )
             masked_logits = logits.masked_fill(~mask_tensor, -torch.inf)
-            distribution = torch.distributions.Categorical(
-                logits=masked_logits,
-                validate_args=False,
+            hierarchical_route = (
+                branch == "route"
+                and self.route_decoder_mode
+                is RouteDecoderMode.HIERARCHICAL_OPTION_AWARE_V1
             )
-            branch_probabilities = distribution.probs
+            if hierarchical_route:
+                (
+                    branch_probabilities,
+                    top_level_probabilities,
+                    conditional_remote_probabilities,
+                    top_level_log_probabilities,
+                    conditional_remote_log_probabilities,
+                    remote_domain,
+                    remote_available,
+                    branch_entropy,
+                ) = _hierarchical_route_statistics(
+                    masked_logits,
+                    mask_tensor,
+                    contracts,
+                    shape,
+                )
+                distribution = None
+            else:
+                distribution = torch.distributions.Categorical(
+                    logits=masked_logits,
+                    validate_args=False,
+                )
+                branch_probabilities = distribution.probs
             if not torch.isfinite(branch_probabilities).all():
                 raise ActionDistributionError(f"{branch} probabilities contain NaN or Inf")
 
@@ -414,16 +579,91 @@ class CAGATMAPPOActionDistribution:
                     device=recurrent.device,
                 ).reshape(shape)
             elif mode == "deterministic":
-                indices = torch.argmax(masked_logits, dim=-1)
+                if hierarchical_route:
+                    top_level_indices = torch.argmax(
+                        top_level_probabilities, dim=-1
+                    )
+                    destination_indices = torch.argmax(
+                        conditional_remote_probabilities, dim=-1
+                    )
+                    indices = torch.where(
+                        top_level_indices == 3,
+                        destination_indices,
+                        top_level_indices,
+                    )
+                else:
+                    indices = torch.argmax(masked_logits, dim=-1)
             elif mode == "stochastic":
-                indices = torch.multinomial(
-                    branch_probabilities.reshape(-1, dimension),
-                    num_samples=1,
-                    replacement=True,
-                    generator=resolved_generator,
-                ).reshape(shape)
+                if hierarchical_route:
+                    if resolved_generator is None:
+                        raise ActionDistributionError(
+                            "hierarchical stochastic route selection requires a generator"
+                        )
+                    top_level_indices = torch.multinomial(
+                        top_level_probabilities.reshape(-1, 4),
+                        num_samples=1,
+                        replacement=True,
+                        generator=resolved_generator,
+                    ).reshape(shape)
+                    remote_fallback = torch.nn.functional.one_hot(
+                        remote_domain.to(torch.long).argmax(dim=-1),
+                        num_classes=dimension,
+                    ).to(dtype=conditional_remote_probabilities.dtype)
+                    safe_remote_probabilities = torch.where(
+                        remote_available.unsqueeze(-1),
+                        conditional_remote_probabilities,
+                        remote_fallback,
+                    )
+                    destination_indices = torch.multinomial(
+                        safe_remote_probabilities.reshape(-1, dimension),
+                        num_samples=1,
+                        replacement=True,
+                        generator=resolved_generator,
+                    ).reshape(shape)
+                    indices = torch.where(
+                        top_level_indices == 3,
+                        destination_indices,
+                        top_level_indices,
+                    )
+                else:
+                    indices = torch.multinomial(
+                        branch_probabilities.reshape(-1, dimension),
+                        num_samples=1,
+                        replacement=True,
+                        generator=resolved_generator,
+                    ).reshape(shape)
             else:
                 raise ActionDistributionError(f"unknown selection mode {mode!r}")
+
+            if hierarchical_route:
+                selected_remote = torch.gather(
+                    remote_domain, -1, indices.unsqueeze(-1)
+                ).squeeze(-1)
+                selected_top_level_indices = torch.where(
+                    selected_remote,
+                    torch.full_like(indices, 3),
+                    indices,
+                )
+                selected_top_level_log_prob = torch.gather(
+                    top_level_log_probabilities,
+                    -1,
+                    selected_top_level_indices.unsqueeze(-1),
+                ).squeeze(-1)
+                selected_remote_log_prob = torch.gather(
+                    conditional_remote_log_probabilities,
+                    -1,
+                    indices.unsqueeze(-1),
+                ).squeeze(-1)
+                branch_log_prob = torch.where(
+                    selected_remote,
+                    selected_top_level_log_prob + selected_remote_log_prob,
+                    selected_top_level_log_prob,
+                )
+            else:
+                if distribution is None:
+                    raise ActionDistributionError("categorical distribution is missing")
+                branch_log_prob = distribution.log_prob(indices)
+                branch_entropy = distribution.entropy()
 
             flat_selected = indices.detach().cpu().reshape(-1).tolist()
             for contract, context, index in zip(contracts, contexts, flat_selected):
@@ -432,8 +672,8 @@ class CAGATMAPPOActionDistribution:
             dynamic_masks[branch] = mask_tensor
             probabilities[branch] = branch_probabilities
             selected_indices[branch] = indices
-            selected_log_probs[branch] = distribution.log_prob(indices)
-            branch_entropies[branch] = distribution.entropy()
+            selected_log_probs[branch] = branch_log_prob
+            branch_entropies[branch] = branch_entropy
 
         resolved_proposals = (
             _proposals_from_contexts(contexts, shape)

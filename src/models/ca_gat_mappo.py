@@ -1526,6 +1526,307 @@ class OptionAwareRouteDecoderV1(nn.Module):
         return logits
 
 
+class HierarchicalOptionAwareRouteDecoderV1(nn.Module):
+    """Compose top-level route and conditional remote-destination probabilities."""
+
+    _BLOCK_DIMENSION = 32
+    _OPTION_TYPE_DIMENSION = 8
+    _SCORER_HIDDEN_DIMENSION = 64
+
+    def __init__(self, *, spec: MAPPOTensorSpec) -> None:
+        super().__init__()
+        if spec.uav_count < 2:
+            raise MAPPONetworkError(
+                "hierarchical option-aware decoder requires at least two UAVs"
+            )
+        self.uav_count = spec.uav_count
+        self.recurrent_dimension = spec.gru_hidden_dimension
+        self.option_dimension = spec.encoder_hidden_dimension
+        self.feature_extractor = RouteOptionFeatureExtractor(spec)
+
+        def projection(input_dimension: int) -> nn.Sequential:
+            return nn.Sequential(
+                nn.Linear(input_dimension, self._BLOCK_DIMENSION),
+                nn.LayerNorm(self._BLOCK_DIMENSION),
+                nn.LeakyReLU(),
+            )
+
+        self.recurrent_projection = projection(self.recurrent_dimension)
+        self.cooperative_projection = projection(self.option_dimension)
+        self.task_projection = projection(_TASK_OPTION_FEATURE_DIM)
+        self.source_projection = projection(_SOURCE_OPTION_FEATURE_DIM)
+        self.endpoint_projection = projection(self.option_dimension)
+        self.burden_projection = projection(_BURDEN_OPTION_FEATURE_DIM)
+        self.option_type_embedding = nn.Embedding(2, self._OPTION_TYPE_DIMENSION)
+        fusion_dimension = (
+            6 * self._BLOCK_DIMENSION
+            + self._OPTION_TYPE_DIMENSION
+            + _OPTION_VALIDITY_FEATURE_DIM
+        )
+        self.fusion_normalization = nn.LayerNorm(fusion_dimension)
+        self.top_level_head = nn.Sequential(
+            nn.Linear(2 * fusion_dimension, self._SCORER_HIDDEN_DIMENSION),
+            nn.LeakyReLU(),
+            nn.Linear(self._SCORER_HIDDEN_DIMENSION, 3),
+        )
+        self.remote_destination_head = nn.Sequential(
+            nn.Linear(fusion_dimension, self._SCORER_HIDDEN_DIMENSION),
+            nn.LeakyReLU(),
+            nn.Linear(self._SCORER_HIDDEN_DIMENSION, 1),
+        )
+        self.register_buffer(
+            "remote_candidate_ids",
+            torch.tensor(
+                [
+                    [candidate for candidate in range(self.uav_count) if candidate != ego]
+                    for ego in range(self.uav_count)
+                ],
+                dtype=torch.long,
+            ),
+            persistent=False,
+        )
+
+    def _gather_remote_endpoints(self, candidate_endpoints: Tensor) -> Tensor:
+        batch, time, agents, _, features = candidate_endpoints.shape
+        index = self.remote_candidate_ids.view(
+            1, 1, agents, self.uav_count - 1, 1
+        ).expand(batch, time, agents, self.uav_count - 1, features)
+        return torch.gather(candidate_endpoints, -2, index)
+
+    def forward(
+        self,
+        recurrent_features: Tensor,
+        cooperative_features: Tensor,
+        local_endpoint_features: Tensor,
+        candidate_endpoint_features: Tensor,
+        self_features: Tensor,
+        candidate_public_features: Tensor,
+        candidate_edge_features: Tensor,
+        route_action_mask: Tensor,
+    ) -> Tensor:
+        if recurrent_features.ndim != 4:
+            raise MAPPONetworkError(
+                "hierarchical option-aware recurrent features must be "
+                "[batch,time,agent,hidden]"
+            )
+        batch, time, agents, recurrent_dimension = recurrent_features.shape
+        common_shape = (batch, time, agents)
+        expected_shapes = (
+            (cooperative_features, (*common_shape, self.option_dimension)),
+            (local_endpoint_features, (*common_shape, self.option_dimension)),
+            (
+                candidate_endpoint_features,
+                (*common_shape, self.uav_count, self.option_dimension),
+            ),
+            (self_features, (*common_shape, self.feature_extractor.self_feature_dim)),
+            (
+                candidate_public_features,
+                (
+                    *common_shape,
+                    self.uav_count,
+                    self.feature_extractor.public_feature_dim,
+                ),
+            ),
+            (
+                candidate_edge_features,
+                (
+                    *common_shape,
+                    self.uav_count,
+                    self.feature_extractor.edge_feature_dim,
+                ),
+            ),
+        )
+        if agents != self.uav_count or recurrent_dimension != self.recurrent_dimension:
+            raise MAPPONetworkError(
+                "hierarchical option-aware recurrent features differ from decoder spec"
+            )
+        if any(tuple(tensor.shape) != shape for tensor, shape in expected_shapes):
+            raise MAPPONetworkError(
+                "hierarchical option-aware input features differ from decoder spec"
+            )
+        tensors = (recurrent_features,) + tuple(
+            tensor for tensor, _ in expected_shapes
+        )
+        if any(not tensor.is_floating_point() for tensor in tensors):
+            raise MAPPONetworkError(
+                "hierarchical option-aware inputs must be floating tensors"
+            )
+        if any(
+            tensor.device != recurrent_features.device
+            or tensor.dtype != recurrent_features.dtype
+            for tensor in tensors[1:]
+        ):
+            raise MAPPONetworkError(
+                "hierarchical option-aware inputs must share device and dtype"
+            )
+        if any(not torch.isfinite(tensor).all() for tensor in tensors):
+            raise MAPPONetworkError(
+                "hierarchical option-aware inputs contain NaN or Inf"
+            )
+        expected_mask = (*common_shape, self.uav_count + 2)
+        if (
+            tuple(route_action_mask.shape) != expected_mask
+            or route_action_mask.dtype != torch.bool
+            or route_action_mask.device != recurrent_features.device
+        ):
+            raise MAPPONetworkError(
+                "hierarchical route action mask must be boolean [batch,time,agent,action]"
+            )
+        if not torch.all(torch.any(route_action_mask, dim=-1)):
+            raise MAPPONetworkError("hierarchical route action mask has no legal action")
+        idle_legal = route_action_mask[..., 0]
+        non_idle_legal = torch.any(route_action_mask[..., 1:], dim=-1)
+        if torch.any(idle_legal & non_idle_legal):
+            raise MAPPONetworkError(
+                "idle cannot coexist with active hierarchical route actions"
+            )
+
+        (
+            task_features,
+            source_features,
+            local_burden,
+            remote_burden,
+            local_validity,
+            remote_validity,
+        ) = self.feature_extractor.extract(
+            self_features,
+            candidate_public_features,
+            candidate_edge_features,
+            self.remote_candidate_ids,
+        )
+        remote_endpoints = self._gather_remote_endpoints(
+            candidate_endpoint_features
+        )
+        option_endpoints = torch.cat(
+            [local_endpoint_features.unsqueeze(-2), remote_endpoints], dim=-2
+        )
+        option_burdens = torch.cat(
+            [local_burden.unsqueeze(-2), remote_burden], dim=-2
+        )
+        option_validity = torch.cat(
+            [local_validity.unsqueeze(-2), remote_validity], dim=-2
+        )
+        option_count = self.uav_count
+
+        def expand_options(features: Tensor) -> Tensor:
+            return features.unsqueeze(-2).expand(
+                batch, time, agents, option_count, features.shape[-1]
+            )
+
+        option_type_ids = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.long, device=recurrent_features.device),
+                torch.ones(
+                    option_count - 1,
+                    dtype=torch.long,
+                    device=recurrent_features.device,
+                ),
+            ]
+        )
+        option_types = self.option_type_embedding(option_type_ids).view(
+            1, 1, 1, option_count, self._OPTION_TYPE_DIMENSION
+        ).expand(batch, time, agents, -1, -1)
+        fused = self.fusion_normalization(
+            torch.cat(
+                [
+                    expand_options(self.recurrent_projection(recurrent_features)),
+                    expand_options(self.cooperative_projection(cooperative_features)),
+                    expand_options(self.task_projection(task_features)),
+                    expand_options(self.source_projection(source_features)),
+                    self.endpoint_projection(option_endpoints),
+                    self.burden_projection(option_burdens),
+                    option_types,
+                    option_validity,
+                ],
+                dim=-1,
+            )
+        )
+
+        remote_mask = route_action_mask[..., 3:]
+        remote_legal = torch.any(remote_mask, dim=-1)
+        remote_fused = fused[..., 1:, :]
+        remote_weights = remote_mask.to(dtype=fused.dtype).unsqueeze(-1)
+        remote_summary = (remote_fused * remote_weights).sum(dim=-2) / remote_weights.sum(
+            dim=-2
+        ).clamp_min(1.0)
+        top_level_logits = self.top_level_head(
+            torch.cat([fused[..., 0, :], remote_summary], dim=-1)
+        )
+        top_level_mask = torch.stack(
+            [
+                route_action_mask[..., 1],
+                route_action_mask[..., 2],
+                remote_legal,
+            ],
+            dim=-1,
+        )
+        active = ~idle_legal
+        if torch.any(active & ~torch.any(top_level_mask, dim=-1)):
+            raise MAPPONetworkError(
+                "active hierarchical route mask has no legal top-level action"
+            )
+
+        invalid_logit = torch.finfo(recurrent_features.dtype).min
+        top_fallback = torch.zeros_like(top_level_mask)
+        top_fallback[..., 0] = True
+        safe_top_mask = torch.where(
+            active.unsqueeze(-1), top_level_mask, top_fallback
+        )
+        top_level_log_probabilities = torch.log_softmax(
+            top_level_logits.masked_fill(~safe_top_mask, invalid_logit), dim=-1
+        )
+
+        destination_logits = self.remote_destination_head(remote_fused).squeeze(-1)
+        destination_fallback = torch.zeros_like(remote_mask)
+        destination_fallback[..., 0] = True
+        safe_remote_mask = torch.where(
+            remote_legal.unsqueeze(-1), remote_mask, destination_fallback
+        )
+        destination_log_probabilities = torch.log_softmax(
+            destination_logits.masked_fill(~safe_remote_mask, invalid_logit),
+            dim=-1,
+        )
+
+        invalid = torch.full_like(idle_legal, invalid_logit, dtype=recurrent_features.dtype)
+        idle_logits = torch.where(idle_legal, torch.zeros_like(invalid), invalid)
+        local_logits = torch.where(
+            active & top_level_mask[..., 0],
+            top_level_log_probabilities[..., 0],
+            invalid,
+        )
+        defer_logits = torch.where(
+            active & top_level_mask[..., 1],
+            top_level_log_probabilities[..., 1],
+            invalid,
+        )
+        remote_logits = (
+            top_level_log_probabilities[..., 2:].expand_as(
+                destination_log_probabilities
+            )
+            + destination_log_probabilities
+        )
+        remote_logits = torch.where(
+            active.unsqueeze(-1) & remote_mask,
+            remote_logits,
+            torch.full_like(remote_logits, invalid_logit),
+        )
+        logits = torch.cat(
+            [
+                idle_logits.unsqueeze(-1),
+                local_logits.unsqueeze(-1),
+                defer_logits.unsqueeze(-1),
+                remote_logits,
+            ],
+            dim=-1,
+        )
+        expected_logits = (batch, time, agents, self.uav_count + 2)
+        if tuple(logits.shape) != expected_logits or not torch.isfinite(logits).all():
+            raise MAPPONetworkError(
+                "hierarchical option-aware route logits are invalid"
+            )
+        return logits
+
+
 @dataclass(frozen=True)
 class ActorNetworkOutput:
     """Raw seven-head logits, validated masks, and recurrent output."""
@@ -1617,6 +1918,11 @@ class CAGATMAPPOActor(nn.Module):
                 )
             elif self.route_decoder_mode is RouteDecoderMode.OPTION_AWARE_V1:
                 route_head = OptionAwareRouteDecoderV1(spec=self.spec)
+            elif (
+                self.route_decoder_mode
+                is RouteDecoderMode.HIERARCHICAL_OPTION_AWARE_V1
+            ):
+                route_head = HierarchicalOptionAwareRouteDecoderV1(spec=self.spec)
             else:
                 raise MAPPONetworkError(
                     f"unsupported route decoder mode {self.route_decoder_mode.value!r}"
@@ -1657,6 +1963,7 @@ class CAGATMAPPOActor(nn.Module):
         local_endpoint_features: Tensor | None = None,
         candidate_endpoint_features: Tensor | None = None,
         self_features: Tensor | None = None,
+        route_action_mask: Tensor | None = None,
     ) -> Tensor:
         """Return raw route logits for the configured decoder architecture."""
 
@@ -1714,6 +2021,39 @@ class CAGATMAPPOActor(nn.Module):
                 self_features,
                 candidate_public_features,
                 candidate_edge_features,
+            )
+        elif (
+            self.route_decoder_mode
+            is RouteDecoderMode.HIERARCHICAL_OPTION_AWARE_V1
+        ):
+            route_decoder = self.route_decoder
+            if not isinstance(route_decoder, HierarchicalOptionAwareRouteDecoderV1):
+                raise MAPPONetworkError(
+                    "hierarchical option-aware route decoder has an invalid module type"
+                )
+            required = (
+                cooperative_features,
+                local_endpoint_features,
+                candidate_endpoint_features,
+                self_features,
+                candidate_public_features,
+                candidate_edge_features,
+                route_action_mask,
+            )
+            if any(tensor is None for tensor in required):
+                raise MAPPONetworkError(
+                    "hierarchical option-aware route logits require recurrent, graph, "
+                    "semantic, and route-mask features"
+                )
+            logits = route_decoder(
+                recurrent_features,
+                cooperative_features,
+                local_endpoint_features,
+                candidate_endpoint_features,
+                self_features,
+                candidate_public_features,
+                candidate_edge_features,
+                route_action_mask,
             )
         else:
             raise MAPPONetworkError("unsupported route decoder mode")
@@ -1826,7 +2166,10 @@ class CAGATMAPPOActor(nn.Module):
         )
         local_endpoint_features: Tensor | None = None
         candidate_endpoint_features: Tensor | None = None
-        if self.route_decoder_mode is RouteDecoderMode.OPTION_AWARE_V1:
+        if self.route_decoder_mode in {
+            RouteDecoderMode.OPTION_AWARE_V1,
+            RouteDecoderMode.HIERARCHICAL_OPTION_AWARE_V1,
+        }:
             graph_result = self.graph_encoder(
                 *graph_arguments,
                 return_candidate_values=True,
@@ -1888,7 +2231,11 @@ class CAGATMAPPOActor(nn.Module):
         )
         route_public_features = (
             batch.neighbor_public_features
-            if self.route_decoder_mode is RouteDecoderMode.OPTION_AWARE_V1
+            if self.route_decoder_mode
+            in {
+                RouteDecoderMode.OPTION_AWARE_V1,
+                RouteDecoderMode.HIERARCHICAL_OPTION_AWARE_V1,
+            }
             else candidate_public_state
         )
         logits = {
@@ -1900,6 +2247,7 @@ class CAGATMAPPOActor(nn.Module):
                 local_endpoint_features=local_endpoint_features,
                 candidate_endpoint_features=candidate_endpoint_features,
                 self_features=batch.self_features,
+                route_action_mask=batch.action_masks["route"],
             )
         }
         logits.update(
@@ -1971,6 +2319,7 @@ __all__ = [
     "CAGATMAPPOActor",
     "CAGATv2Layer",
     "CandidateAwareRouteDecoderV1",
+    "HierarchicalOptionAwareRouteDecoderV1",
     "CentralizedCritic",
     "CentralizedStateTensorBatch",
     "CentralizedStateTensorizer",
