@@ -65,6 +65,8 @@ knowledge/project_plan/方案2.md
 
 ## 当前进度
 
+- 2026-09-15 组会后进展审计与完成路线已整理至 [项目完成实施路线](sections/8_project_completion_roadmap_20260915.md)。已核实最新 Option-Aware + responsibility-terminal 的 seed=42、64K 训练及 FINAL checkpoint；尚未找到正式评估落盘证据。本次 Option-Aware 专项 10/10、既有 agent-credit 专项 20/20 通过；正式评估回归 7/13 通过、6 项因配置快照与 canonical hash 口径不一致报错。下一步优先修复评估兼容与新增信用分配测试，再评估已有模型、实施双因素消融和多种子正式实验。下方保留历史阶段记录；本条与详细路线反映本次最新核查，未启动新训练或正式评估。
+
 - Git 基线已经建立；
 - 本地备份与缓存文件已通过 `.gitignore` 排除；
 - 系统模型第一项 P0 修订已完成：采用硬截止期语义，取消延迟完成类别；
