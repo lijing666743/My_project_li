@@ -65,6 +65,8 @@ knowledge/project_plan/方案2.md
 
 ## 当前进度
 
+- 2026-09-17 Formal Evaluation checkpoint identity compatibility 已修复：配置、checkpoint resume 与 actor-only evaluation 统一使用 canonical identity normalization；历史缺失字段与显式 `channel_ablation_mode="full"` 归一为同一身份，非默认 channel、decoder、environment/action architecture 与 reward provenance 仍严格拒绝。既有 64K Option-Aware FINAL checkpoint 已完成真实 actor-only 加载验证；相关 config/checkpoint/evaluation 回归 103/103、Same-State 受影响面回归 16/16 通过，未启动训练、未修改 checkpoint、模型、reward function 或 Option-Aware Route Decoder。
+
 - 2026-09-15 组会后进展审计与完成路线已整理至 [项目完成实施路线](sections/8_project_completion_roadmap_20260915.md)。已核实最新 Option-Aware + responsibility-terminal 的 seed=42、64K 训练及 FINAL checkpoint；尚未找到正式评估落盘证据。本次 Option-Aware 专项 10/10、既有 agent-credit 专项 20/20 通过；正式评估回归 7/13 通过、6 项因配置快照与 canonical hash 口径不一致报错。下一步优先修复评估兼容与新增信用分配测试，再评估已有模型、实施双因素消融和多种子正式实验。下方保留历史阶段记录；本条与详细路线反映本次最新核查，未启动新训练或正式评估。
 
 - Git 基线已经建立；

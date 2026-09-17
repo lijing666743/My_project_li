@@ -830,10 +830,6 @@ class RunConfig:
             "git_commit",
             "git_dirty",
         })
-        if self.reward == RewardCreditConfig():
-            # Omitted historical settings must retain their exact identity.
-            # Every non-default mode or coefficient enters the config hash.
-            resolved.pop("reward")
         mappo = resolved.get("training", {}).get("mappo")
         if isinstance(mappo, dict) and self.training.mappo.route_choice_stability_enabled:
             mappo["route_choice_stability_enabled"] = True
@@ -849,101 +845,7 @@ class RunConfig:
             output = resolved.get("output")
             if isinstance(output, dict):
                 output["route_oracle_counterfactual_filename"] = self.output.route_oracle_counterfactual_filename
-        environment = resolved.get("environment")
-        if (
-            isinstance(environment, dict)
-            and environment.get("channel_ablation_mode")
-            == ChannelAblationMode.FULL.value
-        ):
-            # ``full`` is the historical channel behavior.  Keep its omitted
-            # selector outside the canonical payload so legacy configs and
-            # explicit-full configs retain their exact pre-ablation identity.
-            environment.pop("channel_ablation_mode")
-        if (
-            isinstance(environment, dict)
-            and environment.get("workload_timing_mode")
-            == WorkloadTimingMode.LEGACY_POST_ROUTE.value
-        ):
-            # Preserve the exact pre-Fix-Package-3 canonical payload/hash so an
-            # omitted field in an old config or checkpoint still denotes the
-            # historical reward behavior.  The non-default mode remains part
-            # of the canonical identity.
-            environment.pop("workload_timing_mode")
-        training = resolved.get("training")
-        mappo = training.get("mappo") if isinstance(training, dict) else None
-        if (
-            isinstance(mappo, dict)
-            and mappo.get("actor_ratio_mode") == ActorRatioMode.JOINT.value
-        ):
-            # ``joint`` is the historical PPO behavior.  Omitting its new
-            # selector preserves pre-Fix-4 config hashes and Checkpoint V1
-            # identity, while ``branch_specific`` remains canonical.
-            mappo.pop("actor_ratio_mode")
-        if (
-            isinstance(mappo, dict)
-            and mappo.get("agent_credit_mode") == AgentCreditMode.TEAM.value
-        ):
-            # ``team`` is the historical scalar reward/value/GAE behavior.
-            # Keep old config hashes and Checkpoint V1 identities unchanged;
-            # role-decomposed credit remains part of the canonical identity.
-            mappo.pop("agent_credit_mode")
-        if (
-            isinstance(mappo, dict)
-            and mappo.get("route_decoder_mode") == RouteDecoderMode.LEGACY.value
-        ):
-            # ``legacy`` is the historical actor route head.  Its omitted
-            # selector preserves pre-V1 config hashes and checkpoint identity;
-            # candidate_aware_v1 remains explicit and canonical.
-            mappo.pop("route_decoder_mode")
-        if (
-            isinstance(mappo, dict)
-            and mappo.get("route_credit_mode") == RouteCreditMode.SHARED_GAE.value
-        ):
-            # Shared GAE is the historical actor-credit behavior.  Both the
-            # selector and its dormant treatment coefficient stay outside the
-            # legacy canonical payload so old hashes remain byte-for-byte
-            # stable.
-            mappo.pop("route_credit_mode")
-            mappo.pop("route_gae_lambda")
-        elif (
-            isinstance(mappo, dict)
-            and mappo.get("route_credit_mode")
-            == RouteCreditMode.ROLLOUT_CAPPED_ROUTE_EVENT_NSTEP.value
-        ):
-            # This estimator has no lambda recurrence.  Keep the selected
-            # treatment mode canonical while excluding its dormant legacy
-            # coefficient from run identity.
-            mappo.pop("route_gae_lambda")
-        if isinstance(mappo, dict) and not mappo.get(
-            "entropy_coefficient_schedule_enabled", False
-        ):
-            # The historical false flag already belongs to the canonical
-            # payload.  Only the newly introduced route-only parameters are
-            # omitted so legacy hashes remain byte-for-byte unchanged.
-            mappo.pop("route_entropy_start_coefficient")
-            mappo.pop("route_entropy_schedule_start_step")
-            mappo.pop("route_entropy_schedule_end_step")
-        if isinstance(mappo, dict) and not mappo.get(
-            "trajectory_credit_telemetry_enabled", False
-        ):
-            # The V1 sidecar is explicitly opt-in.  Omitting the historical
-            # false value preserves legacy config hashes and run identities;
-            # enabled diagnostic runs receive a distinct canonical identity.
-            mappo.pop("trajectory_credit_telemetry_enabled")
-        if isinstance(mappo, dict) and not mappo.get(
-            "route_diagnostic_samples_enabled", False
-        ):
-            # The route-diagnostic sidecar is independently opt-in. Omitting
-            # the historical false value preserves legacy hashes and run IDs.
-            mappo.pop("route_diagnostic_samples_enabled")
-        if isinstance(mappo, dict) and not mappo.get(
-            "route_oracle_counterfactual_enabled", False
-        ):
-            # Oracle-1 is independently opt-in. Omitting both disabled fields
-            # preserves legacy config hashes and run IDs.
-            mappo.pop("route_oracle_counterfactual_enabled", None)
-            mappo.pop("route_oracle_selection_rate_ppm", None)
-        return resolved
+        return canonicalize_config_identity(resolved)
 
     def to_dict(self) -> dict[str, Any]:
         """Alias used by callers that need the canonical resolved mapping."""
@@ -952,8 +854,7 @@ class RunConfig:
 
     @property
     def config_hash(self) -> str:
-        payload = json.dumps(self.resolved_dict(), sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return canonical_config_identity_hash(self.resolved_dict())
 
     @property
     def run_id(self) -> str:
@@ -2259,6 +2160,89 @@ def _jsonable(value: Any, *, exclude: set[str] | None = None) -> Any:
     return value
 
 
+def canonicalize_config_identity(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the one canonical identity mapping for configs and snapshots.
+
+    Snapshot provenance and effective historical defaults remain available in
+    the raw snapshot. Only the identity copy is normalized, so an omitted
+    historical default and the same explicitly recorded default hash equally,
+    while every non-default value remains identity-bearing.
+    """
+
+    if not isinstance(config, Mapping):
+        raise TypeError("config identity source must be a mapping")
+    canonical = _jsonable(config)
+    canonical.pop("_metadata", None)
+    for name in (
+        "source_config_path",
+        "cli_overrides",
+        "interactive_overrides",
+        "git_branch",
+        "git_commit",
+        "git_dirty",
+    ):
+        canonical.pop(name, None)
+
+    if canonical.get("reward") == _jsonable(asdict(RewardCreditConfig())):
+        # The default legacy reward-credit contract predates this section.
+        canonical.pop("reward")
+
+    environment = canonical.get("environment")
+    if isinstance(environment, dict):
+        if environment.get("channel_ablation_mode") == ChannelAblationMode.FULL.value:
+            # Explicit ``full`` and its historical omission are one identity.
+            environment.pop("channel_ablation_mode")
+        if (
+            environment.get("workload_timing_mode")
+            == WorkloadTimingMode.LEGACY_POST_ROUTE.value
+        ):
+            environment.pop("workload_timing_mode")
+
+    training = canonical.get("training")
+    mappo = training.get("mappo") if isinstance(training, dict) else None
+    if isinstance(mappo, dict):
+        if mappo.get("actor_ratio_mode") == ActorRatioMode.JOINT.value:
+            mappo.pop("actor_ratio_mode")
+        if mappo.get("agent_credit_mode") == AgentCreditMode.TEAM.value:
+            mappo.pop("agent_credit_mode")
+        if mappo.get("route_decoder_mode") == RouteDecoderMode.LEGACY.value:
+            mappo.pop("route_decoder_mode")
+        if mappo.get("route_credit_mode") == RouteCreditMode.SHARED_GAE.value:
+            mappo.pop("route_credit_mode")
+            mappo.pop("route_gae_lambda", None)
+        elif (
+            mappo.get("route_credit_mode")
+            == RouteCreditMode.ROLLOUT_CAPPED_ROUTE_EVENT_NSTEP.value
+        ):
+            mappo.pop("route_gae_lambda", None)
+        if not mappo.get("entropy_coefficient_schedule_enabled", False):
+            mappo.pop("route_entropy_start_coefficient", None)
+            mappo.pop("route_entropy_schedule_start_step", None)
+            mappo.pop("route_entropy_schedule_end_step", None)
+        if not mappo.get("trajectory_credit_telemetry_enabled", False):
+            mappo.pop("trajectory_credit_telemetry_enabled", None)
+        if not mappo.get("route_diagnostic_samples_enabled", False):
+            mappo.pop("route_diagnostic_samples_enabled", None)
+        if not mappo.get("route_oracle_counterfactual_enabled", False):
+            mappo.pop("route_oracle_counterfactual_enabled", None)
+            mappo.pop("route_oracle_selection_rate_ppm", None)
+    return canonical
+
+
+def canonical_config_identity_hash(config: Mapping[str, Any]) -> str:
+    """Hash a configuration only after applying canonical identity rules."""
+
+    canonical = canonicalize_config_identity(config)
+    payload = json.dumps(
+        canonical,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 __all__ = [
     "ActionConfig",
     "AgentCreditMode",
@@ -2304,6 +2288,8 @@ __all__ = [
     "SUPPORTED_SCENARIOS",
     "TrainingConfig",
     "WorkloadTimingMode",
+    "canonical_config_identity_hash",
+    "canonicalize_config_identity",
     "compute_mappo_checkpoint_active_rollout_length",
     "compute_mappo_periodic_checkpoint_steps",
     "compute_route_entropy_schedule",

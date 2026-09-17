@@ -453,6 +453,18 @@ class FormalEvaluationRunner:
             "source_training_config_hash": (
                 self.loaded_actor.source_training_config_hash
             ),
+            "source_training_config_original_hash": (
+                self.loaded_actor.source_training_config_original_hash
+            ),
+            "source_training_config_raw_snapshot_hash": (
+                self.loaded_actor.source_training_config_raw_snapshot_hash
+            ),
+            "source_training_config_canonical_hash": (
+                self.loaded_actor.source_training_config_canonical_hash
+            ),
+            "source_checkpoint_metadata": dict(
+                self.loaded_actor.source_checkpoint_metadata
+            ),
             "source_training_actor_ratio_mode": (
                 self.loaded_actor.source_training_actor_ratio_mode
             ),

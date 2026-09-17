@@ -21,7 +21,11 @@ from src.config import (
     AgentCreditMode,
     CHECKPOINT_KIND_FINAL_COMPLETED,
     CHECKPOINT_KIND_PERIODIC_RESUME,
+    ChannelAblationMode,
     ConfigError,
+    RewardCreditConfig,
+    RouteDecoderMode,
+    canonical_config_identity_hash,
 )
 from src.evaluation.actor_loader import (
     EvaluationCheckpointError,
@@ -43,6 +47,10 @@ def make_evaluation_fixture(
     kind: str = CHECKPOINT_KIND_FINAL_COMPLETED,
     actor_ratio_mode: ActorRatioMode = ActorRatioMode.JOINT,
     agent_credit_mode: AgentCreditMode = AgentCreditMode.TEAM,
+    channel_ablation_mode: ChannelAblationMode = ChannelAblationMode.FULL,
+    route_decoder_mode: RouteDecoderMode = RouteDecoderMode.LEGACY,
+    reward: RewardCreditConfig | None = None,
+    omit_snapshot_channel_mode: bool = False,
 ):
     source = make_checkpoint_config(root, horizon=4, interval=4, budget=8)
     source = replace(
@@ -53,8 +61,14 @@ def make_evaluation_fixture(
                 source.training.mappo,
                 actor_ratio_mode=actor_ratio_mode,
                 agent_credit_mode=agent_credit_mode,
+                route_decoder_mode=route_decoder_mode,
             ),
         ),
+        environment=replace(
+            source.environment,
+            channel_ablation_mode=channel_ablation_mode,
+        ),
+        reward=source.reward if reward is None else reward,
     )
     if arrivals is not None:
         source = replace(
@@ -65,6 +79,10 @@ def make_evaluation_fixture(
     object.__setattr__(source, "git_commit", "a" * 40)
     object.__setattr__(source, "git_dirty", False)
     payload, source_actor, _critic, _updater = make_payload(source, kind)
+    if omit_snapshot_channel_mode:
+        payload["config_snapshot"]["environment"].pop(
+            "channel_ablation_mode", None
+        )
     checkpoint = root / ("final.pt" if kind == CHECKPOINT_KIND_FINAL_COMPLETED else "periodic.pt")
     atomic_save_checkpoint(payload, checkpoint)
     evaluation = replace(
@@ -197,6 +215,26 @@ class TestEvaluationExecutionContext(unittest.TestCase):
 
 
 class TestFinalActorOnlyLoader(unittest.TestCase):
+    def test_historical_snapshot_missing_default_full_channel_loads(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source, config, checkpoint, _actor = make_evaluation_fixture(
+                Path(directory), omit_snapshot_channel_mode=True
+            )
+            loaded = load_final_actor_for_evaluation(
+                config,
+                checkpoint,
+                evaluation_device="cpu",
+            )
+
+            self.assertEqual(
+                loaded.source_training_config_original_hash,
+                source.config_hash,
+            )
+            self.assertEqual(
+                loaded.source_training_config_raw_snapshot_hash,
+                loaded.source_training_config_canonical_hash,
+            )
+
     def test_final_checkpoint_loads_only_actor_and_enters_eval_mode(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             _source, config, checkpoint, source_actor = make_evaluation_fixture(
@@ -223,8 +261,105 @@ class TestFinalActorOnlyLoader(unittest.TestCase):
             self.assertEqual(loaded.source_training_agent_credit_mode, "team")
             self.assertEqual(loaded.source_training_device, "cpu")
             self.assertEqual(loaded.evaluation_device, "cpu")
+            self.assertEqual(
+                loaded.source_training_config_original_hash,
+                loaded.source_training_config_canonical_hash,
+            )
+            self.assertNotEqual(
+                loaded.source_training_config_raw_snapshot_hash,
+                loaded.source_training_config_canonical_hash,
+            )
+            self.assertEqual(
+                loaded.source_checkpoint_metadata["config_hash"],
+                loaded.source_training_config_original_hash,
+            )
             for name, value in source_actor.state_dict().items():
                 self.assertTrue(torch.equal(value.cpu(), loaded.actor.state_dict()[name].cpu()))
+
+    def test_nondefault_deterministic_channel_is_distinct_and_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source, config, checkpoint, _actor = make_evaluation_fixture(
+                Path(directory),
+                channel_ablation_mode=(
+                    ChannelAblationMode.SIMPLIFIED_DETERMINISTIC
+                ),
+            )
+            full_identity = source.snapshot_dict()
+            full_identity["environment"]["channel_ablation_mode"] = "full"
+            self.assertNotEqual(
+                canonical_config_identity_hash(source.snapshot_dict()),
+                canonical_config_identity_hash(full_identity),
+            )
+            full_evaluator = replace(
+                config,
+                environment=replace(
+                    config.environment,
+                    channel_ablation_mode=ChannelAblationMode.FULL,
+                ),
+            )
+            full_evaluator.validate()
+
+            with self.assertRaisesRegex(
+                EvaluationCheckpointError,
+                "environment/observation domain",
+            ):
+                load_final_actor_for_evaluation(
+                    full_evaluator,
+                    checkpoint,
+                    evaluation_device="cpu",
+                )
+
+    def test_legacy_decoder_checkpoint_is_rejected_by_option_aware_evaluator(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _source, config, checkpoint, _actor = make_evaluation_fixture(
+                Path(directory),
+                route_decoder_mode=RouteDecoderMode.LEGACY,
+            )
+            option_evaluator = replace(
+                config,
+                training=replace(
+                    config.training,
+                    mappo=replace(
+                        config.training.mappo,
+                        route_decoder_mode=RouteDecoderMode.OPTION_AWARE_V1,
+                    ),
+                ),
+            )
+            option_evaluator.validate()
+
+            with self.assertRaisesRegex(
+                EvaluationCheckpointError,
+                "route_decoder_mode",
+            ):
+                load_final_actor_for_evaluation(
+                    option_evaluator,
+                    checkpoint,
+                    evaluation_device="cpu",
+                )
+
+    def test_reward_provenance_mismatch_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _source, config, checkpoint, _actor = make_evaluation_fixture(
+                Path(directory)
+            )
+            incompatible = replace(
+                config,
+                reward=replace(
+                    config.reward,
+                    beta_completion_credit=0.75,
+                ),
+            )
+            incompatible.validate()
+
+            with self.assertRaisesRegex(
+                EvaluationCheckpointError,
+                "reward provenance mismatch",
+            ):
+                load_final_actor_for_evaluation(
+                    incompatible,
+                    checkpoint,
+                    evaluation_device="cpu",
+                )
 
     def test_branch_specific_training_provenance_reaches_formal_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -443,6 +578,10 @@ class TestFormalEvaluationRunner(unittest.TestCase):
             self.assertTrue(manifest["masked_argmax"])
             self.assertIn("source_checkpoint_sha256", manifest)
             self.assertIn("source_training_config_hash", manifest)
+            self.assertIn("source_training_config_original_hash", manifest)
+            self.assertIn("source_training_config_raw_snapshot_hash", manifest)
+            self.assertIn("source_training_config_canonical_hash", manifest)
+            self.assertIn("source_checkpoint_metadata", manifest)
             self.assertEqual(manifest["source_training_actor_ratio_mode"], "joint")
             self.assertEqual(manifest["source_training_agent_credit_mode"], "team")
             self.assertIn("shared_external_trace_by_seed", manifest)

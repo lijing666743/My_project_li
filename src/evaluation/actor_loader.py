@@ -16,6 +16,8 @@ from ..config import (
     CHECKPOINT_KIND_FINAL_COMPLETED,
     RouteDecoderMode,
     RunConfig,
+    canonical_config_identity_hash,
+    canonicalize_config_identity,
 )
 from ..models.ca_gat_mappo import CAGATMAPPOActor, MAPPOTensorSpec
 from ..models.ca_gat_mappo_checkpoint import CheckpointError, load_checkpoint_payload
@@ -46,6 +48,10 @@ class LoadedEvaluationActor:
     source_checkpoint_kind: str
     source_method_id: str
     source_training_config_hash: str
+    source_training_config_original_hash: str
+    source_training_config_raw_snapshot_hash: str
+    source_training_config_canonical_hash: str
+    source_checkpoint_metadata: Mapping[str, Any]
     source_training_actor_ratio_mode: str
     source_training_agent_credit_mode: str
     source_training_git_commit: str
@@ -54,6 +60,17 @@ class LoadedEvaluationActor:
     dtype: str
     actor_architecture_identity: Mapping[str, Any]
     action_domain_identity: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class _SourceConfigIdentity:
+    """Auditable raw and canonical views of checkpoint config identity."""
+
+    canonical_snapshot: Mapping[str, Any]
+    checkpoint_metadata: Mapping[str, Any]
+    original_hash: str
+    raw_snapshot_hash: str
+    canonical_hash: str
 
 
 def checkpoint_sha256(path: str | Path) -> str:
@@ -165,7 +182,8 @@ def _load_final_actor_only(
     if payload["method_id"] != "ca_gat_mappo":
         raise EvaluationCheckpointError("checkpoint method_id mismatch")
 
-    resolved_source = _validate_source_config_identity(payload)
+    source_identity = _validate_source_config_identity(payload)
+    resolved_source = source_identity.canonical_snapshot
     _validate_source_compatibility(config, resolved_source)
     source_training = resolved_source.get("training")
     source_mappo = (
@@ -254,6 +272,10 @@ def _load_final_actor_only(
         source_checkpoint_kind=str(payload["checkpoint_kind"]),
         source_method_id=str(payload["method_id"]),
         source_training_config_hash=str(payload["config_hash"]),
+        source_training_config_original_hash=source_identity.original_hash,
+        source_training_config_raw_snapshot_hash=source_identity.raw_snapshot_hash,
+        source_training_config_canonical_hash=source_identity.canonical_hash,
+        source_checkpoint_metadata=source_identity.checkpoint_metadata,
         source_training_actor_ratio_mode=source_actor_ratio_mode,
         source_training_agent_credit_mode=source_agent_credit_mode,
         source_training_git_commit=source_git,
@@ -289,27 +311,28 @@ def _validate_evaluation_device(value: str) -> torch.device:
     return torch.device(value)
 
 
-def _validate_source_config_identity(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+def _validate_source_config_identity(
+    payload: Mapping[str, Any],
+) -> _SourceConfigIdentity:
     snapshot = payload["config_snapshot"]
     if not isinstance(snapshot, Mapping):
         raise EvaluationCheckpointError("checkpoint config snapshot is invalid")
     metadata = snapshot.get("_metadata")
     if not isinstance(metadata, Mapping):
         raise EvaluationCheckpointError("checkpoint config metadata is invalid")
-    resolved = {key: value for key, value in snapshot.items() if key != "_metadata"}
-    canonical = json.dumps(
-        resolved,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
-    recomputed = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    if recomputed != payload["config_hash"]:
+    original_hash = str(payload["config_hash"])
+    _validate_sha256(original_hash, "checkpoint training config hash")
+    raw_snapshot = {
+        key: value for key, value in snapshot.items() if key != "_metadata"
+    }
+    raw_snapshot_hash = _config_mapping_hash(raw_snapshot)
+    canonical_snapshot = canonicalize_config_identity(raw_snapshot)
+    canonical_hash = canonical_config_identity_hash(canonical_snapshot)
+    if canonical_hash != original_hash:
         raise EvaluationCheckpointError(
             "checkpoint training config hash does not match its canonical snapshot"
         )
-    if metadata.get("config_hash") != recomputed:
+    if metadata.get("config_hash") != original_hash:
         raise EvaluationCheckpointError(
             "checkpoint training config hash metadata is inconsistent"
         )
@@ -317,11 +340,33 @@ def _validate_source_config_identity(payload: Mapping[str, Any]) -> Mapping[str,
         raise EvaluationCheckpointError(
             "checkpoint git provenance differs from its config snapshot"
         )
-    if resolved.get("mode") != "rl" or resolved.get("method_id") != "ca_gat_mappo":
+    if (
+        canonical_snapshot.get("mode") != "rl"
+        or canonical_snapshot.get("method_id") != "ca_gat_mappo"
+    ):
         raise EvaluationCheckpointError(
             "FINAL_COMPLETED source config is not an rl/ca_gat_mappo run"
         )
-    return resolved
+    return _SourceConfigIdentity(
+        canonical_snapshot=canonical_snapshot,
+        checkpoint_metadata=_jsonable(metadata),
+        original_hash=original_hash,
+        raw_snapshot_hash=raw_snapshot_hash,
+        canonical_hash=canonical_hash,
+    )
+
+
+def _config_mapping_hash(config: Mapping[str, Any]) -> str:
+    """Hash one mapping exactly as stored, without identity normalization."""
+
+    serialized = json.dumps(
+        _jsonable(config),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def _validate_source_compatibility(
@@ -338,6 +383,9 @@ def _validate_source_compatibility(
         )
     if source.get("action") != current_action:
         raise EvaluationCheckpointError("checkpoint action domain is incompatible")
+    current_reward = config.resolved_dict().get("reward")
+    if source.get("reward") != current_reward:
+        raise EvaluationCheckpointError("checkpoint reward provenance mismatch")
     source_training = source.get("training")
     if not isinstance(source_training, Mapping):
         raise EvaluationCheckpointError("checkpoint training config is invalid")

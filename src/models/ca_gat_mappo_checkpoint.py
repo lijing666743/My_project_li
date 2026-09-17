@@ -32,10 +32,10 @@ from ..config import (
     CHECKPOINT_V1_TOP_LEVEL_FIELDS,
     CHECKPOINT_V1_TRAINING_STATE_FIELDS,
     CHECKPOINT_V1_TRANSITION_FIELDS,
-    ChannelAblationMode,
     MAPPO_INITIAL_POLICY_VERSION,
     ConfigError,
     RunConfig,
+    canonicalize_config_identity,
     compute_mappo_checkpoint_active_rollout_length,
     mappo_checkpoint_kind_at,
     validate_mappo_checkpoint_resume_compatibility,
@@ -797,20 +797,7 @@ def validate_periodic_checkpoint_compatibility(
     except ConfigError as exc:
         raise CheckpointError(str(exc)) from exc
     validate_checkpoint_payload(mapping, config=config)
-    resolved_snapshot = dict(mapping["config_snapshot"])
-    resolved_snapshot.pop("_metadata")
-    snapshot_environment = resolved_snapshot.get("environment")
-    if (
-        config.environment.channel_ablation_mode == ChannelAblationMode.FULL
-        and isinstance(snapshot_environment, Mapping)
-        and snapshot_environment.get("channel_ablation_mode")
-        == ChannelAblationMode.FULL.value
-    ):
-        # ``snapshot_dict`` records effective Full explicitly, while the
-        # canonical payload/hash omits this historical default.  Canonicalize
-        # only that one legacy-elided field before strict comparison.
-        resolved_snapshot["environment"] = dict(snapshot_environment)
-        resolved_snapshot["environment"].pop("channel_ablation_mode")
+    resolved_snapshot = canonicalize_config_identity(mapping["config_snapshot"])
     if resolved_snapshot != config.resolved_dict():
         raise CheckpointError("checkpoint config snapshot differs from RunConfig")
     if runtime["dtype"] != str(dtype):
