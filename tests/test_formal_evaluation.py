@@ -25,6 +25,7 @@ from src.config import (
     ConfigError,
     RewardCreditConfig,
     RouteDecoderMode,
+    RunConfig,
     canonical_config_identity_hash,
 )
 from src.evaluation.actor_loader import (
@@ -51,8 +52,25 @@ def make_evaluation_fixture(
     route_decoder_mode: RouteDecoderMode = RouteDecoderMode.LEGACY,
     reward: RewardCreditConfig | None = None,
     omit_snapshot_channel_mode: bool = False,
+    multi_uav: bool = False,
 ):
     source = make_checkpoint_config(root, horizon=4, interval=4, budget=8)
+    if multi_uav:
+        environment = RunConfig().environment
+        source = replace(
+            source,
+            environment=replace(
+                environment,
+                episode_horizon=4,
+                arrival_probabilities=(1.0,) * environment.uav_count,
+                building_layout=(),
+                candidate_neighbor_radius_m=2_000.0,
+                velocity_std_mps=(0.0, 0.0),
+                shadowing_std_db=0.0,
+                csi_error_std_db=0.0,
+                fixed_csi_aoi_slots=1,
+            ),
+        )
     source = replace(
         source,
         training=replace(
@@ -435,6 +453,112 @@ class TestFinalActorOnlyLoader(unittest.TestCase):
 
 
 class TestFormalEvaluationRunner(unittest.TestCase):
+    def test_hierarchical_route_telemetry_is_action_neutral_and_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _source, config, checkpoint, _actor = make_evaluation_fixture(
+                Path(directory),
+                route_decoder_mode=RouteDecoderMode.HIERARCHICAL_OPTION_AWARE_V1,
+                multi_uav=True,
+            )
+            control = FormalEvaluationRunner(
+                config,
+                checkpoint,
+                evaluation_device="cpu",
+                collect_route_telemetry=False,
+            ).run(write_artifacts=False)
+            instrumented = FormalEvaluationRunner(
+                config,
+                checkpoint,
+                evaluation_device="cpu",
+                collect_route_telemetry=True,
+            ).run(write_artifacts=False)
+
+            self.assertEqual(control.aggregate_metrics, instrumented.aggregate_metrics)
+            self.assertEqual(
+                [item.action_trace_sha256 for item in control.episodes],
+                [item.action_trace_sha256 for item in instrumented.episodes],
+            )
+            self.assertEqual(
+                [item.artifact_record(control.evaluation_run_id) for item in control.episodes],
+                [
+                    item.artifact_record(instrumented.evaluation_run_id)
+                    for item in instrumented.episodes
+                ],
+            )
+            self.assertTrue(instrumented.route_decision_trace)
+            required = {
+                "episode_id",
+                "step",
+                "uav_id",
+                "local_probability",
+                "remote_probability",
+                "defer_probability",
+                "remote_destination_probabilities",
+                "selected_top_level",
+                "selected_remote_id",
+                "final_route_action_index",
+                "legal_route_candidates",
+                "route_action_mask",
+                "tx_action",
+                "resource_group",
+                "power_action",
+                "executed_communication",
+            }
+            for record in instrumented.route_decision_trace:
+                self.assertTrue(required.issubset(record))
+                self.assertAlmostEqual(
+                    record["local_probability"]
+                    + record["remote_probability"]
+                    + record["defer_probability"],
+                    1.0,
+                    places=6,
+                )
+                destinations = record["remote_destination_probabilities"]
+                if destinations:
+                    self.assertAlmostEqual(sum(destinations.values()), 1.0, places=6)
+            summary = instrumented.route_summary
+            assert summary is not None
+            self.assertEqual(
+                summary["route_decision_count"],
+                len(instrumented.route_decision_trace),
+            )
+            self.assertEqual(
+                summary["route_decision_count"],
+                summary["local_count"]
+                + summary["remote_count"]
+                + summary["defer_count"]
+                + summary["idle_count"],
+            )
+
+    def test_route_telemetry_remains_compatible_with_all_decoder_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for mode in (
+                RouteDecoderMode.LEGACY,
+                RouteDecoderMode.OPTION_AWARE_V1,
+                RouteDecoderMode.HIERARCHICAL_OPTION_AWARE_V1,
+            ):
+                with self.subTest(route_decoder_mode=mode.value):
+                    case_root = root / mode.value
+                    case_root.mkdir()
+                    _source, config, checkpoint, _actor = make_evaluation_fixture(
+                        case_root,
+                        route_decoder_mode=mode,
+                        multi_uav=True,
+                    )
+                    result = FormalEvaluationRunner(
+                        config,
+                        checkpoint,
+                        evaluation_device="cpu",
+                    ).run(write_artifacts=False)
+                    self.assertTrue(result.route_decision_trace)
+                    self.assertTrue(
+                        all(
+                            record["decoder_mode"] == mode.value
+                            for record in result.route_decision_trace
+                        )
+                    )
+
     def test_cpu_evaluation_is_repeatable_actor_safe_and_fair(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             _source, config, checkpoint, _actor = make_evaluation_fixture(
@@ -562,6 +686,23 @@ class TestFormalEvaluationRunner(unittest.TestCase):
             )
             first = runner.run(write_artifacts=True)
             self.assertEqual(len(first.artifacts), 4)
+            self.assertEqual(len(first.diagnostic_artifacts), 2)
+            self.assertTrue(
+                all(
+                    "/diagnostics/hierarchical-route-eval__" in path.replace("\\", "/")
+                    for path in first.diagnostic_artifacts
+                )
+            )
+            summary = json.loads(
+                Path(first.diagnostic_artifacts[0]).read_text(encoding="utf-8")
+            )
+            trace = [
+                json.loads(line)
+                for line in Path(first.diagnostic_artifacts[1])
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(summary["route_decision_count"], len(trace))
             before = {Path(path): Path(path).read_bytes() for path in first.artifacts}
             call_count = calls
             with self.assertRaises(ArtifactConflictError):

@@ -15,10 +15,16 @@ from .actor_only_route_oracle import (
 from .metrics import FORMAL_EVALUATION_SCHEMA_VERSION, FORMAL_METRIC_FIELDS
 from .runner import (
     EVALUATION_ARTIFACT_FILENAMES,
+    EVALUATION_ROUTE_DIAGNOSTIC_FILENAMES,
     FORMAL_METHOD_SUITE,
     FormalEvaluationError,
     FormalEvaluationResult,
     FormalEvaluationRunner,
+)
+from .route_telemetry import (
+    EVALUATION_ROUTE_TELEMETRY_SCHEMA_VERSION,
+    EvaluationRouteTelemetryCollector,
+    EvaluationRouteTelemetryError,
 )
 
 __all__ = [
@@ -27,10 +33,14 @@ __all__ = [
     "ActorOnlyRouteOracleResult",
     "ActorOnlyRouteOracleRunner",
     "EVALUATION_ARTIFACT_FILENAMES",
+    "EVALUATION_ROUTE_DIAGNOSTIC_FILENAMES",
+    "EVALUATION_ROUTE_TELEMETRY_SCHEMA_VERSION",
     "FORMAL_EVALUATION_SCHEMA_VERSION",
     "FORMAL_METHOD_SUITE",
     "FORMAL_METRIC_FIELDS",
     "EvaluationCheckpointError",
+    "EvaluationRouteTelemetryCollector",
+    "EvaluationRouteTelemetryError",
     "FormalEvaluationError",
     "FormalEvaluationResult",
     "FormalEvaluationRunner",

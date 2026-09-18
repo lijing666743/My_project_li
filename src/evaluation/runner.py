@@ -20,6 +20,7 @@ from ..env.environment import U2UMECEnvironment
 from ..models.ca_gat_mappo import ActorObservationTensorizer
 from ..models.ca_gat_mappo_actions import (
     CAGATMAPPOActionDistribution,
+    SequentialActionDistributionOutput,
     SequentialActionMaskBatch,
 )
 from ..policies.heuristic_policy import HeuristicPolicy
@@ -32,6 +33,10 @@ from .metrics import (
     EvaluationEpisodeResult,
     aggregate_episode_metrics,
     build_episode_metrics,
+)
+from .route_telemetry import (
+    EvaluationRouteTelemetryCollector,
+    build_evaluation_route_summary,
 )
 
 
@@ -46,6 +51,10 @@ EVALUATION_ARTIFACT_FILENAMES = (
     "episode_metrics.jsonl",
     "aggregate_metrics.json",
     "evaluation_metrics.csv",
+)
+EVALUATION_ROUTE_DIAGNOSTIC_FILENAMES = (
+    "summary.json",
+    "route_decision_trace.jsonl",
 )
 _CONSUMED_ENVIRONMENT_STREAMS = (
     "reset_mobility",
@@ -69,6 +78,9 @@ class FormalEvaluationResult:
     episodes: tuple[EvaluationEpisodeResult, ...]
     aggregate_metrics: Mapping[str, Any]
     artifacts: tuple[str, ...]
+    route_decision_trace: tuple[Mapping[str, Any], ...] = ()
+    route_summary: Mapping[str, Any] | None = None
+    diagnostic_artifacts: tuple[str, ...] = ()
 
 
 class FormalEvaluationRunner:
@@ -81,6 +93,7 @@ class FormalEvaluationRunner:
         *,
         evaluation_device: str,
         environment_factory: Callable[[RunConfig], U2UMECEnvironment] | None = None,
+        collect_route_telemetry: bool = True,
     ) -> None:
         if not isinstance(config, RunConfig):
             raise TypeError("config must be a RunConfig")
@@ -88,6 +101,9 @@ class FormalEvaluationRunner:
         self._validate_config(config)
         self.config = config
         self.environment_factory = environment_factory or U2UMECEnvironment
+        if not isinstance(collect_route_telemetry, bool):
+            raise TypeError("collect_route_telemetry must be bool")
+        self.collect_route_telemetry = collect_route_telemetry
         self.loaded_actor = load_final_actor_for_evaluation(
             config,
             checkpoint_path,
@@ -103,6 +119,7 @@ class FormalEvaluationRunner:
             self.evaluation_config_identity
         )
         self.evaluation_run_id = self._evaluation_run_id()
+        self.route_telemetry = EvaluationRouteTelemetryCollector(config)
 
     def run(self, *, write_artifacts: bool = True) -> FormalEvaluationResult:
         """Run all configured seeds; a no-write path supports repeatability tests."""
@@ -113,6 +130,11 @@ class FormalEvaluationRunner:
                 artifact_paths.values(),
                 group_name="formal evaluation artifact group",
             )
+            if self.collect_route_telemetry:
+                require_artifact_targets_absent(
+                    self.diagnostic_artifact_paths().values(),
+                    group_name="evaluation route diagnostic artifact group",
+                )
 
         actor = self.loaded_actor.actor
         actor.eval()
@@ -123,11 +145,19 @@ class FormalEvaluationRunner:
         )
 
         episodes: list[EvaluationEpisodeResult] = []
-        for evaluation_seed in self.config.evaluation.evaluation_seeds:
+        route_decision_trace: list[Mapping[str, Any]] = []
+        for episode_id, evaluation_seed in enumerate(
+            self.config.evaluation.evaluation_seeds
+        ):
             seed_episodes: list[EvaluationEpisodeResult] = []
             for method_id in FORMAL_METHOD_SUITE:
                 seed_episodes.append(
-                    self._run_episode(method_id, int(evaluation_seed))
+                    self._run_episode(
+                        method_id,
+                        int(evaluation_seed),
+                        episode_id=episode_id,
+                        route_decision_trace=route_decision_trace,
+                    )
                 )
             trace_hashes = {
                 item.method_id: item.external_trace_sha256
@@ -160,9 +190,29 @@ class FormalEvaluationRunner:
         aggregate = aggregate_episode_metrics(episodes, FORMAL_METHOD_SUITE)
         aggregate["evaluation_run_id"] = self.evaluation_run_id
         manifest = self._manifest(tuple(episodes), before_requires_grad)
+        actor_episodes = tuple(
+            item for item in episodes if item.method_id == "ca_gat_mappo"
+        )
+        route_summary = (
+            build_evaluation_route_summary(
+                evaluation_run_id=self.evaluation_run_id,
+                decoder_mode=self.config.training.mappo.route_decoder_mode.value,
+                records=route_decision_trace,
+                actor_episodes=actor_episodes,
+            )
+            if self.collect_route_telemetry
+            else None
+        )
         artifacts = (
             self._write_artifacts(manifest, tuple(episodes), aggregate)
             if write_artifacts
+            else ()
+        )
+        diagnostic_artifacts = (
+            self._write_diagnostic_artifacts(
+                tuple(route_decision_trace), route_summary
+            )
+            if write_artifacts and self.collect_route_telemetry
             else ()
         )
         return FormalEvaluationResult(
@@ -171,6 +221,9 @@ class FormalEvaluationRunner:
             episodes=tuple(episodes),
             aggregate_metrics=aggregate,
             artifacts=artifacts,
+            route_decision_trace=tuple(route_decision_trace),
+            route_summary=route_summary,
+            diagnostic_artifacts=diagnostic_artifacts,
         )
 
     def artifact_paths(self) -> Mapping[str, Path]:
@@ -194,10 +247,28 @@ class FormalEvaluationRunner:
             )
         }
 
+    def diagnostic_artifact_paths(self) -> Mapping[str, Path]:
+        """Return isolated additive diagnostics paths without creating them."""
+
+        root = (
+            Path(self.config.output.logs_dir)
+            / "diagnostics"
+            / f"hierarchical-route-eval__{self.evaluation_run_id}"
+        )
+        return {
+            "summary": root / EVALUATION_ROUTE_DIAGNOSTIC_FILENAMES[0],
+            "route_decision_trace": (
+                root / EVALUATION_ROUTE_DIAGNOSTIC_FILENAMES[1]
+            ),
+        }
+
     def _run_episode(
         self,
         method_id: str,
         evaluation_seed: int,
+        *,
+        episode_id: int,
+        route_decision_trace: list[Mapping[str, Any]],
     ) -> EvaluationEpisodeResult:
         episode_config = replace(
             self.config,
@@ -240,15 +311,30 @@ class FormalEvaluationRunner:
             raise FormalEvaluationError(f"unknown formal method {method_id!r}")
 
         while True:
+            action_output: SequentialActionDistributionOutput | None = None
             if method_id == "ca_gat_mappo":
                 assert hidden is not None
-                proposals, hidden = self._actor_actions(observations, hidden)
+                proposals, hidden, action_output = self._actor_actions(
+                    observations, hidden
+                )
                 hidden_trace_sha256.append(_tensor_sha256(hidden))
             else:
                 assert policy is not None
                 proposals = tuple(policy.act(item) for item in observations)
             action_trace.append(tuple(_proposal_record(item) for item in proposals))
             step = environment.step(proposals)
+            if self.collect_route_telemetry and action_output is not None:
+                route_decision_trace.extend(
+                    self.route_telemetry.collect_step(
+                        evaluation_run_id=self.evaluation_run_id,
+                        episode_id=episode_id,
+                        evaluation_seed=evaluation_seed,
+                        observations=observations,
+                        proposals=proposals,
+                        action_output=action_output,
+                        step_info=step.info,
+                    )
+                )
             slot_infos.append(step.info)
             external_trace.append(
                 self._external_trace_record(
@@ -292,7 +378,11 @@ class FormalEvaluationRunner:
         self,
         observations: Sequence[Any],
         hidden: torch.Tensor,
-    ) -> tuple[tuple[ActionProposal, ...], torch.Tensor]:
+    ) -> tuple[
+        tuple[ActionProposal, ...],
+        torch.Tensor,
+        SequentialActionDistributionOutput,
+    ]:
         actor = self.loaded_actor.actor
         if actor.training:
             raise FormalEvaluationError("actor must remain in eval mode")
@@ -312,7 +402,7 @@ class FormalEvaluationRunner:
         if output.mode != "deterministic":
             raise FormalEvaluationError("actor did not use deterministic action mode")
         proposals = tuple(output.proposals[0][0])
-        return proposals, output.hidden_out.detach()
+        return proposals, output.hidden_out.detach(), output
 
     def _external_trace_record(
         self,
@@ -546,6 +636,22 @@ class FormalEvaluationRunner:
         )
         return tuple(str(path) for path in ordered_paths)
 
+    def _write_diagnostic_artifacts(
+        self,
+        records: tuple[Mapping[str, Any], ...],
+        summary: Mapping[str, Any] | None,
+    ) -> tuple[str, ...]:
+        if summary is None:
+            raise FormalEvaluationError("evaluation route summary is missing")
+        paths = self.diagnostic_artifact_paths()
+        trace_text = "".join(_compact_json(record) + "\n" for record in records)
+        ordered_paths = tuple(paths.values())
+        atomic_write_text_group(
+            zip(ordered_paths, (_pretty_json(summary), trace_text)),
+            group_name="evaluation route diagnostic artifact group",
+        )
+        return tuple(str(path) for path in ordered_paths)
+
     def _evaluation_csv(
         self,
         episodes: Sequence[EvaluationEpisodeResult],
@@ -693,6 +799,7 @@ def _jsonable(value: Any) -> Any:
 
 __all__ = [
     "EVALUATION_ARTIFACT_FILENAMES",
+    "EVALUATION_ROUTE_DIAGNOSTIC_FILENAMES",
     "FORMAL_METHOD_SUITE",
     "FormalEvaluationError",
     "FormalEvaluationResult",

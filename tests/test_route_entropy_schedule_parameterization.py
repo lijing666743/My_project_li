@@ -7,6 +7,7 @@ import math
 import json
 import unittest
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -17,9 +18,11 @@ from src.config import (
     CHECKPOINT_KIND_PERIODIC_RESUME,
     CHECKPOINT_V1_TRAINING_STATE_FIELDS,
     ConfigError,
+    RouteDecoderMode,
     RunConfig,
     WorkloadTimingMode,
     compute_route_entropy_schedule,
+    load_run_config,
 )
 from src.models.ca_gat_mappo_ppo import (
     compute_configured_ppo_objective_and_loss,
@@ -39,6 +42,28 @@ from src.training_artifacts import (
     _ppo_epoch_records,
     read_training_metrics_csv_text,
 )
+
+
+EXPERIMENT_CONFIG_DIRECTORY = (
+    Path(__file__).resolve().parents[1]
+    / "experiments"
+    / "cooperative-load"
+    / "configs"
+)
+ENTROPY_ABLATION_CONFIG_PATHS = {
+    "B0": EXPERIMENT_CONFIG_DIRECTORY
+    / "cooperative-load-v2-hierarchical-optionaware-v1-entropy-b0-32k.json",
+    "A": EXPERIMENT_CONFIG_DIRECTORY
+    / "cooperative-load-v2-hierarchical-optionaware-v1-entropy-a-32k.json",
+    "B": EXPERIMENT_CONFIG_DIRECTORY
+    / "cooperative-load-v2-hierarchical-optionaware-v1-entropy-b-32k.json",
+}
+ENTROPY_TREATMENT_FIELDS = {
+    "entropy_coefficient_schedule_enabled",
+    "route_entropy_start_coefficient",
+    "route_entropy_schedule_start_step",
+    "route_entropy_schedule_end_step",
+}
 
 
 def frozen_control_config() -> RunConfig:
@@ -71,7 +96,7 @@ def frozen_control_config() -> RunConfig:
     return config
 
 
-def treatment_config() -> RunConfig:
+def treatment_config(start_coefficient: float = 0.03) -> RunConfig:
     control = frozen_control_config()
     config = replace(
         control,
@@ -80,6 +105,7 @@ def treatment_config() -> RunConfig:
             mappo=replace(
                 control.training.mappo,
                 entropy_coefficient_schedule_enabled=True,
+                route_entropy_start_coefficient=start_coefficient,
             ),
         ),
     )
@@ -154,44 +180,51 @@ class FakeFullBuffer:
 
 
 class RouteEntropyScheduleBoundaryTests(unittest.TestCase):
-    def test_preregistered_boundary_values_and_discontinuity(self) -> None:
-        mappo = treatment_config().training.mappo
-        expected = {
-            0: 0.01,
-            3071: 0.01,
-            3072: 0.03,
-            3073: 0.01
-            + 0.02 * (32768 - 3073) / (32768 - 3072),
-            32767: 0.01
-            + 0.02 * (32768 - 32767) / (32768 - 3072),
-            32768: 0.01,
-            40000: 0.01,
-        }
-        for step, coefficient in expected.items():
-            with self.subTest(step=step):
-                point = compute_route_entropy_schedule(mappo, step)
-                self.assertAlmostEqual(point.coefficient, coefficient, places=15)
+    def test_configured_boundary_values_and_discontinuity(self) -> None:
+        for peak in (0.03, 0.05):
+            with self.subTest(peak=peak):
+                mappo = treatment_config(peak).training.mappo
+                delta = peak - 0.01
+                expected = {
+                    0: 0.01,
+                    3071: 0.01,
+                    3072: peak,
+                    3073: 0.01
+                    + delta * (32768 - 3073) / (32768 - 3072),
+                    32767: 0.01
+                    + delta * (32768 - 32767) / (32768 - 3072),
+                    32768: 0.01,
+                    40000: 0.01,
+                }
+                for step, coefficient in expected.items():
+                    point = compute_route_entropy_schedule(mappo, step)
+                    self.assertAlmostEqual(
+                        point.coefficient,
+                        coefficient,
+                        places=15,
+                    )
 
-        self.assertEqual(
-            compute_route_entropy_schedule(mappo, 3071).coefficient,
-            0.01,
-        )
-        self.assertEqual(
-            compute_route_entropy_schedule(mappo, 3072).coefficient,
-            0.03,
-        )
-        self.assertEqual(
-            compute_route_entropy_schedule(mappo, 32768).coefficient,
-            0.01,
-        )
-        self.assertEqual(
-            compute_route_entropy_schedule(mappo, 3072).progress,
-            0.0,
-        )
-        self.assertEqual(
-            compute_route_entropy_schedule(mappo, 32768).progress,
-            1.0,
-        )
+                self.assertEqual(
+                    compute_route_entropy_schedule(mappo, 3071).coefficient,
+                    0.01,
+                )
+                self.assertAlmostEqual(
+                    compute_route_entropy_schedule(mappo, 3072).coefficient,
+                    peak,
+                    places=15,
+                )
+                self.assertEqual(
+                    compute_route_entropy_schedule(mappo, 32768).coefficient,
+                    0.01,
+                )
+                self.assertEqual(
+                    compute_route_entropy_schedule(mappo, 3072).progress,
+                    0.0,
+                )
+                self.assertEqual(
+                    compute_route_entropy_schedule(mappo, 32768).progress,
+                    1.0,
+                )
 
     def test_disabled_schedule_is_base_only_at_every_boundary(self) -> None:
         mappo = frozen_control_config().training.mappo
@@ -205,39 +238,45 @@ class RouteEntropyScheduleBoundaryTests(unittest.TestCase):
 
 class RouteOnlyEntropyLossTests(unittest.TestCase):
     def test_route_only_coefficient_and_other_branch_isolation(self) -> None:
-        route_entropy = torch.full((2, 2), 0.5, requires_grad=True)
-        other_entropy = torch.full((2, 2), 2.0, requires_grad=True)
-        inputs = branch_specific_loss_inputs()
-        output = compute_configured_ppo_objective_and_loss(
-            **inputs,
-            entropy=route_entropy + other_entropy,
-            route_entropy=route_entropy,
-            collected_environment_steps=3072,
-            config=treatment_config(),
-        )
+        for peak in (0.03, 0.05):
+            with self.subTest(peak=peak):
+                route_entropy = torch.full((2, 2), 0.5, requires_grad=True)
+                other_entropy = torch.full((2, 2), 2.0, requires_grad=True)
+                inputs = branch_specific_loss_inputs()
+                output = compute_configured_ppo_objective_and_loss(
+                    **inputs,
+                    entropy=route_entropy + other_entropy,
+                    route_entropy=route_entropy,
+                    collected_environment_steps=3072,
+                    config=treatment_config(peak),
+                )
 
-        self.assertEqual(output.route_entropy_coefficient, 0.03)
-        torch.testing.assert_close(
-            output.route_entropy_loss_contribution,
-            torch.tensor(0.015),
-        )
-        torch.testing.assert_close(
-            output.other_branch_entropy_loss_contribution,
-            torch.tensor(0.02),
-        )
-        torch.testing.assert_close(
-            output.global_entropy_loss_contribution,
-            torch.tensor(0.035),
-        )
-        output.total_loss.backward()
-        torch.testing.assert_close(
-            route_entropy.grad,
-            torch.full((2, 2), -0.03 / 4.0),
-        )
-        torch.testing.assert_close(
-            other_entropy.grad,
-            torch.full((2, 2), -0.01 / 4.0),
-        )
+                self.assertAlmostEqual(
+                    output.route_entropy_coefficient,
+                    peak,
+                    places=15,
+                )
+                torch.testing.assert_close(
+                    output.route_entropy_loss_contribution,
+                    torch.tensor(peak * 0.5),
+                )
+                torch.testing.assert_close(
+                    output.other_branch_entropy_loss_contribution,
+                    torch.tensor(0.02),
+                )
+                torch.testing.assert_close(
+                    output.global_entropy_loss_contribution,
+                    torch.tensor(peak * 0.5 + 0.02),
+                )
+                output.total_loss.backward()
+                torch.testing.assert_close(
+                    route_entropy.grad,
+                    torch.full((2, 2), -peak / 4.0),
+                )
+                torch.testing.assert_close(
+                    other_entropy.grad,
+                    torch.full((2, 2), -0.01 / 4.0),
+                )
 
     def test_intervention_changes_only_entropy_regularization(self) -> None:
         route_entropy = torch.full((2, 2), 0.5)
@@ -450,6 +489,55 @@ class RouteEntropyConfigAndResumeTests(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(ConfigError, "preregistered"):
                     invalid.validate()
+
+    def test_32k_ablation_configs_are_valid_and_matched(self) -> None:
+        configs = {
+            name: load_run_config(path)
+            for name, path in ENTROPY_ABLATION_CONFIG_PATHS.items()
+        }
+        for name, config in configs.items():
+            with self.subTest(group=name):
+                self.assertEqual(config.scenario_id, "small")
+                self.assertEqual(config.seed, 42)
+                self.assertEqual(
+                    config.training.mappo.max_training_environment_steps,
+                    32000,
+                )
+                self.assertEqual(
+                    config.training.mappo.route_decoder_mode,
+                    RouteDecoderMode.HIERARCHICAL_OPTION_AWARE_V1,
+                )
+                self.assertEqual(config.training.mappo.entropy_coefficient, 0.01)
+
+        self.assertFalse(
+            configs["B0"].training.mappo.entropy_coefficient_schedule_enabled
+        )
+        for name, peak in (("A", 0.03), ("B", 0.05)):
+            with self.subTest(group=name):
+                mappo = configs[name].training.mappo
+                self.assertTrue(mappo.entropy_coefficient_schedule_enabled)
+                self.assertEqual(mappo.route_entropy_start_coefficient, peak)
+                self.assertEqual(mappo.route_entropy_schedule_start_step, 3072)
+                self.assertEqual(mappo.route_entropy_schedule_end_step, 32768)
+                self.assertAlmostEqual(
+                    compute_route_entropy_schedule(mappo, 3072).coefficient,
+                    peak,
+                    places=15,
+                )
+                self.assertEqual(
+                    compute_route_entropy_schedule(mappo, 32768).coefficient,
+                    0.01,
+                )
+
+        normalized = {}
+        for name, config in configs.items():
+            payload = json.loads(json.dumps(config.resolved_dict()))
+            mappo = payload["training"]["mappo"]
+            for field in ENTROPY_TREATMENT_FIELDS:
+                mappo.pop(field, None)
+            normalized[name] = payload
+        self.assertEqual(normalized["B0"], normalized["A"])
+        self.assertEqual(normalized["B0"], normalized["B"])
 
     def test_checkpoint_state_reconstructs_schedule_without_extra_state(self) -> None:
         trainer = object.__new__(CAGATMAPPOTrainer)

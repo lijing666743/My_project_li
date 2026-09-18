@@ -677,7 +677,7 @@ def compute_route_entropy_schedule(
     mappo: MAPPOConfig,
     collected_environment_steps: int,
 ) -> RouteEntropySchedulePoint:
-    """Return the preregistered route coefficient from config and env steps.
+    """Return the configured route coefficient from config and env steps.
 
     The treatment intentionally jumps from the base coefficient immediately
     before ``route_entropy_schedule_start_step`` to the start coefficient at
@@ -1305,11 +1305,6 @@ class RunConfig:
             preregistered = (
                 ("entropy_coefficient", mappo.entropy_coefficient, 0.01),
                 (
-                    "route_entropy_start_coefficient",
-                    mappo.route_entropy_start_coefficient,
-                    0.03,
-                ),
-                (
                     "route_entropy_schedule_start_step",
                     mappo.route_entropy_schedule_start_step,
                     3072,
@@ -1326,6 +1321,12 @@ class RunConfig:
                         "the preregistered route entropy treatment requires "
                         f"training.mappo.{name}={expected}"
                     )
+            if mappo.route_entropy_start_coefficient not in (0.03, 0.05):
+                raise ConfigError(
+                    "the preregistered route entropy treatment requires "
+                    "training.mappo.route_entropy_start_coefficient "
+                    "to be one of (0.03, 0.05)"
+                )
         for name, value in (
             ("rollout_length_slots", mappo.rollout_length_slots),
             ("recurrent_chunk_length_slots", mappo.recurrent_chunk_length_slots),

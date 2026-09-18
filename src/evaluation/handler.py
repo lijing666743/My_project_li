@@ -49,7 +49,7 @@ def formal_evaluation_handler(
             f"episodes={len(evaluation.episodes)}, "
             f"methods={','.join(evaluation.manifest['method_suite'])}"
         ),
-        artifacts=evaluation.artifacts,
+        artifacts=(*evaluation.artifacts, *evaluation.diagnostic_artifacts),
     )
 
 
